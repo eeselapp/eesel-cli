@@ -6,7 +6,7 @@ chat — almost like the dashboard, from your terminal.
 ## Install
 
 ```bash
-curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
+curl -fsSL https://raw.githubusercontent.com/eeselapp/eesel-cli/main/install | sh
 ```
 
 This drops a single `eesel` script into `~/.local/bin`. Requires
@@ -18,15 +18,15 @@ By default the installer pulls the latest release from
 Pin a specific version:
 
 ```bash
-curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/eeselapp/eesel-cli/main/install | sh -s -- --version v0.1.0
 # or via env
-EESEL_VERSION=v0.1.0 curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
+EESEL_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/eeselapp/eesel-cli/main/install | sh
 ```
 
 Install somewhere else:
 
 ```bash
-EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
+EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/eeselapp/eesel-cli/main/install | sh
 ```
 
 ## Quick start
