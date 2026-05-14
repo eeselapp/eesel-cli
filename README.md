@@ -6,22 +6,27 @@ chat — almost like the dashboard, from your terminal.
 ## Install
 
 ```bash
-curl -fsSL https://eesel.ai/install.sh | sh
+curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
 ```
 
 This drops a single `eesel` script into `~/.local/bin`. Requires
 `python3` (>= 3.8) — no other deps, stdlib only.
 
+By default the installer pulls the latest release from
+`https://github.com/eeselapp/eesel-cli/releases/latest/download/eesel`.
+
 Pin a specific version:
 
 ```bash
-curl -fsSL https://eesel.ai/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh -s -- --version v0.1.0
+# or via env
+EESEL_VERSION=v0.1.0 curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
 ```
 
 Install somewhere else:
 
 ```bash
-EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://eesel.ai/install.sh | sh
+EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh
 ```
 
 ## Quick start
