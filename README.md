@@ -53,6 +53,25 @@ eesel sessions delete <id>
 
 In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/quit`.
 
+## Documents
+
+List and export documents from your workspace — e.g. to download a blog
+draft the agent generated, or any other artifact in the doc store.
+
+```bash
+eesel document list                                            # all documents
+eesel document list --prefix outputs/skills                    # filter by key prefix
+eesel document list --search "blog title"                      # filter by name/key
+
+eesel document export --document-key <key> --format md -o post.md
+eesel document export --document-id <id-or-prefix> --format html -o post.html
+```
+
+`--format` accepts `md` or `html`. `-o` is optional; without it the
+file lands in the current directory using the document's filename.
+Export is scoped to the currently-active agent (`eesel agents use`),
+so set the right agent before exporting.
+
 ## How auth works
 
 `eesel login` opens `dashboard.eesel.ai/cli` in your browser. The page
@@ -61,7 +80,7 @@ hands it back to a local HTTP server the CLI runs briefly. Same auth
 as the dashboard — no separate credentials.
 
 The token lives at `~/.config/eesel/credentials.json` (chmod 600) and
-expires in 24h. Re-run `eesel login` when it expires.
+expires in 30 days. Re-run `eesel login` when it expires.
 
 ## Local state
 

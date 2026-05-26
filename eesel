@@ -17,9 +17,14 @@ which session is "active" so plain `eesel chat "msg"` knows where to send.
 API surface used:
   POST /workspaces/token             (dashboard side, prod login bridge only)
   GET  /agents                       list agents in the workspace
+  GET  /agents/{id}/triggers         list triggers configured for one agent
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
+                                       optional triggerId → preview a scheduled
+                                       trigger's context in chat
   GET  /agents/chat/{id}/raw-stream  SSE stream of UI message chunks
+  POST /triggers/{id}/fire           manually enqueue a scheduled trigger
 """
+
 from __future__ import annotations
 
 import argparse
@@ -68,10 +73,17 @@ DEV_JWT_SECRET = "dev-fallback-secret-key-not-for-production"
 POSTGRES_CONTAINER = "slack-postgres_db_dev-1"
 POSTGRES_DB = "eesel_dev"
 
+# 30 days. Matches the long-lived TTL that /workspaces/token applies when
+# called with `client: "cli"` (server/app/api/agents/agents.py). In prod the
+# value comes from the server response; this constant is the dev-path
+# fallback when the CLI self-mints its own JWT.
+CLI_TOKEN_TTL_SECONDS = 30 * 24 * 3600
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output helpers
 # ──────────────────────────────────────────────────────────────────────────
+
 
 def _is_tty() -> bool:
     return sys.stdout.isatty()
@@ -102,6 +114,7 @@ def ok(msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 # Config / credentials
 # ──────────────────────────────────────────────────────────────────────────
+
 
 def ensure_dirs() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -140,6 +153,7 @@ def require_creds() -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 # Sessions
 # ──────────────────────────────────────────────────────────────────────────
+
 
 def _session_path(sid: str) -> Path:
     return SESSIONS_DIR / f"{sid}.json"
@@ -211,8 +225,7 @@ def ensure_current_session(creds: dict, agent_id: str | None = None) -> dict:
     return new_session(creds, agent_id=agent_id, name=None, switch_to=True)
 
 
-def new_session(creds: dict, *, agent_id: str | None, name: str | None,
-                switch_to: bool = True) -> dict:
+def new_session(creds: dict, *, agent_id: str | None, name: str | None, switch_to: bool = True, trigger_id: str | None = None, trigger_title: str | None = None) -> dict:
     sid = uuid.uuid4().hex[:12]
     sess = {
         "id": sid,
@@ -224,6 +237,9 @@ def new_session(creds: dict, *, agent_id: str | None, name: str | None,
         "created_at": time.time(),
         "updated_at": time.time(),
     }
+    if trigger_id:
+        sess["trigger_id"] = trigger_id
+        sess["trigger_title"] = trigger_title
     save_session(sess)
     if switch_to:
         set_current(sid)
@@ -234,21 +250,24 @@ def new_session(creds: dict, *, agent_id: str | None, name: str | None,
 # JWT helpers (dev mode only)
 # ──────────────────────────────────────────────────────────────────────────
 
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def mint_dev_jwt(workspace_id: str, agent_id: str | None) -> str:
-    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"},
-                                separators=(",", ":")).encode())
+def mint_dev_jwt(workspace_id: str, agent_id: str | None, user_id: str | None = None) -> str:
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
     now = int(time.time())
-    payload_d = {"workspace_id": workspace_id, "iat": now, "exp": now + 86400}
+    payload_d = {"workspace_id": workspace_id, "iat": now, "exp": now + CLI_TOKEN_TTL_SECONDS}
     if agent_id:
         payload_d["agent_id"] = agent_id
+    if user_id:
+        # Required by chat RBAC (kira/rbac-core) — POST /agents/sandbox/start
+        # rejects tokens without user_id since 2026-04-30.
+        payload_d["user_id"] = user_id
+        payload_d["sub"] = user_id
     payload = _b64url(json.dumps(payload_d, separators=(",", ":")).encode())
-    sig = _b64url(hmac.new(DEV_JWT_SECRET.encode(),
-                           f"{header}.{payload}".encode(),
-                           hashlib.sha256).digest())
+    sig = _b64url(hmac.new(DEV_JWT_SECRET.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest())
     return f"{header}.{payload}.{sig}"
 
 
@@ -260,41 +279,51 @@ def _run_psql(sql: str) -> str:
     (e.g. cost lookup before metrics have landed).
     """
     try:
-        return subprocess.check_output(
-            ["docker", "exec", POSTGRES_CONTAINER, "psql", "-U", "postgres",
-             "-d", POSTGRES_DB, "-Atc", sql],
-            stderr=subprocess.PIPE,
-        ).decode().strip()
+        return (
+            subprocess.check_output(
+                ["docker", "exec", POSTGRES_CONTAINER, "psql", "-U", "postgres", "-d", POSTGRES_DB, "-Atc", sql],
+                stderr=subprocess.PIPE,
+            )
+            .decode()
+            .strip()
+        )
     except FileNotFoundError:
         raise RuntimeError("docker not on PATH. Is Docker running?")
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"psql failed against {POSTGRES_CONTAINER}: "
-            f"{e.stderr.decode().strip()}"
-        )
+        raise RuntimeError(f"psql failed against {POSTGRES_CONTAINER}: {e.stderr.decode().strip()}")
 
 
-def discover_local_ids() -> tuple[str, str]:
-    """Read workspace_id + agent_id from the local Postgres container."""
-    sql = (
-        'SELECT w."workspaceId", a.agent_id '
-        "FROM eesel_ai_workspaces w "
-        'LEFT JOIN eesel_ai_agents a ON a.workspace_id = w."workspaceId" '
-        'ORDER BY w."createdAt" ASC LIMIT 1;'
-    )
+def discover_local_ids(workspace_id: str | None = None) -> tuple[str, str, str | None]:
+    """Read workspace_id, agent_id, and workspace owner user_id from local Postgres."""
+    # Tab separator avoids collision with `|` characters that appear inside
+    # user_ids like "google-oauth2|104939625588671259012".
+    workspace_filter = ""
+    if workspace_id:
+        workspace_filter = f"""WHERE w."workspaceId" = '{workspace_id.replace("'", "''")}'"""
+    sql = f"""SELECT w."workspaceId", a.agent_id, w."workspaceOwnerUserId" FROM eesel_ai_workspaces w LEFT JOIN eesel_ai_agents a ON a.workspace_id = w."workspaceId" {workspace_filter} ORDER BY w."createdAt" ASC LIMIT 1;"""
     try:
-        out = _run_psql(sql)
-    except RuntimeError as e:
-        sys.exit(
-            f"Could not read workspace from local db. "
-            f"Is `docker compose up` running in ~/src/slack?\n{e}"
+        out = (
+            subprocess.check_output(
+                ["docker", "exec", POSTGRES_CONTAINER, "psql", "-U", "postgres", "-d", POSTGRES_DB, "-AtF", "\t", "-c", sql],
+                stderr=subprocess.PIPE,
+            )
+            .decode()
+            .strip()
         )
-    if not out or "|" not in out:
+    except FileNotFoundError:
+        sys.exit("docker not on PATH. Is Docker running?")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Could not read workspace from local db. Is `docker compose up` running in ~/src/slack?\n{e.stderr.decode().strip()}")
+    parts = out.split("\t") if out else []
+    if len(parts) < 2:
+        if workspace_id:
+            sys.exit(f"No workspace {workspace_id} in local db.")
         sys.exit("No workspace in local db. Sign up via the local dashboard first.")
-    ws, ag = out.split("|", 1)
+    ws, ag = parts[0], parts[1]
+    user_id = parts[2] if len(parts) >= 3 and parts[2] else None
     if not ag:
         sys.exit(f"Workspace {ws} has no agent. Create one in the dashboard first.")
-    return ws, ag
+    return ws, ag, user_id
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -427,9 +456,7 @@ def format_cost_oneline(d: dict) -> str:
         f"[{_fmt_cost(d['total_cost'])} · "
         f"{_fmt_tokens(d['totals']['input_tokens'])} in / "
         f"{_fmt_tokens(d['totals']['output_tokens'])} out · "
-        f"{d['total_runs']} call{'s' if d['total_runs'] != 1 else ''}"
-        + (f" · {len(d['by_task'])} tasks" if len(d["by_task"]) > 1 else "")
-        + "]"
+        f"{d['total_runs']} call{'s' if d['total_runs'] != 1 else ''}" + (f" · {len(d['by_task'])} tasks" if len(d["by_task"]) > 1 else "") + "]"
     )
 
 
@@ -456,10 +483,7 @@ def format_cost_full(d: dict, sess: dict) -> str:
             label = "root" if not row["parent_task_id"] else "sub"
             short = row["task_id"][:8]
             name = row["name"][:40] if row["name"] else "(unnamed)"
-            lines.append(
-                f"    [{label}] {short}  {_fmt_cost(row['cost'])}  "
-                f"{row['runs']} call{'s' if row['runs'] != 1 else ''}  {name}"
-            )
+            lines.append(f"    [{label}] {short}  {_fmt_cost(row['cost'])}  {row['runs']} call{'s' if row['runs'] != 1 else ''}  {name}")
     return "\n".join(lines)
 
 
@@ -467,10 +491,10 @@ def format_cost_full(d: dict, sess: dict) -> str:
 # HTTP helpers
 # ──────────────────────────────────────────────────────────────────────────
 
-def http_request(method: str, url: str, *, token: str | None = None,
-                 body: dict | None = None, timeout: int = 60) -> dict:
+
+def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", **(headers or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -487,24 +511,38 @@ def http_request(method: str, url: str, *, token: str | None = None,
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
 
 
+def http_download(url: str, *, token: str, output_path: Path) -> None:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            output_path.write_bytes(resp.read())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        sys.exit(f"GET {url} → {e.code}: {body_text}")
+    except urllib.error.URLError as e:
+        sys.exit(f"GET {url} failed (server reachable?): {e}")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Login flows
 # ──────────────────────────────────────────────────────────────────────────
 
-def login_dev() -> dict:
-    workspace_id, agent_id = discover_local_ids()
-    token = mint_dev_jwt(workspace_id, agent_id)
+
+def login_dev(workspace_id: str | None = None) -> dict:
+    workspace_id, agent_id, user_id = discover_local_ids(workspace_id)
+    token = mint_dev_jwt(workspace_id, None, user_id)
     creds = {
         "env": "dev",
         "api_url": ENVS["dev"]["api"],
         "dashboard_url": ENVS["dev"]["dashboard"],
         "workspace_id": workspace_id,
         "agent_id": agent_id,
+        "user_id": user_id,
         "token": token,
-        "expires_at": int(time.time()) + 86400,
+        "expires_at": int(time.time()) + CLI_TOKEN_TTL_SECONDS,
     }
     save_creds(creds)
-    ok(f"Logged in (dev) — workspace={workspace_id} agent={agent_id}")
+    ok(f"Logged in (dev) — workspace={workspace_id} agent={agent_id}" + (f" user={user_id}" if user_id else " (no owner user_id)"))
     return creds
 
 
@@ -603,6 +641,14 @@ def login_prod() -> dict:
     if not token or not workspace_id:
         sys.exit(f"Auth response missing fields: {captured}")
 
+    # `expires_in` is forwarded from the server's /workspaces/token response
+    # by the dashboard bridge (CliAuthClient.tsx). It's the source of truth
+    # for the JWT's `exp` claim. Fall back to the dev-path default only if
+    # the bridge is older than the server change that added the field.
+    expires_in = captured.get("expires_in")
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        expires_in = CLI_TOKEN_TTL_SECONDS
+
     creds = {
         "env": "prod",
         "api_url": api_url,
@@ -611,7 +657,7 @@ def login_prod() -> dict:
         "user_email": user_email,
         "agent_id": None,  # picked on first chat / via `eesel agents use`
         "token": token,
-        "expires_at": int(time.time()) + 86400,
+        "expires_at": int(time.time()) + expires_in,
     }
     save_creds(creds)
     ok(f"Logged in — workspace={workspace_id}{f' as {user_email}' if user_email else ''}")
@@ -622,6 +668,7 @@ def login_prod() -> dict:
 # Agent helpers
 # ──────────────────────────────────────────────────────────────────────────
 
+
 def fetch_agents(creds: dict) -> list[dict]:
     """Return list of {agent_id, name, agent_type} for the workspace."""
     url = f"{creds['api_url']}/agents?{urllib.parse.urlencode({'workspace_id': creds['workspace_id']})}"
@@ -629,6 +676,57 @@ def fetch_agents(creds: dict) -> list[dict]:
     # Response shape varies; normalize.
     items = data if isinstance(data, list) else data.get("agents") or data.get("items") or []
     return items
+
+
+def fetch_triggers(creds: dict, agent_id: str) -> list[dict]:
+    """Return list of triggers for one agent."""
+    url = f"{creds['api_url']}/agents/{agent_id}/triggers"
+    data = http_request("GET", url, token=creds["token"])
+    return data.get("triggers") or []
+
+
+def fetch_all_scheduled_triggers(creds: dict) -> list[dict]:
+    """Return scheduled triggers across every agent in the workspace.
+
+    Each row is the raw trigger dict, augmented with `agent_id` and
+    `agent_name` for display.
+    """
+    out = []
+    for a in fetch_agents(creds):
+        agent_id = a.get("agent_id")
+        if not agent_id:
+            continue
+        try:
+            for t in fetch_triggers(creds, agent_id):
+                if t.get("trigger_key") != "eesel_scheduled":
+                    continue
+                t["agent_id"] = agent_id
+                t["agent_name"] = a.get("name") or "?"
+                out.append(t)
+        except Exception as e:  # one agent's failure shouldn't kill the list
+            warn(f"Couldn't list triggers for {a.get('name', agent_id)}: {e}")
+    return out
+
+
+def resolve_scheduled_trigger(creds: dict, target: str) -> dict | None:
+    """Match `target` against scheduled triggers in the workspace.
+
+    Resolution order: exact id, id prefix, then case-insensitive substring of
+    config.title. Returns the augmented trigger dict, or None if nothing
+    matches.
+    """
+    rows = fetch_all_scheduled_triggers(creds)
+    match = next((t for t in rows if t.get("id") == target), None)
+    if match:
+        return match
+    match = next((t for t in rows if (t.get("id") or "").startswith(target)), None)
+    if match:
+        return match
+    needle = target.lower()
+    return next(
+        (t for t in rows if needle in ((t.get("config") or {}).get("title") or "").lower()),
+        None,
+    )
 
 
 def pick_agent(creds: dict, *, prompt: bool = True) -> str:
@@ -657,14 +755,29 @@ def pick_agent(creds: dict, *, prompt: bool = True) -> str:
 # Chat — POST /agents/sandbox/start + stream
 # ──────────────────────────────────────────────────────────────────────────
 
-def send_message(creds: dict, sess: dict, message: str) -> str:
-    sess["messages"].append({"sender": "user", "message": message})
 
+def send_message(creds: dict, sess: dict, message: str) -> str:
+    # Empty user messages are how trigger-preview sessions auto-fire (kicked off
+    # by `eesel new --trigger X` with no user typing yet). The backend filters
+    # empty messages out of the persisted chat history, so the task's history
+    # doesn't get polluted with "(blank user turn)" markers. Skip the local
+    # session append for the same reason — keeps `eesel sessions show` clean
+    # and subsequent turns don't keep resending the empty entry.
+    if message:
+        sess["messages"].append({"sender": "user", "message": message})
+
+    # Build the outgoing messages array. For auto-fire we send a one-shot
+    # `[{"sender":"user","message":""}]` so backend validation passes (it
+    # requires a non-empty array), but the message itself drops out of the
+    # persisted history.
+    outgoing_messages = sess["messages"] if sess["messages"] else [{"sender": "user", "message": ""}]
     body = {
-        "messages": sess["messages"],
+        "messages": outgoing_messages,
         "agentId": sess["agent_id"],
         "taskId": sess["task_id"],
     }
+    if sess.get("trigger_id"):
+        body["triggerId"] = sess["trigger_id"]
     url = f"{creds['api_url']}/agents/sandbox/start"
     req = urllib.request.Request(
         url,
@@ -681,7 +794,9 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         err(f"sandbox/start → {e.code}: {body_text}")
-        sess["messages"].pop()  # roll back the user message
+        # Only roll back if we actually appended (i.e. non-empty user message).
+        if message:
+            sess["messages"].pop()
         save_session(sess)
         return ""
 
@@ -748,8 +863,7 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
                     preview = (json.dumps(out) if not isinstance(out, str) else out)[:200]
                     print(_color(f"[tool] → {preview}", "2;37"), flush=True)
                 elif etype == "error":
-                    print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"),
-                          file=sys.stderr, flush=True)
+                    print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
         err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
         return ""
@@ -761,9 +875,10 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
 # Subcommands
 # ──────────────────────────────────────────────────────────────────────────
 
+
 def cmd_login(args) -> int:
     if args.dev:
-        login_dev()
+        login_dev(args.workspace_id)
     else:
         login_prod()
     return 0
@@ -791,6 +906,24 @@ def cmd_whoami(args) -> int:
     if creds.get("user_email"):
         print(f"user_email   : {creds['user_email']}")
     print(f"token expires: {expires_in}s ({expires_in // 3600}h {(expires_in % 3600) // 60}m)")
+
+    # Surface active impersonation so sticky state isn't invisible. Failures
+    # here (network, allowlist gate, missing endpoint on older servers) are
+    # intentionally silent — whoami shouldn't error just because we can't
+    # reach the endpoint.
+    try:
+        url = f"{creds['api_url']}/cli/impersonate"
+        status = http_request("GET", url, token=creds["token"])
+        if status.get("allowed"):
+            tgt = status.get("target_user_id")
+            if tgt:
+                print(f"impersonating: {tgt}")
+                print("               (every command runs as this user; clear with `eesel impersonate clear`)")
+            else:
+                print("impersonator : yes (no target set)")
+    except Exception:
+        pass
+
     return 0
 
 
@@ -805,8 +938,7 @@ def cmd_agents(args) -> int:
         active = creds.get("agent_id")
         for a in agents:
             mark = "*" if a.get("agent_id") == active else " "
-            print(f" {mark} {a.get('agent_id', '?')[:12]}  {a.get('name', '?')}"
-                  + (f"  [{a.get('agent_type')}]" if a.get('agent_type') else ""))
+            print(f" {mark} {a.get('agent_id', '?')[:12]}  {a.get('name', '?')}" + (f"  [{a.get('agent_type')}]" if a.get("agent_type") else ""))
         return 0
     if sub == "use":
         target = args.agent_id
@@ -833,8 +965,43 @@ def cmd_new(args) -> int:
     if args.agent:
         creds["agent_id"] = args.agent
         save_creds(creds)
-    sess = new_session(creds, agent_id=creds.get("agent_id"), name=args.name, switch_to=True)
-    ok(f"New session: {sess['id']} ({sess['name']})")
+
+    trigger_id = trigger_title = None
+    if getattr(args, "trigger", None):
+        match = resolve_scheduled_trigger(creds, args.trigger)
+        if not match:
+            err(f"No scheduled trigger matches '{args.trigger}'.")
+            info("Run `eesel triggers list` to see available triggers.")
+            return 1
+        trigger_id = match["id"]
+        trigger_title = (match.get("config") or {}).get("title")
+        # Pin the agent on the session to whatever owns the trigger; mismatched
+        # agent + trigger sends a chat to the wrong agent.
+        creds["agent_id"] = match["agent_id"]
+        save_creds(creds)
+
+    sess = new_session(
+        creds,
+        agent_id=creds.get("agent_id"),
+        name=args.name,
+        switch_to=True,
+        trigger_id=trigger_id,
+        trigger_title=trigger_title,
+    )
+    suffix = f" [trigger: {trigger_title}]" if trigger_title else ""
+    ok(f"New session: {sess['id']} ({sess['name']}){suffix}")
+
+    # Auto-fire when bound to a trigger. The whole point of binding a session
+    # to a scheduled trigger is to preview what it would output — making the
+    # user type "go" as a separate `chat` step was friction and polluted the
+    # persisted chat history with a "user said: go" turn. Now the session
+    # immediately fires once with an empty user message (backend filters it
+    # out of history), streams the agent's response, and leaves you in a
+    # state where follow-up `eesel chat "<scenario tweak>"` calls iterate
+    # on the preview.
+    if trigger_id:
+        info("Firing trigger...")
+        send_message(creds, sess, "")
     return 0
 
 
@@ -887,6 +1054,102 @@ def cmd_sessions(args) -> int:
     return 1
 
 
+def cmd_triggers(args) -> int:
+    creds = require_creds()
+    sub = args.triggers_cmd or "list"
+
+    if sub == "list":
+        rows = fetch_all_scheduled_triggers(creds)
+        if not rows:
+            info("(no scheduled triggers in this workspace)")
+            return 0
+        for t in rows:
+            cfg = t.get("config") or {}
+            title = cfg.get("title") or "(untitled)"
+            cron = cfg.get("cron") or "?"
+            tz = cfg.get("timezone") or "UTC"
+            tid = (t.get("id") or "?")[:12]
+            print(f" {tid}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
+        return 0
+
+    if sub == "fire":
+        match = resolve_scheduled_trigger(creds, args.trigger_id)
+        if not match:
+            err(f"No scheduled trigger matches '{args.trigger_id}'.")
+            info("Run `eesel triggers list` to see available triggers.")
+            return 1
+
+        url = f"{creds['api_url']}/triggers/{match['id']}/fire"
+        resp = http_request("POST", url, token=creds["token"], body={})
+
+        title = (match.get("config") or {}).get("title") or "(untitled)"
+        ok(f"Fired '{title}' (trigger={match['id'][:12]}, agent={match['agent_name']}).")
+        info(f"  scheduled_at: {resp.get('scheduled_at')}")
+        info(f"  external_ref: {resp.get('external_reference')}")
+        info("Tail the worker: docker logs slack-server-1 -f | grep scheduled_trigger")
+        return 0
+
+    return 1
+
+
+def cmd_impersonate(args) -> int:
+    """`eesel impersonate <user_id>` and `eesel impersonate clear`.
+
+    Sets (or clears) a sticky impersonation target on the server. From the
+    moment you set a target, every subsequent `eesel` command behaves as if
+    that user were calling — auth, workspace context, agents, integrations.
+    Calls `/cli/impersonate` (workspace-JWT authed), which mirrors the
+    semantics of `/sysadmin/set-impersonator-target` for the CLI's token
+    shape.
+
+    Combine with `eesel chat --trigger heartbeat` to preview a target's
+    heartbeat, or just `eesel chat` to run a general chat as them. WRITE
+    tools (email send, helpdesk reply, Slack post, etc.) are stubbed
+    server-side so previewing can't accidentally fire real-world actions.
+
+    Sticks for ~1 hour, or until you `eesel impersonate clear`. Always
+    visible in `eesel whoami`.
+    """
+    creds = require_creds()
+    target = args.user_id
+
+    if not target:
+        err("Usage: eesel impersonate <user_id>   or   eesel impersonate clear")
+        return 1
+
+    if target == "clear":
+        url = f"{creds['api_url']}/cli/impersonate"
+        try:
+            http_request("DELETE", url, token=creds["token"])
+        except urllib.error.HTTPError as e:
+            try:
+                payload = json.loads(e.read().decode("utf-8") or "{}")
+            except Exception:
+                payload = {}
+            err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
+            return 1
+        ok("Impersonation cleared.")
+        return 0
+
+    url = f"{creds['api_url']}/cli/impersonate"
+    try:
+        resp = http_request("POST", url, token=creds["token"], body={"target_user_id": target})
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8") or "{}")
+        except Exception:
+            payload = {}
+        err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
+        if e.code == 401:
+            info("This command requires a sysadmin/impersonator account. Your current login isn't on the allowlist.")
+        return 1
+
+    ok(f"Impersonating: {resp.get('target_user_id') or target}")
+    info("All subsequent `eesel` commands run as this user.")
+    info("Run `eesel whoami` to confirm. Clear with `eesel impersonate clear`.")
+    return 0
+
+
 def _print_cost_after_turn(creds: dict, sess: dict, prev_runs: int) -> None:
     """Poll briefly for fresh cost data, then print a one-line summary.
 
@@ -900,8 +1163,7 @@ def _print_cost_after_turn(creds: dict, sess: dict, prev_runs: int) -> None:
     while time.time() < deadline:
         d = fetch_session_cost(creds, sess)
         if d is None:
-            print(_color("[cost: unavailable in prod — check /activity in dashboard]",
-                         "2;37"), file=sys.stderr)
+            print(_color("[cost: unavailable in prod — check /activity in dashboard]", "2;37"), file=sys.stderr)
             return
         last = d
         if d["total_runs"] > prev_runs:
@@ -920,7 +1182,31 @@ def _current_run_count(creds: dict, sess: dict) -> int:
 def cmd_chat(args) -> int:
     creds = require_creds()
     pick_agent(creds, prompt=False)  # only prompt in REPL if needed
-    sess = ensure_current_session(creds, agent_id=creds.get("agent_id"))
+
+    # --trigger always opens a fresh session pinned to that trigger. Reusing an
+    # active session whose trigger doesn't match would mean half its turns ran
+    # under one trigger context and half under another — not useful for
+    # iteration.
+    target = getattr(args, "trigger", None)
+    if target:
+        match = resolve_scheduled_trigger(creds, target)
+        if not match:
+            err(f"No scheduled trigger matches '{target}'.")
+            info("Run `eesel triggers list` to see available triggers.")
+            return 1
+        creds["agent_id"] = match["agent_id"]
+        save_creds(creds)
+        sess = new_session(
+            creds,
+            agent_id=creds["agent_id"],
+            name=None,
+            switch_to=True,
+            trigger_id=match["id"],
+            trigger_title=(match.get("config") or {}).get("title"),
+        )
+        info(f"Preview session bound to trigger '{sess.get('trigger_title')}' ({sess['trigger_id'][:12]}, agent={match['agent_name']})")
+    else:
+        sess = ensure_current_session(creds, agent_id=creds.get("agent_id"))
     show_cost = bool(getattr(args, "cost", False))
 
     if args.message:
@@ -931,7 +1217,8 @@ def cmd_chat(args) -> int:
         return 0
 
     # REPL mode
-    info(f"session {sess['id']} ({sess.get('name')}) — agent {sess.get('agent_id', '?')[:8]}")
+    badge = f" [trigger: {sess.get('trigger_title')}]" if sess.get("trigger_id") else ""
+    info(f"session {sess['id']} ({sess.get('name')}) — agent {sess.get('agent_id', '?')[:8]}{badge}")
     if show_cost:
         info("cost-on: a one-line cost summary will print after each reply.")
     info("Type your message. Empty line submits. Ctrl-C to quit. /help for commands.")
@@ -964,8 +1251,7 @@ def cmd_chat(args) -> int:
                 print("  /quit       exit")
                 continue
             if line == "/new":
-                sess = new_session(creds, agent_id=creds.get("agent_id"),
-                                   name=None, switch_to=True)
+                sess = new_session(creds, agent_id=creds.get("agent_id"), name=None, switch_to=True)
                 info(f"new session: {sess['id']}")
                 continue
             if line == "/sessions":
@@ -1022,9 +1308,197 @@ def cmd_cost(args) -> int:
     return 0
 
 
+def fetch_documents(creds: dict, *, prefix: str | None = None, search: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
+    params = {
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    if prefix:
+        params["prefix"] = prefix
+    if search:
+        params["search"] = search
+    url = f"{creds['api_url']}/documents?{urllib.parse.urlencode(params)}"
+    data = http_request("GET", url, token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("documents") or data.get("items") or data.get("data") or []
+
+
+def agent_document_prefix(creds: dict) -> str:
+    return f"outputs/skills/{creds['agent_id']}"
+
+
+def agent_document_prefixes(creds: dict) -> list[str]:
+    return [f"files/{creds['agent_id']}", f"outputs/skills/{creds['agent_id']}"]
+
+
+def document_key_agent_id(key: str) -> str | None:
+    parts = (key or "").split("/")
+    if len(parts) >= 2 and parts[0] == "files":
+        return parts[1]
+    if len(parts) >= 3 and parts[0] == "outputs" and parts[1] == "skills":
+        return parts[2]
+    return None
+
+
+def document_matches_agent(creds: dict, document: dict) -> bool:
+    key = document.get("key") or document.get("document_key") or ""
+    return document_key_agent_id(key) == creds["agent_id"]
+
+
+def _document_key_for_workspace(document_key: str, workspace_id: str) -> str | None:
+    key = document_key.strip().lstrip("/")
+    parts = key.split("/", 1)
+    if parts and _looks_like_uuid(parts[0]):
+        if parts[0] != workspace_id:
+            return None
+        return parts[1] if len(parts) > 1 else ""
+    return key
+
+
+def _looks_like_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+def resolve_document_id(creds: dict, target: str) -> str | None:
+    documents = [doc for doc in fetch_documents(creds, limit=500) if document_matches_agent(creds, doc)]
+    exact = next((doc for doc in documents if doc.get("id") == target), None)
+    if exact:
+        return exact.get("id")
+    matches = [doc for doc in documents if (doc.get("id") or "").startswith(target)]
+    if len(matches) == 1:
+        return matches[0].get("id")
+    if len(matches) > 1:
+        labels = ", ".join((doc.get("id") or "?")[:12] for doc in matches[:5])
+        err(f"Document id prefix '{target}' is ambiguous: {labels}")
+        return None
+    err(f"No document id matches '{target}' in workspace {creds['workspace_id']}.")
+    return None
+
+
+def _mcp_metadata_header(metadata: dict) -> str:
+    payload = json.dumps(metadata, separators=(",", ":")).encode()
+    return base64.b64encode(payload).decode()
+
+
+def mcp_call_tool(creds: dict, tool_name: str, arguments: dict) -> dict:
+    body = {
+        "jsonrpc": "2.0",
+        "id": "eesel-cli",
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }
+    data = http_request(
+        "POST",
+        f"{creds['api_url']}/mcp",
+        token=creds["token"],
+        body=body,
+        headers={
+            "X-Eesel-Agent-Id": creds["agent_id"],
+            "X-Eesel-Metadata": _mcp_metadata_header({"available_tools_override": [tool_name]}),
+        },
+    )
+    if data.get("error"):
+        message = data["error"].get("message") or data["error"]
+        raise RuntimeError(str(message))
+    structured = (data.get("result") or {}).get("structuredContent") or {}
+    if structured.get("type") == "error" or structured.get("isError"):
+        raise RuntimeError(structured.get("text") or "Tool returned an error")
+    payload = structured.get("data")
+    if isinstance(payload, dict):
+        return payload
+    raise RuntimeError("Tool returned an invalid response")
+
+
+def doc_export_signed_url(creds: dict, *, document_id: str | None, document_key: str | None, fmt: str) -> tuple[str, str]:
+    arguments = {}
+    if document_id:
+        arguments["document_id"] = document_id
+    if document_key:
+        arguments["document_key"] = document_key
+
+    payload = mcp_call_tool(creds, "doc_export", arguments)
+    exports = payload.get("exports") or []
+    export = next((item for item in exports if item.get("format") == fmt), None)
+    if not export or not export.get("url"):
+        available = ", ".join(item.get("format", "?") for item in exports) or "none"
+        raise RuntimeError(f"Document export format '{fmt}' is not available. Available formats: {available}")
+    filename = payload.get("filename") or f"{document_id or 'document'}.{fmt}"
+    if not filename.endswith(f".{fmt}"):
+        filename = f"{Path(filename).stem}.{fmt}"
+    return filename, export["url"]
+
+
+def cmd_document(args) -> int:
+    sub = args.document_cmd or "list"
+    if sub == "list":
+        creds = require_creds()
+        documents = fetch_documents(
+            creds,
+            prefix=args.prefix,
+            search=args.search,
+            limit=args.limit,
+            offset=args.offset,
+        )
+        documents = [doc for doc in documents if document_matches_agent(creds, doc)]
+        if not documents:
+            info("(no documents)")
+            return 0
+        for doc in documents:
+            doc_id = doc.get("id", "?")
+            key = doc.get("key") or doc.get("document_key") or "?"
+            name = doc.get("name") or key.rsplit("/", 1)[-1]
+            print(f"{doc_id[:12]}  {key}  {name}")
+        return 0
+    if sub == "export":
+        return cmd_document_export(args)
+    return 1
+
+
+def cmd_document_export(args) -> int:
+    creds = require_creds()
+    fmt = args.format.lower()
+
+    if args.document_id:
+        document_id = resolve_document_id(creds, args.document_id)
+        if not document_id:
+            return 1
+        document_key = None
+    else:
+        key = _document_key_for_workspace(args.document_key, creds["workspace_id"])
+        if key is None:
+            err(f"Document key belongs to a different workspace than {creds['workspace_id']}. Run `eesel login --dev --workspace-id <workspace-id>` first.")
+            return 1
+        key_agent_id = document_key_agent_id(key)
+        if key_agent_id != creds["agent_id"]:
+            err(f"Document key belongs to agent {key_agent_id or 'unknown'}, but current CLI agent is {creds['agent_id']}.")
+            return 1
+        document_id = None
+        document_key = key
+
+    try:
+        filename, url = doc_export_signed_url(creds, document_id=document_id, document_key=document_key, fmt=fmt)
+    except RuntimeError as e:
+        err(str(e))
+        return 1
+
+    output_path = Path(args.output or filename).expanduser()
+    http_download(url, token=creds["token"], output_path=output_path)
+    ok(f"Exported {fmt} to {output_path}")
+    return 0
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="eesel", description=__doc__.strip().split("\n")[0])
@@ -1032,6 +1506,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)")
     sp.add_argument("--dev", action="store_true", help="Mint local dev JWT, no browser")
+    sp.add_argument("--workspace-id", help="Dev login only: workspace id to mint credentials for")
     sp.set_defaults(func=cmd_login)
 
     sp = sub.add_parser("logout", help="Clear stored credentials")
@@ -1050,6 +1525,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("new", help="Start a new chat session")
     sp.add_argument("--agent", help="Agent id to use (default: active agent)")
     sp.add_argument("--name", help="Session name (default: auto)")
+    sp.add_argument("--trigger", help="Bind session to a scheduled trigger (id-prefix or title substring) so the agent runs under that trigger's context (preview mode)")
     sp.set_defaults(func=cmd_new)
 
     sp = sub.add_parser("sessions", help="Manage chat sessions")
@@ -1065,17 +1541,69 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
     sp.add_argument("message", nargs="?", help="Message to send (omit for REPL)")
-    sp.add_argument("--cost", action="store_true",
-                    help="After each reply, print a one-line cost + token "
-                         "summary for the whole session (incl. sub-agents)")
+    sp.add_argument("--cost", action="store_true", help="After each reply, print a one-line cost + token summary for the whole session (incl. sub-agents)")
+    sp.add_argument(
+        "--trigger",
+        help="Open a preview session bound to a scheduled trigger "
+        "(id-prefix or title substring like 'heartbeat'). "
+        "The agent runs under that trigger's context — "
+        "useful for iterating on what the trigger would output",
+    )
     sp.set_defaults(func=cmd_chat)
 
-    sp = sub.add_parser("cost",
-                        help="Print cost + token usage for a session "
-                             "(includes sub-agents). Dev mode only.")
-    sp.add_argument("session_id", nargs="?",
-                    help="(default: active session, prefix-match ok)")
+    sp = sub.add_parser("cost", help="Print cost + token usage for a session (includes sub-agents). Dev mode only.")
+    sp.add_argument("session_id", nargs="?", help="(default: active session, prefix-match ok)")
     sp.set_defaults(func=cmd_cost)
+
+    sp = sub.add_parser("document", help="List or export documents")
+    d_sub = sp.add_subparsers(dest="document_cmd")
+    ls = d_sub.add_parser("list", help="List documents in this workspace")
+    ls.add_argument("--prefix", help="Filter by document key prefix")
+    ls.add_argument("--search", help="Search document names/keys")
+    ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
+    ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    exp = d_sub.add_parser("export", help="Download a document as markdown or HTML")
+    target = exp.add_mutually_exclusive_group(required=True)
+    target.add_argument("--document-key", help="Document key to export")
+    target.add_argument("--document-id", help="Document id to export")
+    exp.add_argument("--format", default="md", choices=["md", "html"], help="Export format")
+    exp.add_argument("-o", "--output", help="Output file path")
+    sp.set_defaults(func=cmd_document, document_cmd="list", prefix=None, search=None, limit=100, offset=0)
+
+    sp = sub.add_parser("triggers", help="List or fire scheduled triggers")
+    t_sub = sp.add_subparsers(dest="triggers_cmd")
+    t_sub.add_parser("list", help="List scheduled triggers in this workspace")
+    fire = t_sub.add_parser("fire", help="Manually fire a scheduled trigger")
+    fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
+    sp.set_defaults(func=cmd_triggers)
+
+    # Staff-only. Hidden from `eesel --help` (still runnable if you know the
+    # subcommand). Server-side allowlist is the actual gate; this just keeps
+    # the command off regular customers' radar so they're not asking what it
+    # does.
+    #
+    # argparse's `help=SUPPRESS` only blanks the description; the subcommand
+    # name still shows up in the choices list as `impersonate ==SUPPRESS==`.
+    # To fully hide we also drop the action from the subparser's
+    # `_choices_actions` list. Private attr but a known idiom — Python core
+    # ships it as `argparse._SubParsersAction._ChoicesPseudoAction`.
+    sp = sub.add_parser(
+        "impersonate",
+        help=argparse.SUPPRESS,
+        description="Act as another user — every subsequent `eesel` command runs "
+        "in their workspace. Combine with `eesel chat --trigger heartbeat` "
+        "to preview their heartbeat, or just `eesel chat` for general "
+        "chat. WRITE tools are stubbed server-side so no real emails/"
+        "replies fire. Requires a sysadmin/impersonator account.",
+    )
+    sub._choices_actions = [a for a in sub._choices_actions if a.dest != "impersonate"]
+    # Take a positional that's either a user_id or the literal "clear".
+    sp.add_argument(
+        "user_id",
+        nargs="?",
+        help="Auth0 user id of the target (e.g. 'auth0|abc…', 'google-oauth2|…'). Pass 'clear' to drop the impersonation.",
+    )
+    sp.set_defaults(func=cmd_impersonate)
 
     return p
 
