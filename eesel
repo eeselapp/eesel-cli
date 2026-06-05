@@ -1417,23 +1417,41 @@ def mcp_call_tool(creds: dict, tool_name: str, arguments: dict) -> dict:
     raise RuntimeError("Tool returned an invalid response")
 
 
-def doc_export_signed_url(creds: dict, *, document_id: str | None, document_key: str | None, fmt: str) -> tuple[str, str]:
-    arguments = {}
-    if document_id:
-        arguments["document_id"] = document_id
+def _document_record(creds: dict, *, document_id: str | None = None, document_key: str | None = None) -> dict | None:
+    """Look up a single document dict (id, key, name) the CLI agent owns."""
     if document_key:
-        arguments["document_key"] = document_key
+        for doc in fetch_documents(creds, prefix=document_key, limit=500):
+            if (doc.get("key") or doc.get("document_key")) == document_key and document_matches_agent(creds, doc):
+                return doc
+        return None
+    candidates = (doc for doc in fetch_documents(creds, limit=500) if document_matches_agent(creds, doc))
+    return next((doc for doc in candidates if doc.get("id") == document_id), None)
 
-    payload = mcp_call_tool(creds, "doc_export", arguments)
-    exports = payload.get("exports") or []
-    export = next((item for item in exports if item.get("format") == fmt), None)
-    if not export or not export.get("url"):
-        available = ", ".join(item.get("format", "?") for item in exports) or "none"
-        raise RuntimeError(f"Document export format '{fmt}' is not available. Available formats: {available}")
-    filename = payload.get("filename") or f"{document_id or 'document'}.{fmt}"
-    if not filename.endswith(f".{fmt}"):
-        filename = f"{Path(filename).stem}.{fmt}"
-    return filename, export["url"]
+
+def doc_export_signed_url(creds: dict, *, document_id: str, document_key: str | None, fmt: str) -> tuple[str, str]:
+    """Mint a fresh signed download URL for a document via the Bearer-authed
+    ``/documents/{id}/export-link`` endpoint.
+
+    The dashboard hands the chat model short app links
+    (``/platform/{agent}/files/{id}?download={fmt}``) and resolves them to a real
+    download at click time through this same endpoint, which signs a short-lived
+    token server-side. The CLI's workspace JWT can't open the cookie-gated
+    dashboard app route, but it can call export-link directly. Going through the
+    server export (rather than reading raw document content) is also what gives
+    blog posts their frontmatter — cover image, FAQs, SEO block, slug, tags live
+    in document properties and are prepended only by the server export path.
+    """
+    params = urllib.parse.urlencode({"format": fmt})
+    data = http_request(
+        "GET",
+        f"{creds['api_url']}/documents/{document_id}/export-link?{params}",
+        token=creds["token"],
+    )
+    url = data.get("url")
+    if not url:
+        raise RuntimeError(f"Export format '{fmt}' is not available for this document.")
+    stem = Path((document_key or document_id).rstrip("/").rsplit("/", 1)[-1]).stem or document_id
+    return f"{stem}.{fmt}", url
 
 
 def cmd_document(args) -> int:
@@ -1480,7 +1498,11 @@ def cmd_document_export(args) -> int:
         if key_agent_id != creds["agent_id"]:
             err(f"Document key belongs to agent {key_agent_id or 'unknown'}, but current CLI agent is {creds['agent_id']}.")
             return 1
-        document_id = None
+        record = _document_record(creds, document_key=key)
+        if not record or not record.get("id"):
+            err(f"No document found for key '{key}' in workspace {creds['workspace_id']}.")
+            return 1
+        document_id = record["id"]
         document_key = key
 
     try:
