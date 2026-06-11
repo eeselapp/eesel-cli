@@ -40,6 +40,11 @@ eesel agents use <id-or-name>
 eesel new                           # start a chat session
 eesel chat "hey, talk to me"        # one-shot send to active session
 eesel chat                          # interactive REPL
+
+eesel chat --task <task-id> "..."   # continue an existing conversation by
+                                    # its backend task id — e.g. post an
+                                    # async job result back into the chat
+                                    # that requested it
 ```
 
 Sessions:

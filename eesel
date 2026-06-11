@@ -225,14 +225,22 @@ def ensure_current_session(creds: dict, agent_id: str | None = None) -> dict:
     return new_session(creds, agent_id=agent_id, name=None, switch_to=True)
 
 
-def new_session(creds: dict, *, agent_id: str | None, name: str | None, switch_to: bool = True, trigger_id: str | None = None, trigger_title: str | None = None) -> dict:
+def find_session_by_task(task_id: str) -> dict | None:
+    """Find the local session bound to a backend task id, if any."""
+    for sess in list_sessions():
+        if sess.get("task_id") == task_id:
+            return sess
+    return None
+
+
+def new_session(creds: dict, *, agent_id: str | None, name: str | None, switch_to: bool = True, trigger_id: str | None = None, trigger_title: str | None = None, task_id: str | None = None) -> dict:
     sid = uuid.uuid4().hex[:12]
     sess = {
         "id": sid,
         "name": name or f"chat-{datetime.now().strftime('%Y%m%d-%H%M')}",
         "agent_id": agent_id or creds.get("agent_id"),
         "workspace_id": creds["workspace_id"],
-        "task_id": str(uuid.uuid4()),
+        "task_id": task_id or str(uuid.uuid4()),
         "messages": [],
         "created_at": time.time(),
         "updated_at": time.time(),
@@ -1187,8 +1195,31 @@ def cmd_chat(args) -> int:
     # active session whose trigger doesn't match would mean half its turns ran
     # under one trigger context and half under another — not useful for
     # iteration.
+    task_target = getattr(args, "task", None)
     target = getattr(args, "trigger", None)
-    if target:
+    if task_target and target:
+        err("--task and --trigger are mutually exclusive.")
+        return 1
+    if task_target:
+        # Attach to an existing backend conversation by its task id — e.g. one
+        # an agent handed to an external service so it can post a result back
+        # into the same conversation. Reuse the local session bound to that
+        # task if we have one (keeps local history accumulating), otherwise
+        # create a fresh session pinned to the given task id. The backend
+        # resumes the conversation from its own task state either way.
+        sess = find_session_by_task(task_target)
+        if sess:
+            set_current(sess["id"])
+        else:
+            sess = new_session(
+                creds,
+                agent_id=creds.get("agent_id"),
+                name=f"task-{task_target[:8]}",
+                switch_to=True,
+                task_id=task_target,
+            )
+        info(f"session {sess['id']} bound to task {task_target}")
+    elif target:
         match = resolve_scheduled_trigger(creds, target)
         if not match:
             err(f"No scheduled trigger matches '{target}'.")
@@ -1570,6 +1601,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(id-prefix or title substring like 'heartbeat'). "
         "The agent runs under that trigger's context — "
         "useful for iterating on what the trigger would output",
+    )
+    sp.add_argument(
+        "--task",
+        help="Continue an existing conversation by its backend task id "
+        "(e.g. one an agent included in an outbound request so your "
+        "service can post the result back into the same conversation). "
+        "Uses the active agent for new sessions",
     )
     sp.set_defaults(func=cmd_chat)
 
