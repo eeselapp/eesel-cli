@@ -35,7 +35,12 @@ EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/ee
 eesel login                         # opens dashboard.eesel.ai, captures workspace token
 eesel whoami
 eesel agents list
-eesel agents use <id-or-name>
+eesel agents use <id-or-name>       # set the active agent
+eesel agents use                    # ...or pick from an arrow-key menu (↑/↓, Enter)
+
+eesel instructions                  # print the active agent's instructions (system prompt)
+eesel instructions <id-or-name>     # ...for a specific agent
+eesel instructions > prompt.md      # stdout is just the prompt, so redirect/pipe freely
 
 eesel new                           # start a chat session
 eesel chat "hey, talk to me"        # one-shot send to active session
