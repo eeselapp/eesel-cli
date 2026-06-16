@@ -56,7 +56,8 @@ eesel sessions show
 eesel sessions delete <id>
 ```
 
-In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/quit`.
+In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/tasks`, `/task <id>`,
+`/cost`, `/cost-on`, `/cost-off`, `/quit`.
 
 ## Documents
 
@@ -76,6 +77,46 @@ eesel document export --document-id <id-or-prefix> --format html -o post.html
 file lands in the current directory using the document's filename.
 Export is scoped to the currently-active agent (`eesel agents use`),
 so set the right agent before exporting.
+
+## Tasks (workspace activity)
+
+`tasks` shows everything the workspace's agents have actually done —
+dashboard chats, the website widget, helpdesk ticket replies,
+scheduled-trigger runs, and sub-agent spawns. It's the same data as the
+dashboard's **Activity** view, and distinct from `sessions` (which are
+just the local chat handles you created with the CLI). `tasks list` marks
+rows that are also one of your local sessions with a `*`.
+
+```bash
+eesel tasks list                    # recent activity, newest first
+eesel tasks list --limit 100 --page 2
+eesel tasks list --agent "Support Bot"   # filter by agent (id, id-prefix, or name)
+eesel tasks count                   # total task count (optionally --agent)
+eesel tasks show <id>               # full transcript of one task (id-prefix ok)
+eesel tasks show <id> --json        # raw history payload
+eesel tasks show <id> --full        # don't truncate tool args/outputs
+eesel tasks show <id> --cost        # append a cost breakdown (dev only)
+eesel tasks cost <id>               # cost breakdown for any task (dev only)
+```
+
+Backed by the same workspace token the chat stream already uses
+(`POST /workspace/tasks`, `GET /workspace/tasks/{id}/history`), so no extra
+login is needed. Staff preview/impersonation tasks are filtered out
+server-side and never appear here.
+
+## Cost
+
+`eesel cost` and `eesel chat --cost` show how much a session has cost end
+to end, including everything the agent's sub-agents spawn under the hood.
+
+```bash
+eesel chat --cost "hello"           # one-line cost summary after each reply
+eesel cost                          # full breakdown for the active session
+eesel cost <session-id-prefix>      # cost for a specific session
+```
+
+Cost data is currently **dev-only** — in production, cost lives in the
+dashboard's Activity view.
 
 ## How auth works
 
