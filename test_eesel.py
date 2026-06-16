@@ -606,6 +606,217 @@ class TestFindFreePort:
             s.bind(("127.0.0.1", port))
 
 
+class TestResolveAgent:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot", "agent_type": "help_desk_agent"},
+        {"agent_id": "agent-def456", "name": "Blog Writer", "agent_type": "blog_writer_agent"},
+    ]
+
+    def test_exact_id(self):
+        assert eesel.resolve_agent(self.AGENTS, "agent-abc123")["name"] == "Support Bot"
+
+    def test_id_prefix(self):
+        assert eesel.resolve_agent(self.AGENTS, "agent-def")["name"] == "Blog Writer"
+
+    def test_exact_name(self):
+        assert eesel.resolve_agent(self.AGENTS, "Support Bot")["agent_id"] == "agent-abc123"
+
+    def test_no_match(self):
+        assert eesel.resolve_agent(self.AGENTS, "nope") is None
+
+    def test_exact_id_beats_prefix(self):
+        # An exact id match wins even if another id shares the prefix.
+        agents = [{"agent_id": "ag", "name": "Short"}, {"agent_id": "ag-long", "name": "Long"}]
+        assert eesel.resolve_agent(agents, "ag")["name"] == "Short"
+
+
+class TestAgentLabel:
+    def test_includes_name_and_short_id(self):
+        label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
+        assert "Support" in label
+        assert "agent-ab" in label  # 8-char prefix
+
+    def test_marks_active(self):
+        a = {"agent_id": "agent-1", "name": "Bot"}
+        assert "*active" in eesel._agent_label(a, active="agent-1")
+        assert "*active" not in eesel._agent_label(a, active="agent-2")
+
+    def test_includes_agent_type(self):
+        label = eesel._agent_label({"agent_id": "a", "name": "Bot", "agent_type": "knowledge_agent"})
+        assert "[knowledge_agent]" in label
+
+
+class TestInstructionsCommand:
+    AGENTS = [
+        {"agent_id": "agent-test-456", "name": "Active One", "prompt": "Be helpful and concise."},
+        {"agent_id": "agent-other-9", "name": "Sales Bot", "prompt": "Always upsell."},
+        {"agent_id": "agent-blank-0", "name": "Empty", "prompt": ""},
+    ]
+
+    def _args(self, agent=None):
+        return type("Args", (), {"agent": agent})()
+
+    def test_prints_active_agent_prompt(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_instructions(self._args())
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert out.strip() == "Be helpful and concise."
+
+    def test_resolves_named_agent(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_instructions(self._args("Sales Bot"))
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "Always upsell."
+
+    def test_resolves_id_prefix(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_instructions(self._args("agent-other"))
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "Always upsell."
+
+    def test_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_instructions(self._args("ghost"))
+        assert rc == 1
+        assert capsys.readouterr().out == ""  # nothing leaks to stdout
+
+    def test_empty_prompt_reports_no_instructions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_instructions(self._args("Empty"))
+        assert rc == 0
+        # Header + "(no instructions...)" go to stderr; stdout stays clean.
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "no instructions" in captured.err
+
+    def test_no_agents_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [])
+        assert eesel.cmd_instructions(self._args()) == 1
+
+    def test_no_active_agent_errors(self, tmp_config, fake_creds, monkeypatch):
+        # Active agent id doesn't match any returned agent and no target given.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "x", "name": "X", "prompt": "p"}])
+        assert eesel.cmd_instructions(self._args()) == 1
+
+
+class TestAgentsUseInteractive:
+    AGENTS = [
+        {"agent_id": "agent-aaa", "name": "First"},
+        {"agent_id": "agent-bbb", "name": "Second"},
+    ]
+
+    def _args(self, agent_id=None):
+        return type("Args", (), {"agents_cmd": "use", "agent_id": agent_id})()
+
+    def test_use_with_id_sets_active(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(self._args("agent-bbb"))
+        assert rc == 0
+        assert eesel.load_creds()["agent_id"] == "agent-bbb"
+
+    def test_use_without_id_opens_menu_and_sets_choice(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        seen = {}
+
+        def fake_select(options, *, title=None, initial=0):
+            seen["options"] = options
+            seen["initial"] = initial
+            return 1  # pick "Second"
+
+        monkeypatch.setattr(eesel, "interactive_select", fake_select)
+        rc = eesel.cmd_agents(self._args(None))
+        assert rc == 0
+        assert eesel.load_creds()["agent_id"] == "agent-bbb"
+        assert len(seen["options"]) == 2
+
+    def test_menu_starts_on_active_agent(self, tmp_config, fake_creds, monkeypatch):
+        # fake_creds active agent is "agent-test-456"; put it second in the list.
+        agents = [{"agent_id": "agent-aaa", "name": "First"}, {"agent_id": "agent-test-456", "name": "Active"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        captured = {}
+
+        def fake_select(options, *, title=None, initial=0):
+            captured["initial"] = initial
+            return initial
+
+        monkeypatch.setattr(eesel, "interactive_select", fake_select)
+        eesel.cmd_agents(self._args(None))
+        assert captured["initial"] == 1
+
+    def test_cancel_leaves_active_agent_unchanged(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
+        rc = eesel.cmd_agents(self._args(None))
+        assert rc == 1
+        assert eesel.load_creds()["agent_id"] == "agent-test-456"  # untouched
+
+    def test_unknown_id_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(self._args("ghost"))
+        assert rc == 1
+        assert eesel.load_creds()["agent_id"] == "agent-test-456"
+
+
+class TestAgentsUnset:
+    def _args(self):
+        return type("Args", (), {"agents_cmd": "unset"})()
+
+    def test_unset_clears_active_agent(self, tmp_config, fake_creds):
+        assert eesel.load_creds().get("agent_id") == "agent-test-456"
+        rc = eesel.cmd_agents(self._args())
+        assert rc == 0
+        # The key is removed entirely, leaving the rest of the creds intact.
+        creds = eesel.load_creds()
+        assert "agent_id" not in creds
+        assert creds["workspace_id"] == "ws-test-123"
+        assert creds["token"] == "test-jwt-token"
+
+    def test_unset_when_already_unset_is_noop(self, tmp_config, fake_creds, capsys):
+        eesel.cmd_agents(self._args())  # clear once
+        rc = eesel.cmd_agents(self._args())  # clear again
+        assert rc == 0
+        assert "No active agent" in capsys.readouterr().err
+
+    def test_unset_does_not_call_fetch_agents(self, tmp_config, fake_creds, monkeypatch):
+        # Clearing is purely local — it must not hit the network.
+        def boom(creds):
+            raise AssertionError("fetch_agents should not be called for unset")
+
+        monkeypatch.setattr(eesel, "fetch_agents", boom)
+        assert eesel.cmd_agents(self._args()) == 0
+
+
+class TestInteractiveSelectFallback:
+    def test_numbered_select_valid_index(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _="": "1")
+        assert eesel._numbered_select(["a", "b", "c"]) == 1
+
+    def test_numbered_select_out_of_range(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _="": "9")
+        assert eesel._numbered_select(["a", "b"]) is None
+
+    def test_numbered_select_non_numeric(self, monkeypatch):
+        monkeypatch.setattr("builtins.input", lambda _="": "nope")
+        assert eesel._numbered_select(["a", "b"]) is None
+
+    def test_numbered_select_eof_cancels(self, monkeypatch):
+        def boom(_=""):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", boom)
+        assert eesel._numbered_select(["a", "b"]) is None
+
+    def test_interactive_select_empty_options(self):
+        assert eesel.interactive_select([]) is None
+
+    def test_interactive_select_falls_back_when_not_tty(self, monkeypatch):
+        # Non-TTY stdin → fall back to the numbered prompt path.
+        monkeypatch.setattr(eesel.sys.stdin, "isatty", lambda: False)
+        monkeypatch.setattr("builtins.input", lambda _="": "0")
+        assert eesel.interactive_select(["only"]) == 0
+
+
 class TestArgParser:
     def test_parser_builds(self):
         # Smoke test: argparse construction shouldn't blow up.
@@ -649,6 +860,39 @@ class TestArgParser:
         assert args.cmd == "agents"
         assert args.agents_cmd == "use"
         assert args.agent_id == "my-agent"
+
+    def test_agents_use_id_is_optional(self):
+        # `agents use` with no id parses (interactive menu picks the agent).
+        parser = eesel.build_parser()
+        args = parser.parse_args(["agents", "use"])
+        assert args.cmd == "agents"
+        assert args.agents_cmd == "use"
+        assert args.agent_id is None
+
+    def test_agents_unset_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["agents", "unset"])
+        assert args.cmd == "agents"
+        assert args.agents_cmd == "unset"
+        assert args.func is eesel.cmd_agents
+
+    def test_instructions_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["instructions"])
+        assert args.func is eesel.cmd_instructions
+        assert args.agent is None
+
+    def test_instructions_subcommand_parses_agent(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["instructions", "Support Bot"])
+        assert args.func is eesel.cmd_instructions
+        assert args.agent == "Support Bot"
+
+    def test_singular_instruction_is_not_a_command(self):
+        # We standardized on the plural; the singular should not parse.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["instruction"])
 
     def test_chat_cost_flag_parses(self):
         parser = eesel.build_parser()

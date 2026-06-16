@@ -16,7 +16,9 @@ which session is "active" so plain `eesel chat "msg"` knows where to send.
 
 API surface used:
   POST /workspaces/token             (dashboard side, prod login bridge only)
-  GET  /agents                       list agents in the workspace
+  GET  /agents                       list agents in the workspace (each row
+                                       already includes the agent's `prompt`,
+                                       which `eesel instructions` prints)
   GET  /agents/{id}/triggers         list triggers configured for one agent
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
                                        optional triggerId → preview a scheduled
@@ -111,6 +113,131 @@ def err(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(_color(f"✓ {msg}", "32"), file=sys.stderr)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Interactive selection (arrow-key menu)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _read_key(fd: int) -> str:
+    """Read one keypress from the raw fd (already in cbreak mode) and normalize.
+
+    Returns one of: 'up', 'down', 'left', 'right', 'enter', 'esc', 'ctrl-c',
+    or the raw single character for anything else.
+
+    Reads bytes straight off the fd with os.read (not sys.stdin.read): a
+    TextIOWrapper would buffer ahead, and select() — which only sees the OS-level
+    fd — would then disagree with what's actually been consumed.
+    """
+    import select
+
+    ch = os.read(fd, 1)
+    if ch == b"\x03":
+        return "ctrl-c"
+    if ch in (b"\r", b"\n"):
+        return "enter"
+    if ch == b"\x1b":
+        # Distinguish a lone Esc from an arrow-key escape sequence. Arrow keys
+        # arrive as a complete "\x1b[A" burst, so if nothing is queued right
+        # after the Esc it was a bare Esc keypress.
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if not r or os.read(fd, 1) != b"[":
+            return "esc"
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if not r:
+            return "esc"
+        return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(os.read(fd, 1), "other")
+    try:
+        return ch.decode()
+    except UnicodeDecodeError:
+        return "other"
+
+
+def _numbered_select(options: list[str], *, title: str | None = None) -> int | None:
+    """Fallback picker for non-interactive terminals: print a numbered list and
+    read an index. Returns the chosen index, or None if cancelled/invalid."""
+    if title:
+        print(title, file=sys.stderr)
+    for i, opt in enumerate(options):
+        print(f"  [{i}] {opt}", file=sys.stderr)
+    try:
+        raw = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        return None
+    return idx if 0 <= idx < len(options) else None
+
+
+def interactive_select(options: list[str], *, title: str | None = None, initial: int = 0) -> int | None:
+    """Show an arrow-key navigable menu and return the chosen index.
+
+    ↑/↓ (or k/j) move, Enter confirms, q/Esc/Ctrl-C cancel (returns None). Falls
+    back to a numbered text prompt when stdin/stderr isn't an interactive TTY or
+    raw-mode control is unavailable (e.g. Windows). The menu renders to stderr
+    so command stdout stays clean.
+    """
+    if not options:
+        return None
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return _numbered_select(options, title=title)
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return _numbered_select(options, title=title)
+
+    out = sys.stderr
+    idx = max(0, min(initial, len(options) - 1))
+
+    def render(first: bool) -> None:
+        if not first:
+            out.write(f"\033[{len(options)}A")  # back to the top of the list
+        for i, opt in enumerate(options):
+            marker = "❯" if i == idx else " "
+            line = f"{marker} {opt}"
+            if i == idx:
+                line = f"\033[36m{line}\033[0m"  # cyan highlight
+            out.write(f"\r\033[K{line}\n")
+        out.flush()
+
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        # isatty() lied (e.g. a pipe masquerading as a tty) — degrade gracefully.
+        return _numbered_select(options, title=title)
+
+    if title:
+        out.write(title + "\n")
+    out.write("\033[?25l")  # hide cursor
+    out.flush()
+    chosen: int | None = idx
+    try:
+        tty.setcbreak(fd)
+        render(first=True)
+        while True:
+            key = _read_key(fd)
+            if key in ("ctrl-c", "esc", "q"):
+                chosen = None
+                break
+            if key in ("up", "k"):
+                idx = (idx - 1) % len(options)
+                render(first=False)
+            elif key in ("down", "j"):
+                idx = (idx + 1) % len(options)
+                render(first=False)
+            elif key == "enter":
+                chosen = idx
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\033[?25h")  # restore cursor
+        out.flush()
+    return chosen
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -688,6 +815,27 @@ def fetch_agents(creds: dict) -> list[dict]:
     return items
 
 
+def resolve_agent(agents: list[dict], target: str) -> dict | None:
+    """Match `target` against agents by exact id, then id-prefix, then exact
+    name. Returns the agent dict or None."""
+    return (
+        next((a for a in agents if a.get("agent_id") == target), None)
+        or next((a for a in agents if (a.get("agent_id") or "").startswith(target)), None)
+        or next((a for a in agents if a.get("name") == target), None)
+    )
+
+
+def _agent_label(a: dict, active: str | None = None) -> str:
+    """One-line display label for an agent, used in lists and pickers."""
+    aid = a.get("agent_id", "?")
+    label = f"{a.get('name', '?')}  ({aid[:8]})"
+    if a.get("agent_type"):
+        label += f"  [{a.get('agent_type')}]"
+    if active and aid == active:
+        label += "  *active"
+    return label
+
+
 def fetch_triggers(creds: dict, agent_id: str) -> list[dict]:
     """Return list of triggers for one agent."""
     url = f"{creds['api_url']}/agents/{agent_id}/triggers"
@@ -951,22 +1099,78 @@ def cmd_agents(args) -> int:
             print(f" {mark} {a.get('agent_id', '?')[:12]}  {a.get('name', '?')}" + (f"  [{a.get('agent_type')}]" if a.get("agent_type") else ""))
         return 0
     if sub == "use":
-        target = args.agent_id
         agents = fetch_agents(creds)
-        # Match by full id, prefix, or name.
-        match = next((a for a in agents if a.get("agent_id") == target), None)
-        if not match:
-            match = next((a for a in agents if (a.get("agent_id") or "").startswith(target)), None)
-        if not match:
-            match = next((a for a in agents if a.get("name") == target), None)
-        if not match:
-            err(f"No agent matches '{target}'.")
+        if not agents:
+            err("No agents in workspace. Create one in the dashboard first.")
             return 1
+        active = creds.get("agent_id")
+        target = args.agent_id
+        if target:
+            match = resolve_agent(agents, target)
+            if not match:
+                err(f"No agent matches '{target}'.")
+                return 1
+        else:
+            # No id given → interactive arrow-key menu, starting on the active one.
+            labels = [_agent_label(a, active) for a in agents]
+            initial = next((i for i, a in enumerate(agents) if a.get("agent_id") == active), 0)
+            choice = interactive_select(
+                labels,
+                title="Select an agent  (↑/↓ to move, Enter to confirm, q to cancel):",
+                initial=initial,
+            )
+            if choice is None:
+                info("Cancelled.")
+                return 1
+            match = agents[choice]
         creds["agent_id"] = match["agent_id"]
         save_creds(creds)
         ok(f"Active agent: {match.get('name')} ({match['agent_id']})")
         return 0
+    if sub == "unset":
+        if not creds.get("agent_id"):
+            info("No active agent set.")
+            return 0
+        prev = creds.pop("agent_id", None)
+        save_creds(creds)
+        ok(f"Cleared active agent ({prev}). Commands that need one will prompt or accept --agent.")
+        return 0
     return 1
+
+
+def cmd_instructions(args) -> int:
+    """Print an agent's instructions (the system prompt that drives it).
+
+    Defaults to the active agent; pass an id / id-prefix / name to inspect a
+    different one. The instructions go to stdout (pipe/redirect-friendly) and
+    the header to stderr, so `eesel instructions > prompt.md` captures just the
+    prompt.
+    """
+    creds = require_creds()
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return 1
+
+    target = getattr(args, "agent", None)
+    if target:
+        agent = resolve_agent(agents, target)
+        if not agent:
+            err(f"No agent matches '{target}'.")
+            return 1
+    else:
+        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
+        if not agent:
+            err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
+            return 1
+
+    info(f"# {agent.get('name', '?')} ({agent.get('agent_id', '')[:12]}) — instructions")
+    prompt = (agent.get("prompt") or "").strip()
+    if not prompt:
+        info("(no instructions set for this agent)")
+        return 0
+    print(prompt)
+    return 0
 
 
 def cmd_new(args) -> int:
@@ -1822,9 +2026,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("agents", help="List or switch agents")
     a_sub = sp.add_subparsers(dest="agents_cmd")
     a_sub.add_parser("list", help="List agents in this workspace")
-    use = a_sub.add_parser("use", help="Set the active agent")
-    use.add_argument("agent_id", help="Full id, id prefix, or agent name")
+    use = a_sub.add_parser("use", help="Set the active agent (omit id for an interactive menu)")
+    use.add_argument("agent_id", nargs="?", help="Full id, id prefix, or agent name (omit to pick from an arrow-key menu)")
+    a_sub.add_parser("unset", help="Clear the active agent (next command that needs one prompts again)")
     sp.set_defaults(func=cmd_agents)
+
+    sp = sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")
+    sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    sp.set_defaults(func=cmd_instructions)
 
     sp = sub.add_parser("new", help="Start a new chat session")
     sp.add_argument("--agent", help="Agent id to use (default: active agent)")
