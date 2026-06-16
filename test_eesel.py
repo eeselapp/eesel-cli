@@ -1552,3 +1552,344 @@ class TestTasksShow:
         rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7"))
         assert rc == 0
         assert "dev-only" in capsys.readouterr().err
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Integrations / tools / triggers --all  (read-only inspectors)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_INTEGRATIONS = [
+    {
+        "id": "int-zendesk-1",
+        "integrationType": "zendesk",
+        "connectionStatus": "FULL",
+        "identifier": "acme.zendesk.com",
+        "properties": [
+            {"key": "subdomain", "value": "acme"},
+            {"key": "zendesk_conversations_access_token", "value": "tok-SECRET-xyz"},
+        ],
+    },
+    {"id": None, "integrationType": "ai_actions", "connectionStatus": "FULL", "properties": []},
+]
+
+_TOOLS = [
+    {
+        "tool_id": "t1",
+        "tool_key": "zendesk_leave_internal_note",
+        "name": "Leave internal note",
+        "tool_action": "write",
+        "permission_mode": "ask",
+        "integration_id": "int-zendesk-1",
+        "is_connected": True,
+        "config": {"type": "json_schema", "tool_data": {"integration_key": "zendesk", "description": "note"}},
+    },
+    {
+        "tool_id": "t2",
+        "tool_key": "doc_search",
+        "name": "Search docs",
+        "tool_action": "read",
+        "permission_mode": "always_allow",
+        "integration_id": None,
+        "is_connected": True,
+        "config": {"tool_data": {"integration_key": "ai_actions"}},
+    },
+]
+
+_ALL_TRIGGERS = [
+    {"id": "sch-1", "type": "SCHEDULE", "trigger_key": "eesel_scheduled",
+     "config": {"title": "Heartbeat", "cron": "0 9 * * *", "timezone": "UTC"},
+     "integration_id": None, "agent_id": "a1", "agent_name": "Bot"},
+    {"id": "zd-1", "type": "WEBHOOK", "trigger_key": "zendesk_ticket_created",
+     "config": {"foo": "bar"}, "integration_id": "int-zendesk-1",
+     "last_executed_at": "2026-05-01T10:00:00+00:00", "agent_id": "a1", "agent_name": "Bot"},
+    {"id": "ic-1", "type": "EVENT", "trigger_key": "intercom_conversation_replied",
+     "config": None, "integration_id": "int-ic-9", "agent_id": "a1", "agent_name": "Bot"},
+]
+
+
+class TestIntegrationsFetch:
+    def test_fetch_integrations_passes_agent_id_and_returns_list(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"] = method, url
+            return [{"id": "int-1", "integrationType": "zendesk"}]
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        out = eesel.fetch_integrations(fake_creds, agent_id="agent-x")
+        assert captured["method"] == "GET"
+        assert captured["url"] == "http://localhost:8080/integrations?agent_id=agent-x"
+        assert out[0]["integrationType"] == "zendesk"
+
+    def test_fetch_integrations_no_agent_omits_query(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return []
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_integrations(fake_creds)
+        assert captured["url"] == "http://localhost:8080/integrations"
+
+    def test_fetch_integrations_unwraps_dict_shape(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"integrations": [{"id": "x"}]})
+        assert eesel.fetch_integrations(fake_creds) == [{"id": "x"}]
+
+
+class TestToolsFetch:
+    def test_fetch_tools_returns_bare_list(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return [{"tool_key": "doc_search"}]
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        out = eesel.fetch_tools(fake_creds, "agent-x")
+        assert captured["url"] == "http://localhost:8080/agents/agent-x/tools"
+        assert out[0]["tool_key"] == "doc_search"
+
+    def test_tool_row_pulls_integration_key_from_tool_data(self):
+        row = eesel._tool_row(_TOOLS[0])
+        assert row["name"] == "Leave internal note"
+        assert row["action"] == "WRITE"  # uppercased from "write"
+        assert row["permission"] == "ask"
+        assert row["integration_key"] == "zendesk"  # from config.tool_data
+        assert row["integration_id"] == "int-zendesk-1"
+
+    def test_tool_row_handles_null_config_and_integration(self):
+        row = eesel._tool_row({"tool_key": "k", "tool_action": "read", "config": None})
+        assert row["name"] == "k"  # falls back to tool_key when name absent
+        assert row["action"] == "READ"
+        assert row["integration_key"] == "—"
+        assert row["integration_id"] == "—"
+
+
+class TestTriggerHelpers:
+    def test_fetch_all_triggers_augments_every_agent(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Bot2"}])
+        per_agent = {
+            "a1": [{"id": "t1", "trigger_key": "eesel_scheduled"}],
+            "a2": [{"id": "t2", "trigger_key": "zendesk_ticket_created"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_triggers", lambda creds, aid: per_agent[aid])
+        rows = eesel.fetch_all_triggers(fake_creds)
+        assert {r["id"] for r in rows} == {"t1", "t2"}
+        assert {r["agent_name"] for r in rows} == {"Bot", "Bot2"}
+
+    def test_fetch_all_scheduled_is_subset(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        scheduled = eesel.fetch_all_scheduled_triggers(fake_creds)
+        assert [t["id"] for t in scheduled] == ["sch-1"]
+
+    def test_one_agent_failure_does_not_blank_list(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Broken"}])
+
+        def flaky(creds, aid):
+            if aid == "a2":
+                raise RuntimeError("boom")
+            return [{"id": "t1", "trigger_key": "eesel_scheduled"}]
+
+        monkeypatch.setattr(eesel, "fetch_triggers", flaky)
+        rows = eesel.fetch_all_triggers(fake_creds)
+        assert [r["id"] for r in rows] == ["t1"]
+
+    def test_integration_label_resolves_then_falls_back_to_prefix(self):
+        id_to_type = {"int-zendesk-1": "zendesk"}
+        assert eesel._trigger_integration_label(_ALL_TRIGGERS[1], id_to_type) == "zendesk"
+        # int-ic-9 not in the map → derive from the trigger_key prefix.
+        assert eesel._trigger_integration_label(_ALL_TRIGGERS[2], id_to_type) == "intercom"
+
+    def test_redact_secrets_masks_sensitive_keys_only(self):
+        cfg = {
+            "app_id": "r9",
+            "access_token": "tok-xyz",
+            "tags": ["a", "b"],
+            "nested": {"client_secret": "shh", "mode": "any"},
+        }
+        red = eesel._redact_secrets(cfg)
+        assert red["app_id"] == "r9"
+        assert red["access_token"] == "***"
+        assert red["tags"] == ["a", "b"]
+        assert red["nested"]["client_secret"] == "***"
+        assert red["nested"]["mode"] == "any"
+        # Empty/None secret values are left as-is (nothing to leak).
+        assert eesel._redact_secrets({"token": ""}) == {"token": ""}
+        # The original dict is not mutated.
+        assert cfg["access_token"] == "tok-xyz"
+
+
+class TestIsSysadmin:
+    def test_true_when_allowed(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"allowed": True})
+        assert eesel._is_sysadmin(fake_creds) is True
+
+    def test_false_when_not_allowed(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"allowed": False})
+        assert eesel._is_sysadmin(fake_creds) is False
+
+    def test_fails_closed_on_systemexit(self, fake_creds, monkeypatch):
+        def boom(*a, **k):
+            raise SystemExit("GET .../cli/impersonate → 404")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        assert eesel._is_sysadmin(fake_creds) is False
+
+
+class TestIntegrationsCommand:
+    def test_lists_id_type_status_subdomain_without_secrets(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        rc = eesel.cmd_integrations(_args(json=False, secrets=False))
+        cap = capsys.readouterr()
+        assert rc == 0
+        assert "zendesk" in cap.out and "FULL" in cap.out and "acme.zendesk.com" in cap.out
+        assert "ai_actions" in cap.out
+        # Secrets stay hidden by default.
+        assert "tok-SECRET-xyz" not in cap.out
+
+    def test_secrets_revealed_for_sysadmin(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
+        eesel.cmd_integrations(_args(json=False, secrets=True))
+        out = capsys.readouterr().out
+        assert "tok-SECRET-xyz" in out
+        assert "subdomain = acme" in out
+
+    def test_secrets_denied_for_non_sysadmin(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
+        eesel.cmd_integrations(_args(json=False, secrets=True))
+        cap = capsys.readouterr()
+        assert "tok-SECRET-xyz" not in cap.out
+        assert "restricted" in cap.err
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        eesel.cmd_integrations(_args(json=True, secrets=False))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload[0]["integrationType"] == "zendesk"
+
+    def test_empty(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
+        rc = eesel.cmd_integrations(_args(json=False, secrets=False))
+        assert rc == 0
+        assert "(no integrations)" in capsys.readouterr().err
+
+
+class TestToolsCommand:
+    def _agents(self):
+        return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+
+    def test_lists_active_agent_tools(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Leave internal note" in out and "WRITE" in out and "ask" in out
+        assert "Search docs" in out and "READ" in out and "always_allow" in out
+        # integration column shows the resolved key.
+        assert "zendesk" in out
+
+    def test_resolves_named_agent(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "agent-test-456", "name": "Support Bot"},
+            {"agent_id": "agent-other-999", "name": "Sales Bot"}])
+
+        def fake_tools(creds, aid):
+            captured["aid"] = aid
+            return []
+
+        monkeypatch.setattr(eesel, "fetch_tools", fake_tools)
+        eesel.cmd_tools(_args(agent="Sales Bot", json=False))
+        assert captured["aid"] == "agent-other-999"
+
+    def test_no_active_agent_errors(self, fake_creds, monkeypatch, capsys):
+        creds = dict(fake_creds)
+        creds.pop("agent_id")
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Bot2"}])
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: pytest.fail("should not fetch"))
+        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        assert rc == 1
+        assert "No active agent" in capsys.readouterr().err
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        eesel.cmd_tools(_args(agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload[0]["tool_key"] == "zendesk_leave_internal_note"
+
+    def test_empty_tools(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: [])
+        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        assert rc == 0
+        assert "no tools" in capsys.readouterr().err
+
+
+class TestTriggersAll:
+    def test_all_groups_scheduled_on_top_then_by_integration(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        # scheduled group renders first, with the existing cron/title format.
+        assert "scheduled (1)" in out and "Heartbeat" in out and "cron=0 9 * * *" in out
+        # zendesk group (resolved via integration map) + intercom (prefix fallback).
+        assert "zendesk (1)" in out and "zendesk_ticket_created" in out and "WEBHOOK" in out
+        assert "intercom (1)" in out and "intercom_conversation_replied" in out
+        # config shown inline for non-scheduled triggers.
+        assert '"foo": "bar"' in out
+        assert out.index("scheduled (1)") < out.index("zendesk (1)")
+
+    def test_all_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda *a, **k: pytest.fail("json path must not fetch integrations"))
+        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert {t["id"] for t in payload} == {"sch-1", "zd-1", "ic-1"}
+
+    def test_all_degrades_when_integrations_unreachable(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+
+        def boom(*a, **k):
+            raise SystemExit("GET /integrations → 401")
+
+        monkeypatch.setattr(eesel, "fetch_integrations", boom)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        # zendesk integration_id can't be resolved to a type → prefix label used.
+        assert "zendesk (1)" in out and "intercom (1)" in out
+
+    def test_default_list_still_scheduled_only(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=False, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Heartbeat" in out
+        # Non-scheduled triggers are not listed by the default view.
+        assert "zendesk_ticket_created" not in out
+
+    def test_all_redacts_secrets_in_config(self, fake_creds, monkeypatch, capsys):
+        triggers = [{
+            "id": "ic-1", "type": "WEBHOOK", "trigger_key": "intercom_conversation_replied",
+            "config": {"access_token": "tok-LEAK", "app_id": "abc"},
+            "integration_id": None, "agent_id": "a1", "agent_name": "Bot",
+        }]
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: triggers)
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
+        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        out = capsys.readouterr().out
+        assert "tok-LEAK" not in out
+        assert '"access_token": "***"' in out
+        assert "abc" in out  # non-secret config still shown

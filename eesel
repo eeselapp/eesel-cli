@@ -20,6 +20,11 @@ API surface used:
                                        already includes the agent's `prompt`,
                                        which `eesel instructions` prints)
   GET  /agents/{id}/triggers         list triggers configured for one agent
+                                       (`eesel triggers --all` groups them by
+                                       integration; scheduled stay on top)
+  GET  /agents/{id}/tools            list an agent's tools/actions (eesel tools)
+  GET  /integrations                 list workspace integrations + connection
+                                       status (eesel integrations)
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
                                        optional triggerId → preview a scheduled
                                        trigger's context in chat
@@ -843,11 +848,12 @@ def fetch_triggers(creds: dict, agent_id: str) -> list[dict]:
     return data.get("triggers") or []
 
 
-def fetch_all_scheduled_triggers(creds: dict) -> list[dict]:
-    """Return scheduled triggers across every agent in the workspace.
+def fetch_all_triggers(creds: dict) -> list[dict]:
+    """Return every trigger across all agents in the workspace.
 
     Each row is the raw trigger dict, augmented with `agent_id` and
-    `agent_name` for display.
+    `agent_name` for display. One agent's failure is warned and skipped so a
+    single broken agent can't blank the whole list.
     """
     out = []
     for a in fetch_agents(creds):
@@ -856,14 +862,116 @@ def fetch_all_scheduled_triggers(creds: dict) -> list[dict]:
             continue
         try:
             for t in fetch_triggers(creds, agent_id):
-                if t.get("trigger_key") != "eesel_scheduled":
-                    continue
                 t["agent_id"] = agent_id
                 t["agent_name"] = a.get("name") or "?"
                 out.append(t)
         except Exception as e:  # one agent's failure shouldn't kill the list
             warn(f"Couldn't list triggers for {a.get('name', agent_id)}: {e}")
     return out
+
+
+def fetch_all_scheduled_triggers(creds: dict) -> list[dict]:
+    """Scheduled triggers across the workspace — the subset of
+    `fetch_all_triggers` whose `trigger_key` is ``eesel_scheduled``."""
+    return [t for t in fetch_all_triggers(creds) if t.get("trigger_key") == "eesel_scheduled"]
+
+
+def fetch_integrations(creds: dict, *, agent_id: str | None = None) -> list[dict]:
+    """List the workspace's integrations.
+
+    Passing ``agent_id`` makes the server compute connection status against
+    that agent. The response is a flat list of serialized integration dicts:
+    id, integrationType, connectionStatus, identifier (subdomain), properties.
+    """
+    params = {"agent_id": agent_id} if agent_id else {}
+    qs = f"?{urllib.parse.urlencode(params)}" if params else ""
+    data = http_request("GET", f"{creds['api_url']}/integrations{qs}", token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("integrations") or data.get("items") or []
+
+
+def fetch_tools(creds: dict, agent_id: str) -> list[dict]:
+    """List the tools/actions configured for one agent.
+
+    Each entry carries tool_key, name, tool_action (read/write), permission_mode,
+    integration_id, is_connected, and a nested ``config.tool_data`` holding the
+    integration_key. The endpoint returns a bare JSON array.
+    """
+    data = http_request("GET", f"{creds['api_url']}/agents/{agent_id}/tools", token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("tools") or []
+
+
+def _is_sysadmin(creds: dict) -> bool:
+    """True if the caller is on the impersonator/sysadmin allowlist.
+
+    Reuses the GET /cli/impersonate introspection `whoami` surfaces (it returns
+    ``{"allowed": bool}``). Fails closed: any error — including http_request's
+    sys.exit on a non-200 from an older server — means "not a sysadmin".
+    """
+    try:
+        status = http_request("GET", f"{creds['api_url']}/cli/impersonate", token=creds["token"])
+    except (Exception, SystemExit):
+        return False
+    return bool(isinstance(status, dict) and status.get("allowed"))
+
+
+def _tool_row(t: dict) -> dict:
+    """Flatten a /agents/{id}/tools entry into the columns `eesel tools` prints."""
+    cfg = t.get("config") if isinstance(t.get("config"), dict) else {}
+    tool_data = (cfg or {}).get("tool_data") or {}
+    return {
+        "name": t.get("name") or t.get("tool_key") or "?",
+        "tool_key": t.get("tool_key") or "?",
+        "action": (t.get("tool_action") or "").upper() or "?",
+        "permission": t.get("permission_mode") or "?",
+        "integration_key": t.get("integration_key") or tool_data.get("integration_key") or "—",
+        "integration_id": t.get("integration_id") or "—",
+        "connected": bool(t.get("is_connected")),
+    }
+
+
+_SECRET_KEY_HINTS = (
+    "token", "secret", "password", "passwd", "credential",
+    "api_key", "apikey", "private_key", "authorization", "access_key",
+)
+
+
+def _redact_secrets(obj):
+    """Recursively copy obj, masking scalar values whose key looks sensitive.
+
+    Trigger config can embed integration access tokens and signing secrets, and
+    the read-only views print config inline — so mask anything secret-looking
+    (`token`, `secret`, `password`, …) before display. The raw values are still
+    reachable via `--json` or the API for those who need them.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            sensitive = isinstance(k, str) and any(h in k.lower() for h in _SECRET_KEY_HINTS)
+            if sensitive and not isinstance(v, (dict, list)) and v not in (None, ""):
+                out[k] = "***"
+            else:
+                out[k] = _redact_secrets(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_secrets(v) for v in obj]
+    return obj
+
+
+def _trigger_integration_label(t: dict, id_to_type: dict) -> str:
+    """Group label for a non-scheduled trigger: the resolved integration type
+    when known, else the trigger_key's prefix (e.g. ``zendesk_ticket_created`` →
+    ``zendesk``), else a catch-all."""
+    iid = t.get("integration_id")
+    if iid and id_to_type.get(iid):
+        return id_to_type[iid]
+    key = t.get("trigger_key") or ""
+    if "_" in key:
+        return key.split("_", 1)[0]
+    return key or "other"
 
 
 def resolve_scheduled_trigger(creds: dict, target: str) -> dict | None:
@@ -1312,9 +1420,12 @@ def cmd_triggers(args) -> int:
     sub = args.triggers_cmd or "list"
 
     if sub == "list":
+        if getattr(args, "all", False):
+            return _triggers_list_all(creds, as_json=getattr(args, "json", False))
         rows = fetch_all_scheduled_triggers(creds)
         if not rows:
             info("(no scheduled triggers in this workspace)")
+            info("Run `eesel triggers --all` to include event/webhook triggers.")
             return 0
         for t in rows:
             cfg = t.get("config") or {}
@@ -1343,6 +1454,155 @@ def cmd_triggers(args) -> int:
         return 0
 
     return 1
+
+
+def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
+    """`eesel triggers --all`: every trigger in the workspace, scheduled grouped
+    on top, the rest grouped by integration. Read-only."""
+    rows = fetch_all_triggers(creds)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        info("(no triggers in this workspace)")
+        return 0
+
+    # Best-effort integration_id → type map for nicer group labels. Degrade to
+    # integration_id-only if integrations aren't reachable (older server, etc.).
+    id_to_type: dict = {}
+    try:
+        for it in fetch_integrations(creds):
+            if it.get("id"):
+                id_to_type[it["id"]] = it.get("integrationType")
+    except (Exception, SystemExit):
+        pass
+
+    scheduled = [t for t in rows if t.get("trigger_key") == "eesel_scheduled"]
+    groups: dict = {}
+    for t in rows:
+        if t.get("trigger_key") == "eesel_scheduled":
+            continue
+        groups.setdefault(_trigger_integration_label(t, id_to_type), []).append(t)
+
+    first = True
+
+    def header(label: str) -> None:
+        nonlocal first
+        if not first:
+            print()
+        first = False
+        print(_color(label, "1"))  # bold group header
+
+    if scheduled:
+        header(f"scheduled ({len(scheduled)})")
+        for t in scheduled:
+            cfg = t.get("config") or {}
+            title = cfg.get("title") or "(untitled)"
+            cron = cfg.get("cron") or "?"
+            tz = cfg.get("timezone") or "UTC"
+            print(f"  {(t.get('id') or '?')[:12]}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
+
+    for label in sorted(groups):
+        bucket = groups[label]
+        header(f"{label} ({len(bucket)})")
+        for t in bucket:
+            tid = (t.get("id") or "?")[:12]
+            tkey = t.get("trigger_key") or "?"
+            ttype = t.get("type") or "?"
+            last = _fmt_task_ts(t.get("last_executed_at"))
+            iid = (t.get("integration_id") or "")[:12] or "—"
+            print(f"  {tid}  {tkey:<30}  {ttype:<8}  last={last:<16}  int={iid}  agent={t['agent_name']}")
+            cfg = t.get("config")
+            if cfg:
+                blob = json.dumps(_redact_secrets(cfg))
+                if len(blob) > 200:
+                    blob = blob[:200] + "…"
+                print(_color(f"      config: {blob}", "2;37"))
+    return 0
+
+
+def cmd_integrations(args) -> int:
+    """List the workspace's integrations (read-only).
+
+    Shows id, type, connection status and subdomain. Sensitive properties
+    (access tokens, secrets) are hidden unless `--secrets` is passed *and* the
+    caller is a sysadmin/impersonator — the same allowlist `eesel whoami` uses.
+    """
+    creds = require_creds()
+    integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
+    if getattr(args, "json", False):
+        print(json.dumps(integrations, indent=2))
+        return 0
+    if not integrations:
+        info("(no integrations)")
+        return 0
+
+    reveal = False
+    if getattr(args, "secrets", False):
+        reveal = _is_sysadmin(creds)
+        if not reveal:
+            warn("--secrets is restricted to sysadmin/impersonator accounts — showing non-sensitive fields only.")
+
+    fmt = " {:<12}  {:<18}  {:<10}  {}"
+    info(fmt.format("id", "type", "status", "subdomain"))
+    for it in integrations:
+        iid = it.get("id") or "—"
+        itype = (it.get("integrationType") or "?")[:18]
+        status = it.get("connectionStatus") or "?"
+        subdomain = it.get("identifier") or ""
+        print(fmt.format(str(iid)[:12], itype, status, subdomain))
+        if reveal:
+            props = it.get("properties") or []
+            if not props:
+                print(_color("      (no properties)", "2;37"))
+            for prop in props:
+                if isinstance(prop, dict) and "key" in prop:
+                    print(_color(f"      {prop.get('key')} = {prop.get('value')}", "2;37"))
+                else:
+                    print(_color(f"      {json.dumps(prop)}", "2;37"))
+    return 0
+
+
+def cmd_tools(args) -> int:
+    """List an agent's tools/actions (read-only).
+
+    Defaults to the active agent; pass an id / id-prefix / name to inspect a
+    different one. Columns: name, read/write, permission mode, integration.
+    """
+    creds = require_creds()
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return 1
+
+    target = getattr(args, "agent", None)
+    if target:
+        agent = resolve_agent(agents, target)
+        if not agent:
+            err(f"No agent matches '{target}'.")
+            return 1
+    else:
+        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
+        if not agent:
+            err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
+            return 1
+
+    agent_id = agent["agent_id"]
+    tools = fetch_tools(creds, agent_id)
+    if getattr(args, "json", False):
+        print(json.dumps(tools, indent=2))
+        return 0
+    if not tools:
+        info(f"(no tools/actions configured for {agent.get('name', agent_id)})")
+        return 0
+
+    info(f"# {agent.get('name', '?')} ({agent_id[:12]}) — {len(tools)} tool{'s' if len(tools) != 1 else ''}")
+    rows = sorted((_tool_row(t) for t in tools), key=lambda r: (r["integration_key"], r["name"].lower()))
+    fmt = " {:<32}  {:<5}  {:<13}  {:<16}  {}"
+    info(fmt.format("name", "r/w", "permission", "integration", "integration_id"))
+    for r in rows:
+        print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_key"][:16], r["integration_id"][:12]))
+    return 0
 
 
 def cmd_impersonate(args) -> int:
@@ -2155,9 +2415,25 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     exp.add_argument("-o", "--output", help="Output file path")
     sp.set_defaults(func=cmd_document, document_cmd="list", prefix=None, search=None, limit=100, offset=0)
 
-    sp = sub.add_parser("triggers", help="List or fire scheduled triggers")
+    sp = sub.add_parser("integrations", help="List the workspace's integrations (read-only)")
+    sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
+    sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
+    sp.set_defaults(func=cmd_integrations)
+
+    sp = sub.add_parser("tools", help="List an agent's tools/actions (read-only)")
+    sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
+    sp.set_defaults(func=cmd_tools)
+
+    sp = sub.add_parser("triggers", help="List or fire triggers")
+    # --all (+ --json) live on both the parent and the `list` subparser so both
+    # `eesel triggers --all` and `eesel triggers list --all` work.
+    sp.add_argument("--all", action="store_true", help="List every trigger across all agents (scheduled grouped on top), not just scheduled")
+    sp.add_argument("--json", action="store_true", help="With --all: emit the raw trigger payload")
     t_sub = sp.add_subparsers(dest="triggers_cmd")
-    t_sub.add_parser("list", help="List scheduled triggers in this workspace")
+    t_ls = t_sub.add_parser("list", help="List scheduled triggers (use --all for every trigger)")
+    t_ls.add_argument("--all", action="store_true", help="List every trigger across all agents, not just scheduled")
+    t_ls.add_argument("--json", action="store_true", help="With --all: emit the raw trigger payload")
     fire = t_sub.add_parser("fire", help="Manually fire a scheduled trigger")
     fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
     sp.set_defaults(func=cmd_triggers)
