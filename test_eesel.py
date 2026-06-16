@@ -817,6 +817,162 @@ class TestInteractiveSelectFallback:
         assert eesel.interactive_select(["only"]) == 0
 
 
+def _subparsers_action(parser):
+    import argparse
+
+    return next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+
+
+def _visible_commands(parser):
+    """Command names shown in `--help` (the descriptive list)."""
+    return [a.dest for a in _subparsers_action(parser)._choices_actions]
+
+
+def _dev_flag_help(parser):
+    login = _subparsers_action(parser).choices["login"]
+    return next(a for a in login._actions if a.dest == "dev").help
+
+
+class TestStaffCommandVisibility:
+    """`impersonate` and dev login are surfaced only for global impersonators."""
+
+    def test_impersonate_hidden_from_non_staff_help(self):
+        parser = eesel.build_parser(staff=False)
+        assert "impersonate" not in _visible_commands(parser)
+        # ...and absent from the `{...}` usage metavar too.
+        assert "impersonate" not in (_subparsers_action(parser).metavar or "")
+
+    def test_impersonate_visible_for_staff(self):
+        parser = eesel.build_parser(staff=True)
+        assert "impersonate" in _visible_commands(parser)
+        assert "impersonate" in _subparsers_action(parser).metavar
+
+    def test_impersonate_still_parseable_for_non_staff(self):
+        # Hidden from help, but the server allowlist is the real gate — so it
+        # must still dispatch if someone types it.
+        parser = eesel.build_parser(staff=False)
+        args = parser.parse_args(["impersonate", "clear"])
+        assert args.func is eesel.cmd_impersonate
+        assert args.user_id == "clear"
+
+    def test_dev_flags_suppressed_for_non_staff(self):
+        import argparse
+
+        assert _dev_flag_help(eesel.build_parser(staff=False)) is argparse.SUPPRESS
+
+    def test_dev_flags_shown_for_staff(self):
+        import argparse
+
+        assert _dev_flag_help(eesel.build_parser(staff=True)) is not argparse.SUPPRESS
+
+    def test_login_dev_parses_regardless_of_staff(self):
+        # Kept parseable both ways so a fresh staff machine can still dev-login.
+        for staff in (False, True):
+            args = eesel.build_parser(staff=staff).parse_args(["login", "--dev", "--workspace-id", "ws-1"])
+            assert args.dev is True
+            assert args.workspace_id == "ws-1"
+
+    def test_default_build_parser_is_non_staff(self):
+        # build_parser() with no arg must hide staff commands (the safe default).
+        assert "impersonate" not in _visible_commands(eesel.build_parser())
+
+
+class TestImpersonatorFlagCaching:
+    def _creds(self, **extra):
+        c = {
+            "env": "prod",
+            "api_url": "https://api.example",
+            "workspace_id": "ws-1",
+            "token": "tok",
+            "expires_at": int(time.time()) + 3600,
+        }
+        c.update(extra)
+        eesel.save_creds(c)
+        return c
+
+    def test_caches_true(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: {"allowed": True})
+        assert eesel.cache_impersonator_flag(creds) is True
+        assert eesel.load_creds()["is_impersonator"] is True
+
+    def test_caches_false(self, tmp_config, monkeypatch):
+        creds = self._creds(is_impersonator=True)  # was true, now downgraded
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: {"allowed": False})
+        assert eesel.cache_impersonator_flag(creds) is False
+        assert eesel.load_creds()["is_impersonator"] is False
+
+    def test_network_error_keeps_cached_value(self, tmp_config, monkeypatch):
+        creds = self._creds(is_impersonator=True)
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
+        # A blip must not transiently hide a staff member's commands.
+        assert eesel.cache_impersonator_flag(creds) is True
+        assert eesel.load_creds()["is_impersonator"] is True
+
+    def test_cmd_login_caches_flag(self, tmp_config, monkeypatch):
+        stored = {
+            "env": "prod",
+            "api_url": "https://api.example",
+            "workspace_id": "ws-1",
+            "token": "tok",
+            "expires_at": int(time.time()) + 3600,
+        }
+
+        def fake_login_prod():
+            eesel.save_creds(stored)
+            return stored
+
+        monkeypatch.setattr(eesel, "login_prod", fake_login_prod)
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: {"allowed": True})
+        rc = eesel.cmd_login(type("Args", (), {"dev": False, "workspace_id": None})())
+        assert rc == 0
+        assert eesel.load_creds()["is_impersonator"] is True
+
+    def test_whoami_persists_flag_and_reports(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel, "_get_impersonate_status", lambda c: {"allowed": True, "target_user_id": None}
+        )
+        eesel.cmd_whoami(type("Args", (), {})())
+        assert eesel.load_creds()["is_impersonator"] is True
+        assert "impersonator : yes" in capsys.readouterr().out
+
+
+class TestMainStaffGating:
+    def _save(self, **extra):
+        c = {
+            "env": "prod",
+            "api_url": "https://api.example",
+            "workspace_id": "ws-1",
+            "token": "tok",
+            "expires_at": int(time.time()) + 3600,
+        }
+        c.update(extra)
+        eesel.save_creds(c)
+
+    def _run_capturing_staff(self, monkeypatch):
+        seen = {}
+        real = eesel.build_parser
+
+        def spy(staff=False):
+            seen["staff"] = staff
+            return real(staff)
+
+        monkeypatch.setattr(eesel, "build_parser", spy)
+        eesel.main(["logout"])  # no network; safe with tmp_config
+        return seen.get("staff")
+
+    def test_main_staff_true_when_cached(self, tmp_config, monkeypatch):
+        self._save(is_impersonator=True)
+        assert self._run_capturing_staff(monkeypatch) is True
+
+    def test_main_staff_false_when_flag_absent(self, tmp_config, monkeypatch):
+        self._save()  # no is_impersonator key
+        assert self._run_capturing_staff(monkeypatch) is False
+
+    def test_main_staff_false_when_not_logged_in(self, tmp_config, monkeypatch):
+        assert self._run_capturing_staff(monkeypatch) is False
+
+
 class TestArgParser:
     def test_parser_builds(self):
         # Smoke test: argparse construction shouldn't blow up.
