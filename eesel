@@ -1034,11 +1034,49 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _get_impersonate_status(creds: dict) -> dict | None:
+    """GET /cli/impersonate, returning the parsed JSON or None on any error.
+
+    Unlike `http_request`, this never calls sys.exit — it's for best-effort
+    checks (whoami display, caching the staff-command gate) where a network
+    hiccup or older server must not abort the CLI.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{creds['api_url']}/cli/impersonate",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {creds['token']}"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read() or b"{}")
+    except Exception:
+        return None
+
+
+def cache_impersonator_flag(creds: dict) -> bool:
+    """Refresh and persist `is_impersonator` on the stored creds, returning
+    whether this login is on the global impersonator allowlist.
+
+    The cached flag is what gates the staff-only commands (`impersonate`, dev
+    login) in `build_parser`, so the gate costs no per-command network call. On
+    a network/endpoint error the cached value is left untouched, so a blip
+    doesn't transiently hide a staff member's commands.
+    """
+    status = _get_impersonate_status(creds)
+    if status is None:
+        return bool(creds.get("is_impersonator"))
+    allowed = bool(status.get("allowed"))
+    if creds.get("is_impersonator") != allowed:
+        creds["is_impersonator"] = allowed
+        save_creds(creds)
+    return allowed
+
+
 def cmd_login(args) -> int:
-    if args.dev:
-        login_dev(args.workspace_id)
-    else:
-        login_prod()
+    creds = login_dev(args.workspace_id) if args.dev else login_prod()
+    # Cache whether this login is a global impersonator so the staff-only
+    # commands can be surfaced/hidden without a network call on every run.
+    cache_impersonator_flag(creds)
     return 0
 
 
@@ -1065,22 +1103,23 @@ def cmd_whoami(args) -> int:
         print(f"user_email   : {creds['user_email']}")
     print(f"token expires: {expires_in}s ({expires_in // 3600}h {(expires_in % 3600) // 60}m)")
 
-    # Surface active impersonation so sticky state isn't invisible. Failures
-    # here (network, allowlist gate, missing endpoint on older servers) are
-    # intentionally silent — whoami shouldn't error just because we can't
-    # reach the endpoint.
-    try:
-        url = f"{creds['api_url']}/cli/impersonate"
-        status = http_request("GET", url, token=creds["token"])
-        if status.get("allowed"):
+    # Surface active impersonation so sticky state isn't invisible, and refresh
+    # the cached `is_impersonator` gate while we're here (so an existing staff
+    # login un-hides its commands without needing to re-login). Best-effort: a
+    # network error or older server just leaves the cached value as-is.
+    status = _get_impersonate_status(creds)
+    if status is not None:
+        allowed = bool(status.get("allowed"))
+        if creds.get("is_impersonator") != allowed:
+            creds["is_impersonator"] = allowed
+            save_creds(creds)
+        if allowed:
             tgt = status.get("target_user_id")
             if tgt:
                 print(f"impersonating: {tgt}")
                 print("               (every command runs as this user; clear with `eesel impersonate clear`)")
             else:
                 print("impersonator : yes (no target set)")
-    except Exception:
-        pass
 
     return 0
 
@@ -2008,13 +2047,22 @@ def cmd_document_export(args) -> int:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(staff: bool = False) -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    `staff` is whether the current login is on the global impersonator
+    allowlist (cached in creds; see `cache_impersonator_flag`). When False, the
+    staff-only surfaces — dev login (`--dev`/`--workspace-id`) and the
+    `impersonate` command — are hidden from `--help`. They remain parseable so
+    nothing breaks for someone who knows them, but the server-side allowlist
+    (and, for dev login, the local-only dev secret) is the real gate.
+    """
     p = argparse.ArgumentParser(prog="eesel", description=__doc__.strip().split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)")
-    sp.add_argument("--dev", action="store_true", help="Mint local dev JWT, no browser")
-    sp.add_argument("--workspace-id", help="Dev login only: workspace id to mint credentials for")
+    sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)" if staff else "Authenticate")
+    sp.add_argument("--dev", action="store_true", help="Mint local dev JWT, no browser" if staff else argparse.SUPPRESS)
+    sp.add_argument("--workspace-id", help="Dev login only: workspace id to mint credentials for" if staff else argparse.SUPPRESS)
     sp.set_defaults(func=cmd_login)
 
     sp = sub.add_parser("logout", help="Clear stored credentials")
@@ -2114,10 +2162,10 @@ def build_parser() -> argparse.ArgumentParser:
     fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
     sp.set_defaults(func=cmd_triggers)
 
-    # Staff-only. Hidden from `eesel --help` (still runnable if you know the
-    # subcommand). Server-side allowlist is the actual gate; this just keeps
-    # the command off regular customers' radar so they're not asking what it
-    # does.
+    # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
+    # from everyone else (but still runnable if you know the subcommand). The
+    # server-side allowlist is the actual gate — this just keeps the command
+    # off regular customers' radar so they're not asking what it does.
     #
     # argparse's `help=SUPPRESS` only blanks the description; the subcommand
     # name still shows up in the choices list as `impersonate ==SUPPRESS==`.
@@ -2126,14 +2174,17 @@ def build_parser() -> argparse.ArgumentParser:
     # ships it as `argparse._SubParsersAction._ChoicesPseudoAction`.
     sp = sub.add_parser(
         "impersonate",
-        help=argparse.SUPPRESS,
+        help="Act as another user — every later command runs in their workspace (staff only)"
+        if staff
+        else argparse.SUPPRESS,
         description="Act as another user — every subsequent `eesel` command runs "
         "in their workspace. Combine with `eesel chat --trigger heartbeat` "
         "to preview their heartbeat, or just `eesel chat` for general "
         "chat. WRITE tools are stubbed server-side so no real emails/"
         "replies fire. Requires a sysadmin/impersonator account.",
     )
-    sub._choices_actions = [a for a in sub._choices_actions if a.dest != "impersonate"]
+    if not staff:
+        sub._choices_actions = [a for a in sub._choices_actions if a.dest != "impersonate"]
     # Take a positional that's either a user_id or the literal "clear".
     sp.add_argument(
         "user_id",
@@ -2142,11 +2193,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=cmd_impersonate)
 
+    # Pin the `{...}` choices metavar to only the *visible* commands. argparse
+    # would otherwise build it from every registered subparser, leaking
+    # `impersonate` into the usage line even after we drop it from the
+    # descriptive list above.
+    sub.metavar = "{" + ",".join(ca.dest for ca in sub._choices_actions) + "}"
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
+    # Surface staff-only commands only for global impersonators. Read from the
+    # cached creds flag (populated at login / refreshed by `whoami`) so this
+    # stays a local read — no network call on every invocation.
+    creds = load_creds()
+    staff = bool(creds and creds.get("is_impersonator"))
+    parser = build_parser(staff)
     args = parser.parse_args(argv)
     return args.func(args)
 
