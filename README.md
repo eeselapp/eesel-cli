@@ -67,22 +67,34 @@ In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/tasks`, `/task <id>`,
 
 ## Documents
 
-List and export documents from your workspace — e.g. to download a blog
-draft the agent generated, or any other artifact in the doc store.
+List, read, and export documents from your workspace — e.g. to view or
+download a blog draft the agent generated, or any other artifact in the
+doc store.
 
 ```bash
 eesel document list                                            # all documents
 eesel document list --prefix outputs/skills                    # filter by key prefix
 eesel document list --search "blog title"                      # filter by name/key
 
+eesel document read                                            # arrow-key menu, then print
+eesel document read <id-or-key>                                # print one doc to stdout
+eesel document read --prefix files/                            # menu, filtered to files/…
+eesel document read <id> --format html                         # read as HTML (default: md)
+eesel document read <id> > draft.md                            # body→stdout, so redirect works
+
 eesel document export --document-key <key> --format md -o post.md
 eesel document export --document-id <id-or-prefix> --format html -o post.html
 ```
 
-`--format` accepts `md` or `html`. `-o` is optional; without it the
-file lands in the current directory using the document's filename.
-Export is scoped to the currently-active agent (`eesel agents use`),
-so set the right agent before exporting.
+`--format` accepts `md` or `html`. For `export`, `-o` is optional; without
+it the file lands in the current directory using the document's filename.
+`read` prints the body to stdout (the header goes to stderr, so redirects
+capture just the content) and, with no id, opens an arrow-key picker like
+`eesel agents use`.
+
+Documents are scoped to the currently-active agent (`eesel agents use`) —
+its `files/…` and `outputs/skills/…` keys — so set the right agent first.
+`--prefix` filters within that scope (e.g. `files/`, `outputs/`).
 
 ## Tasks (workspace activity)
 

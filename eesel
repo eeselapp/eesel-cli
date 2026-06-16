@@ -648,16 +648,25 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
 
 
-def http_download(url: str, *, token: str, output_path: Path) -> None:
+def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
+    """GET a URL with the workspace Bearer token and return the raw bytes.
+
+    Shared by the document download (write to file) and read (print to stdout)
+    paths. Mirrors http_request's error handling — sys.exit with the server's
+    body on failure.
+    """
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            output_path.write_bytes(resp.read())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
     except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        sys.exit(f"GET {url} → {e.code}: {body_text}")
+        sys.exit(f"GET {url} → {e.code}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
         sys.exit(f"GET {url} failed (server reachable?): {e}")
+
+
+def http_download(url: str, *, token: str, output_path: Path) -> None:
+    output_path.write_bytes(http_fetch(url, token=token))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1905,6 +1914,40 @@ def resolve_document_id(creds: dict, target: str) -> str | None:
     return None
 
 
+def _document_key(doc: dict) -> str:
+    return doc.get("key") or doc.get("document_key") or ""
+
+
+def agent_documents(creds: dict, *, prefix: str | None = None, limit: int = 500) -> list[dict]:
+    """Documents the active agent owns (files/{agent}, outputs/skills/{agent}),
+    optionally narrowed to a key prefix. Shared by `document read`'s direct
+    lookup and its interactive menu."""
+    docs = fetch_documents(creds, prefix=prefix, limit=limit)
+    return [doc for doc in docs if document_matches_agent(creds, doc)]
+
+
+def match_document(docs: list[dict], target: str) -> dict | list[dict] | None:
+    """Resolve `target` against a candidate list. Returns the matching doc, or a
+    list of >1 candidates when an id-prefix/filename is ambiguous, or None.
+
+    Resolution order: exact id, exact key, then id-prefix or basename (filename)
+    match.
+    """
+    exact = next((d for d in docs if d.get("id") == target), None) or next(
+        (d for d in docs if _document_key(d) == target), None
+    )
+    if exact:
+        return exact
+    fuzzy = [
+        d
+        for d in docs
+        if (d.get("id") or "").startswith(target) or _document_key(d).rsplit("/", 1)[-1] == target
+    ]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
+    return fuzzy or None
+
+
 def _mcp_metadata_header(metadata: dict) -> str:
     payload = json.dumps(metadata, separators=(",", ":")).encode()
     return base64.b64encode(payload).decode()
@@ -2002,7 +2045,66 @@ def cmd_document(args) -> int:
         return 0
     if sub == "export":
         return cmd_document_export(args)
+    if sub == "read":
+        return cmd_document_read(args)
     return 1
+
+
+def cmd_document_read(args) -> int:
+    """Print a document's contents to stdout.
+
+    `eesel document read <id|key|filename>` reads that document; `eesel document
+    read` (no target) opens an arrow-key menu. `--prefix` narrows both the menu
+    and the direct match to keys under that prefix (e.g. files/, outputs/).
+
+    Like `instructions`, the body goes to stdout and the header to stderr, so
+    `eesel document read <id> > out.md` captures just the content.
+    """
+    creds = require_creds()
+    fmt = (getattr(args, "format", None) or "md").lower()
+    prefix = getattr(args, "prefix", None)
+
+    candidates = agent_documents(creds, prefix=prefix)
+    scope = f" under prefix '{prefix}'" if prefix else ""
+    if not candidates:
+        info(f"(no documents{scope})")
+        return 0
+
+    target = getattr(args, "target", None)
+    if target:
+        match = match_document(candidates, target)
+        if match is None:
+            err(f"No document matches '{target}'{scope}.")
+            return 1
+        if isinstance(match, list):
+            labels = ", ".join(f"{(d.get('id') or '?')[:12]} ({_document_key(d).rsplit('/', 1)[-1]})" for d in match[:5])
+            err(f"'{target}' is ambiguous{scope}: {labels}")
+            return 1
+        doc = match
+    else:
+        labels = [f"{(d.get('id') or '?')[:8]}  {_document_key(d) or d.get('name') or '?'}" for d in candidates]
+        choice = interactive_select(labels, title=f"Select a document to read{scope}  (↑/↓, Enter, q to cancel):")
+        if choice is None:
+            info("Cancelled.")
+            return 1
+        doc = candidates[choice]
+
+    doc_id = doc.get("id")
+    key = _document_key(doc) or None
+    try:
+        _, url = doc_export_signed_url(creds, document_id=doc_id, document_key=key, fmt=fmt)
+    except RuntimeError as e:
+        err(str(e))
+        return 1
+
+    content = http_fetch(url, token=creds["token"])
+    info(f"# {key or doc_id}  ({(doc_id or '')[:12]}, {fmt})")
+    try:
+        text = content.decode("utf-8")
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    except UnicodeDecodeError:
+        sys.stdout.buffer.write(content)
+    return 0
 
 
 def cmd_document_export(args) -> int:
@@ -2140,13 +2242,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_co.add_argument("task_id", help="Full task id or id-prefix")
     sp.set_defaults(func=cmd_tasks, tasks_cmd="list", limit=50, page=1, agent=None)
 
-    sp = sub.add_parser("document", help="List or export documents")
+    sp = sub.add_parser("document", help="List, read, or export documents")
     d_sub = sp.add_subparsers(dest="document_cmd")
     ls = d_sub.add_parser("list", help="List documents in this workspace")
     ls.add_argument("--prefix", help="Filter by document key prefix")
     ls.add_argument("--search", help="Search document names/keys")
     ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    rd = d_sub.add_parser("read", help="Print a document's contents (omit id for an interactive menu)")
+    rd.add_argument("target", nargs="?", help="Document id, id-prefix, key, or filename (omit to pick from a menu)")
+    rd.add_argument("--prefix", help="Filter the menu/list to keys under this prefix (e.g. files/, outputs/)")
+    rd.add_argument("--format", default="md", choices=["md", "html"], help="Content format (default: md)")
     exp = d_sub.add_parser("export", help="Download a document as markdown or HTML")
     target = exp.add_mutually_exclusive_group(required=True)
     target.add_argument("--document-key", help="Document key to export")
