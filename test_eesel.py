@@ -1,0 +1,1154 @@
+"""Unit tests for the eesel CLI.
+
+Run with: `python3 -m pytest test_eesel.py -v` from the repo root.
+
+The CLI script has no `.py` extension, so we load it via importlib.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+# ──────────────────────────────────────────────────────────────────────────
+# Module loading
+# ──────────────────────────────────────────────────────────────────────────
+
+_HERE = Path(__file__).parent.resolve()
+
+
+def _load_eesel():
+    # The CLI script has no `.py` extension, so spec_from_file_location returns
+    # None — bypass that by giving importlib an explicit SourceFileLoader.
+    loader = SourceFileLoader("eesel_cli_module", str(_HERE / "eesel"))
+    spec = importlib.util.spec_from_loader("eesel_cli_module", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+eesel = _load_eesel()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Fixtures
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def tmp_config(tmp_path, monkeypatch):
+    """Redirect the module's config paths into a tmpdir for each test."""
+    config_dir = tmp_path / "eesel"
+    sessions_dir = config_dir / "sessions"
+    monkeypatch.setattr(eesel, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(eesel, "SESSIONS_DIR", sessions_dir)
+    monkeypatch.setattr(eesel, "CREDS_FILE", config_dir / "credentials.json")
+    monkeypatch.setattr(eesel, "CURRENT_FILE", config_dir / "current.json")
+    return config_dir
+
+
+@pytest.fixture
+def fake_creds(tmp_config):
+    creds = {
+        "env": "dev",
+        "api_url": "http://localhost:8080",
+        "dashboard_url": "http://localhost:3000",
+        "workspace_id": "ws-test-123",
+        "agent_id": "agent-test-456",
+        "token": "test-jwt-token",
+        "expires_at": int(time.time()) + 3600,
+    }
+    eesel.save_creds(creds)
+    return creds
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# JWT helpers
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestB64Url:
+    def test_no_padding(self):
+        # standard b64 of b"abc" is "YWJj" (no padding) — should match
+        assert eesel._b64url(b"abc") == "YWJj"
+
+    def test_strips_padding(self):
+        # b"a" → "YQ==" in standard b64; b64url strips trailing "="
+        assert eesel._b64url(b"a") == "YQ"
+
+    def test_url_safe_alphabet(self):
+        # bytes that produce '+' or '/' in standard b64 should yield '-' and '_'.
+        # b'\xfb\xff' → standard "+/8=", url-safe "-_8"
+        out = eesel._b64url(b"\xfb\xff")
+        assert "+" not in out and "/" not in out
+        assert out == "-_8"
+
+
+class TestMintDevJwt:
+    def test_three_parts(self):
+        token = eesel.mint_dev_jwt("ws-1", "agent-1")
+        assert token.count(".") == 2
+
+    def test_payload_contains_ids(self):
+        token = eesel.mint_dev_jwt("ws-1", "agent-1")
+        _, payload_b64, _ = token.split(".")
+        # Re-pad for stdlib base64 decode.
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        assert payload["workspace_id"] == "ws-1"
+        assert payload["agent_id"] == "agent-1"
+        assert payload["exp"] > payload["iat"]
+        assert payload["exp"] - payload["iat"] == eesel.CLI_TOKEN_TTL_SECONDS  # 30d
+
+    def test_signature_verifies(self):
+        token = eesel.mint_dev_jwt("ws-1", "agent-1")
+        header, payload, sig = token.split(".")
+        signing_input = f"{header}.{payload}".encode()
+        expected = base64.urlsafe_b64encode(hmac.new(eesel.DEV_JWT_SECRET.encode(), signing_input, hashlib.sha256).digest()).rstrip(b"=").decode()
+        assert sig == expected
+
+    def test_omits_agent_id_when_none(self):
+        token = eesel.mint_dev_jwt("ws-1", None)
+        _, payload_b64, _ = token.split(".")
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        assert "agent_id" not in payload
+        assert payload["workspace_id"] == "ws-1"
+
+
+class TestLoginDev:
+    def test_mints_workspace_scoped_token_and_stores_active_agent(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(eesel, "discover_local_ids", lambda workspace_id=None: ("ws-1", "agent-1", "user-1"))
+
+        creds = eesel.login_dev()
+
+        _, payload_b64, _ = creds["token"].split(".")
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        assert payload["workspace_id"] == "ws-1"
+        assert payload["user_id"] == "user-1"
+        assert "agent_id" not in payload
+        assert creds["agent_id"] == "agent-1"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Credential storage
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCreds:
+    def test_load_returns_none_when_missing(self, tmp_config):
+        assert eesel.load_creds() is None
+
+    def test_save_then_load_roundtrip(self, tmp_config):
+        original = {"env": "dev", "workspace_id": "ws-1", "token": "x", "expires_at": 9999}
+        eesel.save_creds(original)
+        loaded = eesel.load_creds()
+        assert loaded == original
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions only")
+    def test_creds_file_chmod_600(self, tmp_config):
+        eesel.save_creds({"token": "secret"})
+        mode = eesel.CREDS_FILE.stat().st_mode & 0o777
+        assert mode == 0o600
+
+    def test_require_creds_exits_when_missing(self, tmp_config):
+        with pytest.raises(SystemExit):
+            eesel.require_creds()
+
+    def test_require_creds_exits_when_expired(self, tmp_config):
+        eesel.save_creds(
+            {
+                "env": "dev",
+                "workspace_id": "ws-1",
+                "token": "x",
+                "expires_at": int(time.time()) - 1,  # already expired
+            }
+        )
+        with pytest.raises(SystemExit):
+            eesel.require_creds()
+
+    def test_require_creds_returns_when_valid(self, tmp_config, fake_creds):
+        out = eesel.require_creds()
+        assert out["workspace_id"] == "ws-test-123"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Session storage
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestSessions:
+    def test_list_returns_empty_when_dir_missing(self, tmp_config):
+        assert eesel.list_sessions() == []
+
+    def test_save_load_roundtrip(self, tmp_config):
+        sess = {
+            "id": "abc",
+            "name": "test",
+            "agent_id": "a-1",
+            "workspace_id": "w-1",
+            "task_id": "t-1",
+            "messages": [{"sender": "user", "message": "hi"}],
+            "created_at": time.time(),
+        }
+        eesel.save_session(sess)
+        loaded = eesel.load_session("abc")
+        assert loaded["id"] == "abc"
+        assert loaded["messages"] == [{"sender": "user", "message": "hi"}]
+        assert loaded["updated_at"] > 0  # save_session sets this
+
+    def test_load_returns_none_for_missing(self, tmp_config):
+        assert eesel.load_session("nope") is None
+
+    def test_list_sorted_by_updated_at_desc(self, tmp_config):
+        eesel.save_session({"id": "old", "messages": []})
+        time.sleep(0.01)
+        eesel.save_session({"id": "new", "messages": []})
+        sessions = eesel.list_sessions()
+        assert [s["id"] for s in sessions] == ["new", "old"]
+
+    def test_current_pointer_roundtrip(self, tmp_config):
+        assert eesel.load_current() is None
+        eesel.set_current("abc")
+        assert eesel.load_current() == "abc"
+        eesel.set_current(None)
+        assert eesel.load_current() is None
+
+    def test_delete_session(self, tmp_config):
+        eesel.save_session({"id": "x", "messages": []})
+        assert eesel.load_session("x") is not None
+        assert eesel.delete_session("x") is True
+        assert eesel.load_session("x") is None
+        assert eesel.delete_session("x") is False  # already gone
+
+    def test_delete_clears_current_pointer(self, tmp_config):
+        eesel.save_session({"id": "x", "messages": []})
+        eesel.set_current("x")
+        eesel.delete_session("x")
+        assert eesel.load_current() is None
+
+    def test_delete_preserves_unrelated_current(self, tmp_config):
+        eesel.save_session({"id": "x", "messages": []})
+        eesel.save_session({"id": "y", "messages": []})
+        eesel.set_current("y")
+        eesel.delete_session("x")
+        assert eesel.load_current() == "y"
+
+    def test_new_session_sets_current(self, tmp_config, fake_creds):
+        sess = eesel.new_session(fake_creds, agent_id="ag-1", name=None, switch_to=True)
+        assert eesel.load_current() == sess["id"]
+        assert sess["agent_id"] == "ag-1"
+        assert sess["workspace_id"] == fake_creds["workspace_id"]
+        assert sess["messages"] == []
+        assert "task_id" in sess and len(sess["task_id"]) > 0
+
+    def test_new_session_no_switch(self, tmp_config, fake_creds):
+        eesel.set_current("existing")
+        sess = eesel.new_session(fake_creds, agent_id="ag-1", name="custom", switch_to=False)
+        assert sess["name"] == "custom"
+        assert eesel.load_current() == "existing"
+
+    def test_ensure_current_creates_when_none(self, tmp_config, fake_creds):
+        sess = eesel.ensure_current_session(fake_creds, agent_id="ag-1")
+        assert sess is not None
+        assert eesel.load_current() == sess["id"]
+
+    def test_ensure_current_returns_existing(self, tmp_config, fake_creds):
+        first = eesel.new_session(fake_creds, agent_id="ag-1", name=None)
+        second = eesel.ensure_current_session(fake_creds)
+        assert first["id"] == second["id"]
+
+
+class TestDocumentCommand:
+    def test_document_list_prints_workspace_documents(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http_request(method, url, *, token=None, body=None, timeout=60):
+            calls.append((method, url, token))
+            return {
+                "documents": [
+                    {
+                        "id": "doc-123456789",
+                        "key": "outputs/skills/agent-test-456/blog/run-1/POST.md",
+                        "name": "POST.md",
+                    },
+                    {
+                        "id": "doc-other-agent",
+                        "key": "files/other-agent/random.md",
+                        "name": "random.md",
+                    },
+                ]
+            }
+
+        monkeypatch.setattr(eesel, "http_request", fake_http_request)
+
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "list",
+                    "prefix": "outputs/skills",
+                    "search": "post",
+                    "limit": 25,
+                    "offset": 10,
+                },
+            )()
+        )
+
+        assert rc == 0
+        assert calls == [
+            (
+                "GET",
+                "http://localhost:8080/documents?limit=25&offset=10&prefix=outputs%2Fskills&search=post",
+                "test-jwt-token",
+            )
+        ]
+        out = capsys.readouterr().out
+        assert "doc-12345678" in out
+        assert "outputs/skills/agent-test-456/blog/run-1/POST.md" in out
+        assert "POST.md" in out
+        assert "files/other-agent/random.md" not in out
+
+    def test_document_export_by_document_key_downloads_file(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        # cli resolves the key to a document id via GET /documents (agent-scoped),
+        # mints a signed link via /documents/{id}/export-link, then downloads it.
+        key = "outputs/skills/agent-test-456/blog/run-1/POST.md"
+        calls = []
+
+        def fake_http_request(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append(("request", method, url, token))
+            if "/export-link" in url:
+                return {"url": "http://localhost:8080/documents/export/signed-token"}
+            return {"documents": [{"id": "doc-123456789", "key": key, "name": "POST.md"}]}
+
+        def fake_http_download(url, *, token, output_path):
+            calls.append(("download", url, token, output_path))
+            output_path.write_text("# Exported")
+
+        monkeypatch.setattr(eesel, "http_request", fake_http_request)
+        monkeypatch.setattr(eesel, "http_download", fake_http_download)
+
+        output = tmp_path / "post.md"
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": key,
+                    "document_id": None,
+                    "format": "md",
+                    "output": str(output),
+                },
+            )()
+        )
+
+        assert rc == 0
+        assert output.read_text() == "# Exported"
+        # 1) resolve the key (prefix-scoped lookup), 2) mint export-link, 3) download
+        assert calls[0][1:4] == (
+            "GET",
+            "http://localhost:8080/documents?limit=500&offset=0&prefix=outputs%2Fskills%2Fagent-test-456%2Fblog%2Frun-1%2FPOST.md",
+            "test-jwt-token",
+        )
+        assert calls[1][1:4] == (
+            "GET",
+            "http://localhost:8080/documents/doc-123456789/export-link?format=md",
+            "test-jwt-token",
+        )
+        assert calls[2] == (
+            "download",
+            "http://localhost:8080/documents/export/signed-token",
+            "test-jwt-token",
+            output,
+        )
+
+    def test_document_export_by_document_id_resolves_prefix(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        full_id = "d22e305b-5d1b-41a1-9316-3424db9a1c49"
+        calls = []
+
+        def fake_http_request(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append(("request", method, url, token))
+            if "/export-link" in url:
+                return {"url": "http://localhost:8080/documents/export/html-token"}
+            return {"documents": [{"id": full_id, "key": "outputs/skills/agent-test-456/blog/run-1/POST.md"}]}
+
+        def fake_http_download(url, *, token, output_path):
+            calls.append(("download", url, token, output_path))
+            output_path.write_text("<html></html>")
+
+        monkeypatch.setattr(eesel, "http_request", fake_http_request)
+        monkeypatch.setattr(eesel, "http_download", fake_http_download)
+
+        output = tmp_path / "post.html"
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": None,
+                    "document_id": "d22e305b-5d1",
+                    "format": "html",
+                    "output": str(output),
+                },
+            )()
+        )
+
+        assert rc == 0
+        assert output.read_text() == "<html></html>"
+        # an id-prefix resolves against the agent-scoped document list (no prefix filter)
+        assert calls[0][1:4] == (
+            "GET",
+            "http://localhost:8080/documents?limit=500&offset=0",
+            "test-jwt-token",
+        )
+        # the export-link is minted against the *full* resolved id, not the prefix
+        assert calls[1][1:4] == (
+            "GET",
+            f"http://localhost:8080/documents/{full_id}/export-link?format=html",
+            "test-jwt-token",
+        )
+        assert calls[2] == (
+            "download",
+            "http://localhost:8080/documents/export/html-token",
+            "test-jwt-token",
+            output,
+        )
+
+    def test_document_export_exact_document_id_still_resolves(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        full_id = "d22e305b-5d1b-41a1-9316-3424db9a1c49"
+
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda method, url, *, token=None, body=None, timeout=60, headers=None: (
+                {"url": "http://localhost:8080/documents/export/md-token"}
+                if "/export-link" in url
+                else {"documents": [{"id": full_id, "key": "outputs/skills/agent-test-456/blog/run-1/POST.md"}]}
+            ),
+        )
+        monkeypatch.setattr(eesel, "http_download", lambda url, *, token, output_path: output_path.write_text("# Exported"))
+
+        output = tmp_path / "post.md"
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": None,
+                    "document_id": full_id,
+                    "format": "md",
+                    "output": str(output),
+                },
+            )()
+        )
+
+        assert rc == 0
+        assert output.read_text() == "# Exported"
+
+    def test_document_export_rejects_ambiguous_document_id_prefix(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda method, url, *, token=None, body=None, timeout=60, headers=None: {
+                "documents": [
+                    {"id": "d22e305b-5d1b-41a1-9316-3424db9a1c49"},
+                    {"id": "d22e305b-5d1c-41a1-9316-3424db9a1c50", "key": "files/agent-test-456/random.md"},
+                    {"id": "d22e305b-5d1d-41a1-9316-3424db9a1c51", "key": "outputs/skills/agent-test-456/blog/post.md"},
+                ]
+            },
+        )
+        download_mock = MagicMock()
+        monkeypatch.setattr(eesel, "http_download", download_mock)
+
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": None,
+                    "document_id": "d22e305b-5d1",
+                    "format": "md",
+                    "output": str(tmp_path / "post.md"),
+                },
+            )()
+        )
+
+        assert rc == 1
+        download_mock.assert_not_called()
+
+    def test_document_export_rejects_other_workspace_key(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        request_mock = MagicMock()
+        download_mock = MagicMock()
+        monkeypatch.setattr(eesel, "http_request", request_mock)
+        monkeypatch.setattr(eesel, "http_download", download_mock)
+
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": "c11e2c42-b77e-45f1-88d1-cf9b22974c90/outputs/skills/agent-A/blog/run-1/POST.md",
+                    "document_id": None,
+                    "format": "md",
+                    "output": str(tmp_path / "post.md"),
+                },
+            )()
+        )
+
+        assert rc == 1
+        request_mock.assert_not_called()
+        download_mock.assert_not_called()
+
+    def test_document_export_rejects_other_agent_key(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        request_mock = MagicMock()
+        download_mock = MagicMock()
+        monkeypatch.setattr(eesel, "http_request", request_mock)
+        monkeypatch.setattr(eesel, "http_download", download_mock)
+
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    "document_key": "files/other-agent/random.md",
+                    "document_id": None,
+                    "format": "md",
+                    "output": str(tmp_path / "post.md"),
+                },
+            )()
+        )
+
+        assert rc == 1
+        request_mock.assert_not_called()
+        download_mock.assert_not_called()
+
+    def test_document_export_preserves_matching_workspace_prefix(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        workspace_id = "c11e2c42-b77e-45f1-88d1-cf9b22974c90"
+        fake_creds["workspace_id"] = workspace_id
+        eesel.save_creds(fake_creds)
+        stripped_key = "outputs/skills/agent-test-456/blog/run-1/POST.md"
+        calls = []
+
+        def fake_http_request(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append(("request", method, url, token))
+            if "/export-link" in url:
+                return {"url": "http://localhost:8080/documents/export/prefixed-token"}
+            return {"documents": [{"id": "doc-ws-1", "key": stripped_key, "name": "POST.md"}]}
+
+        def fake_http_download(url, *, token, output_path):
+            calls.append(("download", url, token, output_path))
+            output_path.write_text("# Exported")
+
+        monkeypatch.setattr(eesel, "http_request", fake_http_request)
+        monkeypatch.setattr(eesel, "http_download", fake_http_download)
+
+        output = tmp_path / "post.md"
+        rc = eesel.cmd_document(
+            type(
+                "Args",
+                (),
+                {
+                    "document_cmd": "export",
+                    # caller passes a key that includes its own workspace id prefix
+                    "document_key": f"{workspace_id}/{stripped_key}",
+                    "document_id": None,
+                    "format": "md",
+                    "output": str(output),
+                },
+            )()
+        )
+
+        assert rc == 0
+        # the workspace-id prefix is stripped before the key is resolved
+        assert calls[0][1:3] == (
+            "GET",
+            "http://localhost:8080/documents?limit=500&offset=0&prefix=outputs%2Fskills%2Fagent-test-456%2Fblog%2Frun-1%2FPOST.md",
+        )
+        assert calls[1][1:3] == (
+            "GET",
+            "http://localhost:8080/documents/doc-ws-1/export-link?format=md",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Misc
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestFindFreePort:
+    def test_returns_usable_port(self):
+        port = eesel._find_free_port()
+        assert isinstance(port, int)
+        assert 1024 < port < 65536
+        # Confirm we can actually bind to it.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+
+
+class TestArgParser:
+    def test_parser_builds(self):
+        # Smoke test: argparse construction shouldn't blow up.
+        parser = eesel.build_parser()
+        assert parser is not None
+
+    def test_no_args_exits(self):
+        # `eesel` with no args should trigger argparse's required-subcommand error.
+        with pytest.raises(SystemExit):
+            eesel.main([])
+
+    def test_login_dev_subcommand_parses(self):
+        # Just verify the parser accepts the flag without raising; we can't fully
+        # exercise it without docker/postgres.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["login", "--dev"])
+        assert args.cmd == "login"
+        assert args.dev is True
+
+    def test_login_dev_workspace_id_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["login", "--dev", "--workspace-id", "ws-123"])
+        assert args.cmd == "login"
+        assert args.dev is True
+        assert args.workspace_id == "ws-123"
+
+    def test_chat_message_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["chat", "hello world"])
+        assert args.cmd == "chat"
+        assert args.message == "hello world"
+
+    def test_sessions_use_requires_id(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["sessions", "use"])  # missing positional
+
+    def test_agents_use_parses_id(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["agents", "use", "my-agent"])
+        assert args.cmd == "agents"
+        assert args.agents_cmd == "use"
+        assert args.agent_id == "my-agent"
+
+    def test_chat_cost_flag_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["chat", "--cost", "hi there"])
+        assert args.cmd == "chat"
+        assert args.cost is True
+        assert args.message == "hi there"
+
+    def test_chat_without_cost_flag_defaults_false(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["chat", "hi"])
+        assert args.cost is False
+
+    def test_cost_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["cost"])
+        assert args.cmd == "cost"
+        assert args.session_id is None
+
+    def test_cost_subcommand_with_session(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["cost", "abc12345"])
+        assert args.session_id == "abc12345"
+
+    def test_document_list_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "list", "--prefix", "outputs/skills", "--search", "post", "--limit", "25"])
+        assert args.cmd == "document"
+        assert args.document_cmd == "list"
+        assert args.prefix == "outputs/skills"
+        assert args.search == "post"
+        assert args.limit == 25
+
+    def test_document_export_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "export", "--document-id", "doc-123", "--format", "html"])
+        assert args.cmd == "document"
+        assert args.document_cmd == "export"
+        assert args.document_id == "doc-123"
+        assert args.format == "html"
+
+    def test_document_defaults_to_list(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document"])
+        assert args.cmd == "document"
+        assert args.document_cmd == "list"
+        assert args.limit == 100
+
+    def test_top_level_export_removed(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["export", "--document-id", "doc-123"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Cost tracking
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCostParsing:
+    def test_parse_empty(self):
+        d = eesel.parse_cost_rows("")
+        assert d["total_cost"] == 0
+        assert d["total_runs"] == 0
+        assert d["by_task"] == []
+
+    def test_parse_single_root(self):
+        # task_id|parent|name|cost|in|out|cache_read|cache_write|runs
+        raw = "abc-123||My Task|0.1234|10000|500|2000|1000|3"
+        d = eesel.parse_cost_rows(raw)
+        assert d["total_runs"] == 3
+        assert abs(d["total_cost"] - 0.1234) < 1e-9
+        assert d["totals"]["input_tokens"] == 10000
+        assert d["totals"]["output_tokens"] == 500
+        assert d["totals"]["cache_read_tokens"] == 2000
+        assert d["totals"]["cache_write_tokens"] == 1000
+        assert len(d["by_task"]) == 1
+        row = d["by_task"][0]
+        assert row["task_id"] == "abc-123"
+        assert row["parent_task_id"] is None
+        assert row["name"] == "My Task"
+        assert row["runs"] == 3
+
+    def test_parse_root_plus_subtasks(self):
+        raw = "\n".join(
+            [
+                "root-1||Root|0.10|1000|100|0|0|2",
+                "sub-1|root-1|Triage|0.05|500|50|0|0|1",
+                "sub-2|root-1|Research|0.08|800|80|0|0|1",
+            ]
+        )
+        d = eesel.parse_cost_rows(raw)
+        assert d["total_runs"] == 4
+        assert abs(d["total_cost"] - 0.23) < 1e-9
+        assert d["totals"]["input_tokens"] == 2300
+        assert d["totals"]["output_tokens"] == 230
+        assert len(d["by_task"]) == 3
+        assert d["by_task"][0]["parent_task_id"] is None
+        assert d["by_task"][1]["parent_task_id"] == "root-1"
+        assert d["by_task"][2]["parent_task_id"] == "root-1"
+
+    def test_parse_skips_malformed_rows(self):
+        raw = "\n".join(
+            [
+                "root-1||Root|0.10|1000|100|0|0|2",
+                "this is not a valid row",
+                "",
+                "sub-1|root-1||0.05|500|50|0|0|1",
+            ]
+        )
+        d = eesel.parse_cost_rows(raw)
+        assert len(d["by_task"]) == 2
+        assert d["total_runs"] == 3
+
+    def test_parse_zero_runs(self):
+        # Task exists in tree but has no metric rows yet.
+        raw = "abc-123|||0|0|0|0|0|0"
+        d = eesel.parse_cost_rows(raw)
+        assert d["total_runs"] == 0
+        assert d["total_cost"] == 0
+        assert len(d["by_task"]) == 1
+
+
+class TestCostFormatting:
+    def test_fmt_tokens(self):
+        assert eesel._fmt_tokens(0) == "0"
+        assert eesel._fmt_tokens(123) == "123"
+        assert eesel._fmt_tokens(9999) == "9,999"
+        assert eesel._fmt_tokens(12_345) == "12.3k"
+        assert eesel._fmt_tokens(584_145) == "584.1k"
+        assert eesel._fmt_tokens(2_500_000) == "2.50M"
+
+    def test_fmt_cost_4_decimals(self):
+        # Always 4 decimal places — small chats should not round to $0.00.
+        assert eesel._fmt_cost(0) == "$0.0000"
+        assert eesel._fmt_cost(0.0001) == "$0.0001"
+        assert eesel._fmt_cost(1.5) == "$1.5000"
+
+    def test_oneline_no_data(self):
+        d = {"total_cost": 0, "total_runs": 0, "totals": {}, "by_task": []}
+        out = eesel.format_cost_oneline(d)
+        assert "no cost data" in out
+
+    def test_oneline_single_task(self):
+        d = {
+            "total_cost": 0.373,
+            "total_runs": 5,
+            "totals": {"input_tokens": 584145, "output_tokens": 4822, "cache_read_tokens": 0, "cache_write_tokens": 0},
+            "by_task": [{"task_id": "x", "parent_task_id": None}],
+        }
+        out = eesel.format_cost_oneline(d)
+        assert "$0.3730" in out
+        assert "584.1k in" in out
+        assert "4,822 out" in out
+        assert "5 calls" in out
+        # Single task → no "N tasks" suffix
+        assert "tasks]" not in out
+
+    def test_oneline_with_subtasks(self):
+        d = {
+            "total_cost": 0.5,
+            "total_runs": 7,
+            "totals": {"input_tokens": 1000, "output_tokens": 100, "cache_read_tokens": 0, "cache_write_tokens": 0},
+            "by_task": [
+                {"task_id": "root", "parent_task_id": None},
+                {"task_id": "sub", "parent_task_id": "root"},
+            ],
+        }
+        out = eesel.format_cost_oneline(d)
+        assert "2 tasks" in out
+
+    def test_oneline_singular_call(self):
+        d = {
+            "total_cost": 0.01,
+            "total_runs": 1,
+            "totals": {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 0, "cache_write_tokens": 0},
+            "by_task": [{"task_id": "x", "parent_task_id": None}],
+        }
+        out = eesel.format_cost_oneline(d)
+        assert "1 call]" in out
+
+    def test_full_includes_breakdown_when_subtasks(self):
+        sess = {"id": "abc", "name": "test", "task_id": "root"}
+        d = {
+            "total_cost": 0.5,
+            "total_runs": 4,
+            "totals": {"input_tokens": 1000, "output_tokens": 100, "cache_read_tokens": 50, "cache_write_tokens": 25},
+            "by_task": [
+                {"task_id": "root-id", "parent_task_id": None, "name": "Root task", "cost": 0.3, "runs": 2},
+                {"task_id": "sub-id", "parent_task_id": "root-id", "name": "Triage skill", "cost": 0.2, "runs": 2},
+            ],
+        }
+        out = eesel.format_cost_full(d, sess)
+        assert "session abc" in out
+        assert "$0.5000" in out
+        assert "by task (2)" in out
+        assert "[root]" in out
+        assert "[sub]" in out
+        assert "Triage skill" in out
+
+    def test_full_no_data_message(self):
+        sess = {"id": "abc", "name": "empty", "task_id": "t"}
+        d = {"total_cost": 0, "total_runs": 0, "totals": {}, "by_task": []}
+        out = eesel.format_cost_full(d, sess)
+        assert "no cost data" in out
+
+
+class TestFetchSessionCost:
+    def test_returns_none_in_prod(self, monkeypatch):
+        creds = {"env": "prod"}
+        sess = {"task_id": "abc-123"}
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: pytest.fail("psql should not run in prod"))
+        assert eesel.fetch_session_cost(creds, sess) is None
+
+    def test_returns_none_when_task_id_not_uuid_shaped(self, monkeypatch):
+        # Defence-in-depth against SQL injection via task_id (we interpolate
+        # into a template). Anything outside [0-9a-f-] short-circuits to None.
+        creds = {"env": "dev"}
+        sess = {"task_id": "abc'; DROP TABLE eesel_ai_tasks; --"}
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: pytest.fail("psql should not run for malformed id"))
+        assert eesel.fetch_session_cost(creds, sess) is None
+
+    def test_returns_none_on_psql_failure(self, monkeypatch):
+        creds = {"env": "dev"}
+        sess = {"task_id": "284a6a43-afa7-43f3-88e6-25d1a92cf7d7"}
+
+        def boom(sql):
+            raise RuntimeError("docker not running")
+
+        monkeypatch.setattr(eesel, "_run_psql", boom)
+        assert eesel.fetch_session_cost(creds, sess) is None
+
+    def test_parses_psql_output_in_dev(self, monkeypatch):
+        creds = {"env": "dev"}
+        sess = {"task_id": "284a6a43-afa7-43f3-88e6-25d1a92cf7d7"}
+        canned = "abc-123||My Task|0.5|10000|500|0|0|3"
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: canned)
+        d = eesel.fetch_session_cost(creds, sess)
+        assert d is not None
+        assert d["total_cost"] == 0.5
+        assert d["total_runs"] == 3
+
+    def test_returns_none_when_no_task_id(self, monkeypatch):
+        creds = {"env": "dev"}
+        sess = {}  # no task_id
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: pytest.fail("psql should not run"))
+        assert eesel.fetch_session_cost(creds, sess) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Subcommand integration (light)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestSubcommands:
+    def test_logout_clears_creds(self, tmp_config, fake_creds):
+        assert eesel.CREDS_FILE.exists()
+        rc = eesel.cmd_logout(None)
+        assert rc == 0
+        assert not eesel.CREDS_FILE.exists()
+
+    def test_logout_when_already_logged_out(self, tmp_config):
+        # Should not raise even if no creds file.
+        rc = eesel.cmd_logout(None)
+        assert rc == 0
+
+    def test_whoami_when_logged_out(self, tmp_config, capsys):
+        rc = eesel.cmd_whoami(None)
+        assert rc == 0
+        # stderr ends up captured by capsys too via the info() helper
+        # (we don't assert specific text, just that it doesn't crash)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tasks — workspace-wide agent activity
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _args(**kw):
+    """Build a throwaway args namespace for cmd_* calls."""
+    return type("Args", (), kw)()
+
+
+def _make_task(task_id, *, agent_name="Support Bot", name="hello", channel="chat", updated_at="2026-05-29T13:40:00+00:00"):
+    return {
+        "task_id": task_id,
+        "agent_id": "agent-test-456",
+        "agent_name": agent_name,
+        "name": name,
+        "updated_at": updated_at,
+        "created_at": updated_at,
+        "trigger_context": {"channel": channel},
+        "external_reference": None,
+        "parent_task_id": None,
+    }
+
+
+class TestTasksFetch:
+    def test_fetch_tasks_sends_status_grouping_and_desc_sort(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"tasks": [_make_task("aaaa1111-0000-0000-0000-000000000000")], "hasNextPage": False, "nextPage": None, "totalCount": 1}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rows, has_next, next_page = eesel.fetch_tasks(fake_creds, limit=25, page=2)
+
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/workspace/tasks"
+        assert captured["body"]["grouping"] == "status"
+        assert captured["body"]["sorting"] == "updatedDate"
+        assert captured["body"]["sort_order"] == 1
+        assert captured["body"]["page"] == 2 and captured["body"]["limit"] == 25
+        assert "agent" not in captured["body"]["filters"]
+        assert len(rows) == 1 and has_next is False and next_page is None
+
+    def test_fetch_tasks_agent_filter_is_a_list(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return {"tasks": [], "hasNextPage": False}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_tasks(fake_creds, agent_id="agent-xyz")
+        # Server requires TaskFilter.AGENT to be a list, else it's ignored.
+        assert captured["body"]["filters"] == {"agent": ["agent-xyz"]}
+
+    def test_fetch_tasks_sorts_desc_by_updated_at(self, fake_creds, monkeypatch):
+        rows_in = [
+            _make_task("old00000-0000-0000-0000-000000000000", updated_at="2026-05-01T00:00:00+00:00"),
+            _make_task("new00000-0000-0000-0000-000000000000", updated_at="2026-05-29T00:00:00+00:00"),
+        ]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": rows_in})
+        rows, _, _ = eesel.fetch_tasks(fake_creds)
+        assert [r["task_id"][:3] for r in rows] == ["new", "old"]
+
+    def test_count_tasks_reads_total_count(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return {"tasks": [], "totalCount": 142}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        assert eesel.count_tasks(fake_creds) == 142
+        # Count only needs the aggregate, not the rows.
+        assert captured["body"]["limit"] == 1
+
+    def test_resolve_task_id_passthrough_for_uuid_without_listing(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not list for a full uuid"))
+        full = "284a6a43-afa7-43f3-88e6-25d1a92cf7d7"
+        assert eesel.resolve_task_id(fake_creds, full) == full
+
+    def test_resolve_task_id_prefix_match(self, fake_creds, monkeypatch):
+        rows = [_make_task("7f3a9c21-0000-0000-0000-000000000000"), _make_task("b8e1d0f4-0000-0000-0000-000000000000")]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": rows})
+        assert eesel.resolve_task_id(fake_creds, "7f3a") == "7f3a9c21-0000-0000-0000-000000000000"
+
+    def test_resolve_task_id_ambiguous_returns_none(self, fake_creds, monkeypatch, capsys):
+        rows = [_make_task("7f3a0000-0000-0000-0000-000000000000"), _make_task("7f3a1111-0000-0000-0000-000000000000")]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": rows})
+        assert eesel.resolve_task_id(fake_creds, "7f3a") is None
+        assert "ambiguous" in capsys.readouterr().err
+
+    def test_resolve_task_id_no_match_returns_none(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [_make_task("aaaa0000-0000-0000-0000-000000000000")]})
+        assert eesel.resolve_task_id(fake_creds, "zzzz") is None
+        assert "No task matches" in capsys.readouterr().err
+
+
+class TestTasksList:
+    def test_list_prints_rows(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"tasks": [_make_task("7f3a9c21-1234-0000-0000-000000000000", agent_name="Support Bot", name="Refund for #1024", channel="helpdesk")], "hasNextPage": False},
+        )
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "7f3a9c21-123" in out  # task_id truncated to 12 chars
+        assert "Support Bot" in out
+        assert "helpdesk" in out
+        assert "Refund for #1024" in out
+
+    def test_list_paging_footer_when_more(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [_make_task("aaaa0000-0000-0000-0000-000000000000")], "hasNextPage": True, "nextPage": 3})
+        eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=2, agent=None))
+        # Footer goes to stderr via info().
+        assert "eesel tasks list --page 3" in capsys.readouterr().err
+
+    def test_list_marks_local_sessions_with_star(self, fake_creds, monkeypatch, capsys):
+        # Create a local CLI session whose task_id matches one of the rows.
+        sess = eesel.new_session(fake_creds, agent_id="agent-test-456", name="mine", switch_to=False)
+        local_tid = sess["task_id"]
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"tasks": [_make_task(local_tid), _make_task("ffff0000-0000-0000-0000-000000000000")], "hasNextPage": False},
+        )
+        eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None))
+        out = capsys.readouterr().out
+        assert f"* {local_tid[:12]}" in out
+
+    def test_list_empty_state(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "hasNextPage": False})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None))
+        assert rc == 0
+        assert "(no tasks)" in capsys.readouterr().err
+
+    def test_count_command_prints_total(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "totalCount": 7})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="count", agent=None))
+        assert rc == 0
+        assert "7 tasks" in capsys.readouterr().out
+
+    def test_count_agent_filter_resolves_name(self, fake_creds, monkeypatch, capsys):
+        seen = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if url.endswith("/workspace/tasks"):
+                seen["filters"] = body["filters"]
+                return {"tasks": [], "totalCount": 3}
+            # GET /agents — name resolution
+            return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="count", agent="Support Bot"))
+        assert rc == 0
+        assert seen["filters"] == {"agent": ["agent-test-456"]}
+        assert "for this agent" in capsys.readouterr().out
+
+
+class TestTasksShow:
+    HISTORY = {
+        "runs": [
+            {
+                "run_id": "run-1",
+                "items": [
+                    {"type": "message", "role": "user", "content": "how do refunds work?"},
+                    {"type": "thinking", "content": "checking policy"},
+                    {"type": "tool_call", "name": "doc_search", "tool_arguments": {"query": "refund"}},
+                    {"type": "tool_result", "name": "doc_search", "tool_output": {"hits": 2}},
+                    {"type": "message", "role": "assistant", "content": "Refunds take 5 days."},
+                ],
+            }
+        ]
+    }
+
+    def _fake(self, history):
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if "/history" in url:
+                return history
+            # find_task_row's list call
+            return {"tasks": [_make_task("284a6a43-afa7-43f3-88e6-25d1a92cf7d7", name="refund chat")], "hasNextPage": False}
+
+        return fake
+
+    def test_show_renders_each_item_type(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        rc = eesel.cmd_tasks(_args(tasks_cmd="show", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=False, full=False, cost=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "you" in out and "how do refunds work?" in out
+        assert "eesel" in out and "Refunds take 5 days." in out
+        assert "[tool] doc_search" in out
+        assert "[thinking]" in out
+        assert "# task 284a6a43-afa7-43f3-88e6-25d1a92cf7d7" in out
+
+    def test_show_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        eesel.cmd_tasks(_args(tasks_cmd="show", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=True, full=False, cost=False))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["task_id"] == "284a6a43-afa7-43f3-88e6-25d1a92cf7d7"
+        assert payload["runs"][0]["items"][0]["content"] == "how do refunds work?"
+
+    def test_show_empty_history(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake({"runs": []}))
+        rc = eesel.cmd_tasks(_args(tasks_cmd="show", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=False, full=False, cost=False))
+        assert rc == 0
+        assert "(no history)" in capsys.readouterr().err
+
+    def test_show_cost_reuses_session_cost_path(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        # Dev cost path: stub psql to return one root row.
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: "284a6a43-afa7-43f3-88e6-25d1a92cf7d7||refund chat|0.5|10000|500|0|0|3")
+        eesel.cmd_tasks(_args(tasks_cmd="show", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=False, full=False, cost=True))
+        out = capsys.readouterr().out
+        # format_cost_full is reused with label="task".
+        assert "task 284a6a43-aff" in out or "task 284a6a43" in out
+        assert "$0.5" in out
+
+    def test_cost_command_dev_only_hint_in_prod(self, fake_creds, monkeypatch, capsys):
+        prod = dict(fake_creds)
+        prod["env"] = "prod"
+        eesel.save_creds(prod)
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: pytest.fail("psql must not run in prod"))
+        rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7"))
+        assert rc == 0
+        assert "dev-only" in capsys.readouterr().err

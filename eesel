@@ -23,6 +23,8 @@ API surface used:
                                        trigger's context in chat
   GET  /agents/chat/{id}/raw-stream  SSE stream of UI message chunks
   POST /triggers/{id}/fire           manually enqueue a scheduled trigger
+  POST /workspace/tasks              list/count workspace tasks (agent activity)
+  GET  /workspace/tasks/{id}/history full transcript of one task, grouped by run
 """
 
 from __future__ import annotations
@@ -468,9 +470,9 @@ def format_cost_oneline(d: dict) -> str:
     )
 
 
-def format_cost_full(d: dict, sess: dict) -> str:
+def format_cost_full(d: dict, sess: dict, label: str = "session") -> str:
     lines = []
-    lines.append(f"session {sess['id']} ({sess.get('name', '?')})")
+    lines.append(f"{label} {sess['id']} ({sess.get('name', '?')})")
     lines.append(f"  task_id: {sess.get('task_id', '?')}")
     if d["total_runs"] == 0:
         lines.append("  no cost data — either nothing has run yet, or metrics")
@@ -1276,6 +1278,8 @@ def cmd_chat(args) -> int:
                 print("  /sessions   list sessions")
                 print("  /agents     list agents")
                 print("  /show       print this session's history")
+                print("  /tasks      list recent workspace tasks (all channels)")
+                print("  /task <id>  print one task's transcript")
                 print("  /cost       print cost summary for this session")
                 print("  /cost-on    auto-print cost after each reply")
                 print("  /cost-off   stop auto-printing cost")
@@ -1293,6 +1297,12 @@ def cmd_chat(args) -> int:
                 continue
             if line == "/show":
                 cmd_sessions(argparse.Namespace(sessions_cmd="show", session_id=sess["id"]))
+                continue
+            if line == "/tasks":
+                cmd_tasks(argparse.Namespace(tasks_cmd="list", limit=50, page=1, agent=None))
+                continue
+            if line.startswith("/task "):
+                cmd_tasks(argparse.Namespace(tasks_cmd="show", task_id=line[len("/task "):].strip(), json=False, full=False, cost=False))
                 continue
             if line == "/cost":
                 d = fetch_session_cost(creds, sess)
@@ -1337,6 +1347,247 @@ def cmd_cost(args) -> int:
         return 0
     print(format_cost_full(d, sess))
     return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tasks — workspace-wide agent activity (read-only)
+#
+# A "task" is any conversation/run the workspace's agents have done: dashboard
+# chats, the website widget, helpdesk ticket replies, scheduled-trigger runs,
+# and sub-agent spawns. This is the same data the dashboard's Activity view
+# shows — distinct from CLI "sessions", which are just local handles you
+# created. Backed entirely by the workspace-JWT endpoints POST /workspace/tasks
+# and GET /workspace/tasks/{id}/history, so this needs no extra auth and no
+# backend changes. (Staff preview/impersonation tasks are filtered out
+# server-side, so they never appear here.)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def fetch_tasks(creds: dict, *, limit: int = 50, page: int = 1, agent_id: str | None = None) -> tuple[list[dict], bool, int | None]:
+    """List workspace tasks, most-recently-updated first.
+
+    With the backend's default ``status`` grouping every task lands in a single
+    "Done" bucket, so page/limit page cleanly through the global recent list
+    (no weird per-group paging). Returns ``(rows, has_next_page, next_page)``.
+    """
+    filters: dict = {}
+    if agent_id:
+        filters["agent"] = [agent_id]  # server expects a list (TaskFilter.AGENT)
+    body = {
+        "page": page,
+        "limit": limit,
+        "filters": filters,
+        "grouping": "status",
+        "sorting": "updatedDate",
+        "sort_order": 1,  # descending — most recently updated first
+    }
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    rows = data.get("tasks") or []
+    # Server already sorts, but belt-and-braces in case grouping reorders.
+    rows.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    return rows, bool(data.get("hasNextPage")), data.get("nextPage")
+
+
+def count_tasks(creds: dict, *, agent_id: str | None = None) -> int:
+    """Total task count for the workspace (or one agent).
+
+    Reads ``totalCount`` from the list response, so it's accurate across all
+    pages — unlike counting the rows on a single page.
+    """
+    filters: dict = {}
+    if agent_id:
+        filters["agent"] = [agent_id]
+    body = {"page": 1, "limit": 1, "filters": filters, "grouping": "status"}
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    return int(data.get("totalCount") or 0)
+
+
+def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
+    """Return one task's history as a list of runs: ``[{run_id, items:[...]}]``."""
+    data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=creds["token"])
+    return data.get("runs") or []
+
+
+def resolve_agent_filter(creds: dict, target: str) -> str | None:
+    """Resolve an ``--agent`` value (full id, id-prefix, or name) to an agent_id."""
+    agents = fetch_agents(creds)
+    match = next((a for a in agents if a.get("agent_id") == target), None)
+    if not match:
+        match = next((a for a in agents if (a.get("agent_id") or "").startswith(target)), None)
+    if not match:
+        match = next((a for a in agents if a.get("name") == target), None)
+    if not match:
+        err(f"No agent matches '{target}'. Run `eesel agents list`.")
+        return None
+    return match["agent_id"]
+
+
+def resolve_task_id(creds: dict, target: str) -> str | None:
+    """Full uuid → use as-is; otherwise prefix-match against recent tasks."""
+    if _looks_like_uuid(target):
+        return target
+    rows, _, _ = fetch_tasks(creds, limit=500)
+    matches = [r for r in rows if (r.get("task_id") or "").startswith(target)]
+    if len(matches) == 1:
+        return matches[0].get("task_id")
+    if len(matches) > 1:
+        labels = ", ".join((r.get("task_id") or "?")[:12] for r in matches[:5])
+        err(f"Task id prefix '{target}' is ambiguous: {labels}")
+        return None
+    err(f"No task matches '{target}' in the {len(rows)} most recent tasks. Pass a full task id.")
+    return None
+
+
+def find_task_row(creds: dict, task_id: str) -> dict | None:
+    """Best-effort lookup of a task's metadata row for the `show` header."""
+    try:
+        rows, _, _ = fetch_tasks(creds, limit=200)
+    except SystemExit:
+        return None
+    return next((r for r in rows if r.get("task_id") == task_id), None)
+
+
+def _task_source(row: dict) -> str:
+    """Human label for where a task came from, derived from trigger_context."""
+    ctx = row.get("trigger_context") or {}
+    return ctx.get("channel") or ctx.get("trigger_type") or ctx.get("source") or "chat"
+
+
+def _task_label(row: dict) -> str:
+    name = row.get("name") or row.get("external_reference") or "(untitled)"
+    return name if len(name) <= 48 else name[:47] + "…"
+
+
+def _fmt_task_ts(iso: str | None) -> str:
+    if not iso:
+        return "?"
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return str(iso)[:16]
+
+
+def render_task_runs(runs: list[dict], *, full: bool = False) -> None:
+    """Print a task's transcript run-by-run, one line per history item type."""
+    if not runs:
+        info("(no history)")
+        return
+    multi = len(runs) > 1
+    for i, run in enumerate(runs, 1):
+        if multi:
+            print(_color(f"\n── run {i}/{len(runs)} ──", "2;37"))
+        for item in run.get("items", []):
+            render_history_item(item, full=full)
+
+
+def render_history_item(item: dict, *, full: bool = False) -> None:
+    typ = item.get("type")
+    if typ in ("message", "event"):
+        who = _color("you", "33") if item.get("role") == "user" else _color("eesel", "36")
+        print(f"\n{who}:")
+        print(item.get("content") or "")
+    elif typ == "thinking":
+        print(_color(f"\n[thinking] {item.get('content') or ''}", "2;37"))
+    elif typ == "tool_call":
+        args_s = json.dumps(item.get("tool_arguments") or {})
+        if not full:
+            args_s = args_s[:200]
+        print(_color(f"\n[tool] {item.get('name') or '?'} {args_s}", "2;37"))
+    elif typ in ("tool_result", "tool_error"):
+        out = item.get("tool_output")
+        if out is None:
+            preview = item.get("content") or ""
+        elif isinstance(out, str):
+            preview = out
+        else:
+            preview = json.dumps(out)
+        if not full:
+            preview = preview[:200]
+        tag = "[tool error]" if typ == "tool_error" else "[tool]"
+        print(_color(f"{tag} → {preview}", "2;37"))
+    else:
+        # Unknown type — print minimally so nothing is silently dropped.
+        if item.get("content"):
+            print(_color(f"[{typ}] {item['content']}", "2;37"))
+
+
+def _print_task_cost(creds: dict, task_id: str, name: str | None = None) -> None:
+    # fetch_session_cost only needs a dict carrying `task_id` (+ id/name for the
+    # header), so a synthetic session-like dict lets us reuse the exact same
+    # cost path — including the recursive sub-agent task-tree breakdown.
+    synthetic = {"id": task_id[:12], "name": name, "task_id": task_id}
+    d = fetch_session_cost(creds, synthetic)
+    if d is None:
+        info("cost data is dev-only right now — see /activity in the dashboard for prod")
+        return
+    print(format_cost_full(d, synthetic, label="task"))
+
+
+def cmd_tasks(args) -> int:
+    creds = require_creds()
+    sub = getattr(args, "tasks_cmd", None) or "list"
+
+    if sub == "count":
+        agent_id = None
+        if getattr(args, "agent", None):
+            agent_id = resolve_agent_filter(creds, args.agent)
+            if not agent_id:
+                return 1
+        n = count_tasks(creds, agent_id=agent_id)
+        suffix = " for this agent" if agent_id else ""
+        print(f"{n} task{'s' if n != 1 else ''}{suffix}")
+        return 0
+
+    if sub == "list":
+        agent_id = None
+        if getattr(args, "agent", None):
+            agent_id = resolve_agent_filter(creds, args.agent)
+            if not agent_id:
+                return 1
+        rows, has_next, next_page = fetch_tasks(creds, limit=args.limit, page=args.page, agent_id=agent_id)
+        if not rows:
+            info("(no tasks)")
+            return 0
+        local_task_ids = {s.get("task_id") for s in list_sessions()}
+        for r in rows:
+            tid = r.get("task_id") or "?"
+            mark = "*" if tid in local_task_ids else " "
+            agent = r.get("agent_name") or r.get("agent_id") or "?"
+            print(f" {mark} {tid[:12]}  {_fmt_task_ts(r.get('updated_at'))}  {agent[:18]:<18}  {_task_source(r):<10}  {_task_label(r)}")
+        if has_next:
+            info(f"more: eesel tasks list --page {next_page or args.page + 1}")
+        return 0
+
+    if sub == "show":
+        task_id = resolve_task_id(creds, args.task_id)
+        if not task_id:
+            return 1
+        runs = fetch_task_history(creds, task_id)
+        if getattr(args, "json", False):
+            print(json.dumps({"task_id": task_id, "runs": runs}, indent=2))
+            return 0
+        row = find_task_row(creds, task_id)
+        print(f"# task {task_id}")
+        if row:
+            agent = row.get("agent_name") or row.get("agent_id") or "?"
+            print(f"# agent={agent}  source={_task_source(row)}  updated={_fmt_task_ts(row.get('updated_at'))}")
+            if row.get("name"):
+                print(f"# {row['name']}")
+        render_task_runs(runs, full=getattr(args, "full", False))
+        if getattr(args, "cost", False):
+            print()
+            _print_task_cost(creds, task_id, name=row.get("name") if row else None)
+        return 0
+
+    if sub == "cost":
+        task_id = resolve_task_id(creds, args.task_id)
+        if not task_id:
+            return 1
+        row = find_task_row(creds, task_id)
+        _print_task_cost(creds, task_id, name=row.get("name") if row else None)
+        return 0
+
+    return 1
 
 
 def fetch_documents(creds: dict, *, prefix: str | None = None, search: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
@@ -1614,6 +1865,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("cost", help="Print cost + token usage for a session (includes sub-agents). Dev mode only.")
     sp.add_argument("session_id", nargs="?", help="(default: active session, prefix-match ok)")
     sp.set_defaults(func=cmd_cost)
+
+    sp = sub.add_parser("tasks", help="List, count, or view workspace agent activity (all channels)")
+    tk_sub = sp.add_subparsers(dest="tasks_cmd")
+    tk_ls = tk_sub.add_parser("list", help="List recent tasks (most-recently-updated first)")
+    tk_ls.add_argument("--limit", type=int, default=50, help="Tasks per page")
+    tk_ls.add_argument("--page", type=int, default=1, help="Page number (1-based)")
+    tk_ls.add_argument("--agent", help="Filter to one agent (full id, id-prefix, or name)")
+    tk_ct = tk_sub.add_parser("count", help="Print the total number of tasks")
+    tk_ct.add_argument("--agent", help="Count only one agent's tasks (full id, id-prefix, or name)")
+    tk_sh = tk_sub.add_parser("show", help="Print one task's full transcript")
+    tk_sh.add_argument("task_id", help="Full task id or id-prefix")
+    tk_sh.add_argument("--json", action="store_true", help="Emit the raw history payload instead of a rendered transcript")
+    tk_sh.add_argument("--full", action="store_true", help="Don't truncate tool arguments/outputs")
+    tk_sh.add_argument("--cost", action="store_true", help="Append a cost + token breakdown (dev mode only)")
+    tk_co = tk_sub.add_parser("cost", help="Print cost + token usage for one task (includes sub-agents). Dev mode only.")
+    tk_co.add_argument("task_id", help="Full task id or id-prefix")
+    sp.set_defaults(func=cmd_tasks, tasks_cmd="list", limit=50, page=1, agent=None)
 
     sp = sub.add_parser("document", help="List or export documents")
     d_sub = sp.add_subparsers(dest="document_cmd")
