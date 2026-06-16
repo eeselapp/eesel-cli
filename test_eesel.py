@@ -591,6 +591,116 @@ class TestDocumentCommand:
         )
 
 
+class TestDocumentRead:
+    # fake_creds.agent_id == "agent-test-456"
+    DOCS = [
+        {"id": "doc-aaa11122", "key": "files/agent-test-456/notes.md", "name": "notes.md"},
+        {"id": "doc-bbb33344", "key": "outputs/skills/agent-test-456/blog/run-1/POST.md", "name": "POST.md"},
+        {"id": "doc-other-99", "key": "files/other-agent/secret.md", "name": "secret.md"},
+        {"id": "doc-integ-77", "key": "integrations/zendesk/acme/article-1", "name": "article-1"},
+    ]
+
+    def _args(self, **kw):
+        base = {"document_cmd": "read", "target": None, "prefix": None, "format": "md"}
+        base.update(kw)
+        return type("Args", (), base)()
+
+    def _wire(self, monkeypatch, *, content=b"# Hello\nbody"):
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_documents", lambda creds, **kw: (seen.update(kw) or self.DOCS))
+
+        def fake_signed(creds, *, document_id, document_key, fmt):
+            seen["doc_id"] = document_id
+            seen["fmt"] = fmt
+            return ("x." + fmt, f"https://signed/{document_id}.{fmt}")
+
+        monkeypatch.setattr(eesel, "doc_export_signed_url", fake_signed)
+        monkeypatch.setattr(eesel, "http_fetch", lambda url, *, token, timeout=120: (seen.update(fetch_url=url) or content))
+        return seen
+
+    def test_read_by_id_prints_content(self, tmp_config, fake_creds, monkeypatch, capsys):
+        seen = self._wire(monkeypatch, content=b"# Notes\nhello world")
+        rc = eesel.cmd_document_read(self._args(target="doc-aaa11122"))
+        assert rc == 0
+        assert seen["doc_id"] == "doc-aaa11122"
+        assert seen["fmt"] == "md"
+        out = capsys.readouterr().out
+        assert out == "# Notes\nhello world\n"  # body to stdout, trailing newline added
+
+    def test_read_header_goes_to_stderr(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._wire(monkeypatch)
+        eesel.cmd_document_read(self._args(target="notes.md"))  # match by filename
+        captured = capsys.readouterr()
+        assert "files/agent-test-456/notes.md" in captured.err
+        assert "files/agent-test-456/notes.md" not in captured.out
+
+    def test_read_by_filename_and_html_format(self, tmp_config, fake_creds, monkeypatch):
+        seen = self._wire(monkeypatch, content=b"<h1>x</h1>")
+        rc = eesel.cmd_document_read(self._args(target="POST.md", format="html"))
+        assert rc == 0
+        assert seen["doc_id"] == "doc-bbb33344"
+        assert seen["fmt"] == "html"
+
+    def test_read_no_target_uses_interactive_menu(self, tmp_config, fake_creds, monkeypatch):
+        seen = self._wire(monkeypatch)
+        captured = {}
+
+        def fake_select(options, *, title=None, initial=0):
+            captured["options"] = options
+            return 1  # pick the second agent-owned doc
+
+        monkeypatch.setattr(eesel, "interactive_select", fake_select)
+        rc = eesel.cmd_document_read(self._args())
+        assert rc == 0
+        # Only the two agent-owned docs are offered (other-agent + integrations filtered out).
+        assert len(captured["options"]) == 2
+        assert seen["doc_id"] == "doc-bbb33344"
+
+    def test_read_prefix_is_passed_through_and_scopes(self, tmp_config, fake_creds, monkeypatch):
+        seen = self._wire(monkeypatch)
+        monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: 0)
+        eesel.cmd_document_read(self._args(prefix="files/"))
+        assert seen.get("prefix") == "files/"  # forwarded to fetch_documents
+
+    def test_read_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._wire(monkeypatch)
+        rc = eesel.cmd_document_read(self._args(target="nope"))
+        assert rc == 1
+        assert capsys.readouterr().out == ""
+
+    def test_read_ambiguous_id_prefix_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Two agent-owned ids share the prefix "doc-".
+        self._wire(monkeypatch)
+        rc = eesel.cmd_document_read(self._args(target="doc-"))
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err
+
+    def test_read_excludes_other_agents_doc(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # The other agent's doc must not be reachable by id.
+        self._wire(monkeypatch)
+        rc = eesel.cmd_document_read(self._args(target="doc-other-99"))
+        assert rc == 1
+
+    def test_read_no_documents_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_documents", lambda creds, **kw: [])
+        rc = eesel.cmd_document_read(self._args(prefix="integrations/"))
+        assert rc == 0
+        assert "no documents" in capsys.readouterr().err
+
+    def test_read_cancel_menu_returns_nonzero(self, tmp_config, fake_creds, monkeypatch):
+        self._wire(monkeypatch)
+        monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
+        assert eesel.cmd_document_read(self._args()) == 1
+
+
+class TestHttpFetch:
+    def test_http_download_uses_http_fetch(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(eesel, "http_fetch", lambda url, *, token: b"DATA")
+        out = tmp_path / "f.md"
+        eesel.http_download("https://x/y", token="t", output_path=out)
+        assert out.read_bytes() == b"DATA"
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Misc
 # ──────────────────────────────────────────────────────────────────────────
@@ -1096,6 +1206,22 @@ class TestArgParser:
         assert args.cmd == "document"
         assert args.document_cmd == "list"
         assert args.limit == 100
+
+    def test_document_read_subcommand_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "read", "doc-123", "--prefix", "files/", "--format", "html"])
+        assert args.document_cmd == "read"
+        assert args.target == "doc-123"
+        assert args.prefix == "files/"
+        assert args.format == "html"
+
+    def test_document_read_no_target_defaults(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "read"])
+        assert args.document_cmd == "read"
+        assert args.target is None
+        assert args.prefix is None
+        assert args.format == "md"
 
     def test_top_level_export_removed(self):
         parser = eesel.build_parser()
