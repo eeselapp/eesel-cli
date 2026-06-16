@@ -37,6 +37,7 @@ eesel whoami
 eesel agents list
 eesel agents use <id-or-name>       # set the active agent
 eesel agents use                    # ...or pick from an arrow-key menu (↑/↓, Enter)
+eesel agents unset                  # clear the active agent (next command prompts again)
 
 eesel instructions                  # print the active agent's instructions (system prompt)
 eesel instructions <id-or-name>     # ...for a specific agent

@@ -1127,6 +1127,14 @@ def cmd_agents(args) -> int:
         save_creds(creds)
         ok(f"Active agent: {match.get('name')} ({match['agent_id']})")
         return 0
+    if sub == "unset":
+        if not creds.get("agent_id"):
+            info("No active agent set.")
+            return 0
+        prev = creds.pop("agent_id", None)
+        save_creds(creds)
+        ok(f"Cleared active agent ({prev}). Commands that need one will prompt or accept --agent.")
+        return 0
     return 1
 
 
@@ -2020,6 +2028,7 @@ def build_parser() -> argparse.ArgumentParser:
     a_sub.add_parser("list", help="List agents in this workspace")
     use = a_sub.add_parser("use", help="Set the active agent (omit id for an interactive menu)")
     use.add_argument("agent_id", nargs="?", help="Full id, id prefix, or agent name (omit to pick from an arrow-key menu)")
+    a_sub.add_parser("unset", help="Clear the active agent (next command that needs one prompts again)")
     sp.set_defaults(func=cmd_agents)
 
     sp = sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")

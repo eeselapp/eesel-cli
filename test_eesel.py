@@ -758,6 +758,35 @@ class TestAgentsUseInteractive:
         assert eesel.load_creds()["agent_id"] == "agent-test-456"
 
 
+class TestAgentsUnset:
+    def _args(self):
+        return type("Args", (), {"agents_cmd": "unset"})()
+
+    def test_unset_clears_active_agent(self, tmp_config, fake_creds):
+        assert eesel.load_creds().get("agent_id") == "agent-test-456"
+        rc = eesel.cmd_agents(self._args())
+        assert rc == 0
+        # The key is removed entirely, leaving the rest of the creds intact.
+        creds = eesel.load_creds()
+        assert "agent_id" not in creds
+        assert creds["workspace_id"] == "ws-test-123"
+        assert creds["token"] == "test-jwt-token"
+
+    def test_unset_when_already_unset_is_noop(self, tmp_config, fake_creds, capsys):
+        eesel.cmd_agents(self._args())  # clear once
+        rc = eesel.cmd_agents(self._args())  # clear again
+        assert rc == 0
+        assert "No active agent" in capsys.readouterr().err
+
+    def test_unset_does_not_call_fetch_agents(self, tmp_config, fake_creds, monkeypatch):
+        # Clearing is purely local — it must not hit the network.
+        def boom(creds):
+            raise AssertionError("fetch_agents should not be called for unset")
+
+        monkeypatch.setattr(eesel, "fetch_agents", boom)
+        assert eesel.cmd_agents(self._args()) == 0
+
+
 class TestInteractiveSelectFallback:
     def test_numbered_select_valid_index(self, monkeypatch):
         monkeypatch.setattr("builtins.input", lambda _="": "1")
@@ -839,6 +868,13 @@ class TestArgParser:
         assert args.cmd == "agents"
         assert args.agents_cmd == "use"
         assert args.agent_id is None
+
+    def test_agents_unset_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["agents", "unset"])
+        assert args.cmd == "agents"
+        assert args.agents_cmd == "unset"
+        assert args.func is eesel.cmd_agents
 
     def test_instructions_subcommand_parses(self):
         parser = eesel.build_parser()
