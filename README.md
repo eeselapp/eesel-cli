@@ -122,6 +122,34 @@ Backed by the same workspace token the chat stream already uses
 login is needed. Staff preview/impersonation tasks are filtered out
 server-side and never appear here.
 
+## Integrations, tools & triggers
+
+Read-only inspectors for how an agent is wired up: which integrations the
+workspace has connected, what tools/actions an agent can take, and what
+triggers fire it.
+
+```bash
+eesel integrations                  # id, type, connection status, subdomain
+eesel integrations --json           # raw payload
+eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
+
+eesel tools                         # the active agent's tools/actions
+eesel tools <id-or-name>            # ...for a specific agent
+eesel tools --json                  # raw payload
+
+eesel triggers                      # scheduled triggers (the default view)
+eesel triggers --all                # every trigger, grouped by integration,
+                                    # with scheduled triggers on top
+eesel triggers --all --json         # raw payload
+```
+
+`eesel tools` lists each tool's name, read/write action, permission mode,
+and integration. `eesel triggers --all` shows each trigger's type, config,
+last-run time, and integration. Secret-looking values in trigger config
+(access tokens, signing secrets) are masked in the human view; use `--json`
+for the raw payload. `eesel integrations --secrets` reveals integration
+credentials and is gated to sysadmin/impersonator accounts.
+
 ## Cost
 
 `eesel cost` and `eesel chat --cost` show how much a session has cost end
