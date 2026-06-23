@@ -931,14 +931,74 @@ def fetch_agents(creds: dict) -> list[dict]:
     return items
 
 
+def match_agents(agents: list[dict], target: str) -> list[dict]:
+    """All agents matching `target`, in resolution-priority order: an exact id
+    first, then id-prefix matches, then exact-name matches.
+
+    An exact id is unique, so it short-circuits to a single result. The same
+    agent never appears twice (a prefix match isn't re-listed as a name match),
+    so callers can count the result to detect ambiguity.
+    """
+    exact_id = [a for a in agents if a.get("agent_id") == target]
+    if exact_id:
+        return exact_id
+    prefix = [a for a in agents if (a.get("agent_id") or "").startswith(target)]
+    name = [a for a in agents if a.get("name") == target and a not in prefix]
+    return prefix + name
+
+
 def resolve_agent(agents: list[dict], target: str) -> dict | None:
-    """Match `target` against agents by exact id, then id-prefix, then exact
-    name. Returns the agent dict or None."""
-    return (
-        next((a for a in agents if a.get("agent_id") == target), None)
-        or next((a for a in agents if (a.get("agent_id") or "").startswith(target)), None)
-        or next((a for a in agents if a.get("name") == target), None)
-    )
+    """First agent matching `target` by exact id, id-prefix, then exact name,
+    or None. First-match (used by `agents use`); see `resolve_agent_strict` for
+    the write/destructive commands that must refuse ambiguity."""
+    matches = match_agents(agents, target)
+    return matches[0] if matches else None
+
+
+def resolve_agent_strict(agents: list[dict], target: str) -> tuple[dict | None, list[dict]]:
+    """Resolve `target` to exactly one agent. Returns (agent, []) on a unique
+    match, (None, candidates) when more than one matches, and (None, []) when
+    none do. Used by update/publish/delete, which must not act on an arbitrary
+    first match when a prefix or name is ambiguous."""
+    matches = match_agents(agents, target)
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+def build_agent_create_body(workspace_id: str, name: str, instructions: str | None = None) -> dict:
+    """Request body for `POST /agents`. `workspace_id` comes from stored creds,
+    never a flag. New agents are created live (`is_active=true`). Instructions
+    are optional and ride the `prompt` wire field (what `eesel instructions`
+    reads back); an empty string is sent when none are given."""
+    return {
+        "workspace_id": workspace_id,
+        "name": name,
+        "prompt": instructions or "",
+        "is_active": True,
+    }
+
+
+def build_agent_update_body(*, name: str | None = None, instructions: str | None = None) -> dict:
+    """Request body for `PUT /agents/{id}`, containing only the fields the user
+    actually passed. The server uses unset-exclusion, so a field left out is
+    untouched. Instructions ride the `prompt` wire field."""
+    body: dict = {}
+    if name is not None:
+        body["name"] = name
+    if instructions is not None:
+        body["prompt"] = instructions
+    return body
+
+
+def confirm(prompt: str) -> bool:
+    """Prompt for a yes/no answer. Affirmative = `y` or `yes` (case-insensitive);
+    anything else, including a bare Enter or EOF, is treated as no."""
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
 
 
 def _agent_label(a: dict, active: str | None = None) -> str:
@@ -1403,7 +1463,75 @@ def cmd_agents(args) -> int:
         save_creds(creds)
         ok(f"Cleared active agent ({prev}). Commands that need one will prompt or accept --agent.")
         return 0
+    if sub == "create":
+        return _agents_create(args, creds)
+    if sub == "update":
+        return _agents_update(args, creds)
+    if sub == "delete":
+        return _agents_delete(args, creds)
     return 1
+
+
+def _resolve_one_agent(target: str, creds: dict) -> dict | None:
+    """Resolve `target` to exactly one agent for a write/destructive command, or
+    print why it couldn't and return None. Ambiguous matches list the candidates
+    and refuse rather than acting on an arbitrary one."""
+    agent, candidates = resolve_agent_strict(fetch_agents(creds), target)
+    if agent:
+        return agent
+    if candidates:
+        err(f"'{target}' matches {len(candidates)} agents — narrow it down (full id shown):")
+        for a in candidates:
+            print(f"   {a.get('agent_id', '?')}  {a.get('name', '?')}", file=sys.stderr)
+    else:
+        err(f"No agent matches '{target}'.")
+    return None
+
+
+def _agents_create(args, creds: dict) -> int:
+    if not args.name:
+        err("--name is required.")
+        return 1
+    body = build_agent_create_body(creds["workspace_id"], args.name, args.instructions)
+    data = http_request("POST", f"{creds['api_url']}/agents", token=creds["token"], body=body)
+    agent_id = data.get("agent_id") or data.get("id") or (data.get("agent") or {}).get("agent_id")
+    if agent_id:
+        ok(f"Created agent '{args.name}' ({agent_id})")
+    else:
+        ok(f"Created agent '{args.name}'")
+        info("(server returned no id; run `eesel agents list` to confirm)")
+    return 0
+
+
+def _agents_update(args, creds: dict) -> int:
+    agent = _resolve_one_agent(args.agent_id, creds)
+    if not agent:
+        return 1
+    body = build_agent_update_body(name=args.name, instructions=args.instructions)
+    if not body:
+        err("Nothing to update. Pass --name and/or --instructions.")
+        return 1
+    http_request("PUT", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"], body=body)
+    ok(f"Updated {agent.get('name')} ({agent['agent_id']}): {', '.join(body.keys())}")
+    return 0
+
+
+def _agents_delete(args, creds: dict) -> int:
+    agent = _resolve_one_agent(args.agent_id, creds)
+    if not agent:
+        return 1
+    if not args.yes and not confirm(f"Delete agent '{agent.get('name')}' ({agent['agent_id']})? [y/N] "):
+        info("Aborted.")
+        return 1
+    http_request("DELETE", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"])
+    ok(f"Deleted {agent.get('name')} ({agent['agent_id']}).")
+    # If the deleted agent was the active one, drop the stored pointer so later
+    # commands don't reference a dead id.
+    if creds.get("agent_id") == agent["agent_id"]:
+        creds.pop("agent_id", None)
+        save_creds(creds)
+        info("Cleared the active-agent pointer (it referenced the deleted agent).")
+    return 0
 
 
 def cmd_instructions(args) -> int:
@@ -2615,12 +2743,26 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp = sub.add_parser("whoami", help="Show the current login")
     sp.set_defaults(func=cmd_whoami)
 
-    sp = sub.add_parser("agents", help="List or switch agents")
+    sp = sub.add_parser("agents", help="List, switch, or manage agents")
     a_sub = sp.add_subparsers(dest="agents_cmd")
     a_sub.add_parser("list", help="List agents in this workspace")
     use = a_sub.add_parser("use", help="Set the active agent (omit id for an interactive menu)")
     use.add_argument("agent_id", nargs="?", help="Full id, id prefix, or agent name (omit to pick from an arrow-key menu)")
     a_sub.add_parser("unset", help="Clear the active agent (next command that needs one prompts again)")
+
+    create = a_sub.add_parser("create", help="Create a new agent")
+    create.add_argument("--name", help="Agent name (required)")
+    create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
+
+    update = a_sub.add_parser("update", help="Change an agent's name or instructions (only the flags you pass)")
+    update.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    update.add_argument("--name", help="New name")
+    update.add_argument("--instructions", help="New instructions / system prompt")
+
+    delete = a_sub.add_parser("delete", help="Delete an agent (asks for confirmation)")
+    delete.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+
     sp.set_defaults(func=cmd_agents)
 
     sp = sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")

@@ -1091,6 +1091,234 @@ class TestResolveAgent:
         agents = [{"agent_id": "ag", "name": "Short"}, {"agent_id": "ag-long", "name": "Long"}]
         assert eesel.resolve_agent(agents, "ag")["name"] == "Short"
 
+    def test_first_match_on_ambiguous_prefix(self):
+        # `use` keeps its first-match behaviour even when a prefix is ambiguous.
+        agents = [{"agent_id": "agent-1", "name": "One"}, {"agent_id": "agent-2", "name": "Two"}]
+        assert eesel.resolve_agent(agents, "agent-")["name"] == "One"
+
+
+class TestResolveAgentStrict:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},  # duplicate name
+    ]
+
+    def test_unique_match_returns_agent_and_no_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc123")
+        assert agent["name"] == "Support Bot"
+        assert candidates == []
+
+    def test_unique_prefix_match(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc")
+        assert agent["name"] == "Support Bot"
+        assert candidates == []
+
+    def test_ambiguous_prefix_refuses_and_lists_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-def")
+        assert agent is None
+        assert {a["agent_id"] for a in candidates} == {"agent-def456", "agent-def789"}
+
+    def test_ambiguous_name_refuses(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "Blog Writer")
+        assert agent is None
+        assert len(candidates) == 2
+
+    def test_no_match_returns_none_and_empty(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "nope")
+        assert agent is None
+        assert candidates == []
+
+    def test_exact_id_is_unique_even_when_prefix_of_another(self):
+        agents = [{"agent_id": "ag", "name": "Short"}, {"agent_id": "ag-long", "name": "Long"}]
+        agent, candidates = eesel.resolve_agent_strict(agents, "ag")
+        assert agent["name"] == "Short"
+        assert candidates == []
+
+    def test_same_agent_not_double_counted_on_prefix_and_name(self):
+        # An agent matching both by id-prefix and name must count once, so a
+        # genuinely unique target isn't mistaken for ambiguous.
+        agents = [{"agent_id": "abc", "name": "abc"}]
+        agent, candidates = eesel.resolve_agent_strict(agents, "abc")
+        assert agent["name"] == "abc"
+        assert candidates == []
+
+
+class TestBuildAgentCreateBody:
+    def test_created_live_with_instructions(self):
+        body = eesel.build_agent_create_body("ws-1", "QA Bot", "be helpful")
+        assert body == {"workspace_id": "ws-1", "name": "QA Bot", "prompt": "be helpful", "is_active": True}
+
+    def test_instructions_optional_default_empty(self):
+        # Instructions are optional; the `prompt` wire field is sent as "".
+        body = eesel.build_agent_create_body("ws-1", "QA Bot")
+        assert body == {"workspace_id": "ws-1", "name": "QA Bot", "prompt": "", "is_active": True}
+
+    def test_always_live(self):
+        # New agents are live; there is no inactive create path.
+        assert eesel.build_agent_create_body("ws-1", "QA Bot", "p")["is_active"] is True
+
+
+class TestBuildAgentUpdateBody:
+    def test_empty_when_nothing_passed(self):
+        assert eesel.build_agent_update_body() == {}
+
+    def test_only_name(self):
+        assert eesel.build_agent_update_body(name="Renamed") == {"name": "Renamed"}
+
+    def test_instructions_map_to_prompt_field(self):
+        assert eesel.build_agent_update_body(instructions="new text") == {"prompt": "new text"}
+
+    def test_both_fields(self):
+        body = eesel.build_agent_update_body(name="N", instructions="P")
+        assert body == {"name": "N", "prompt": "P"}
+
+
+def _capture_requests(monkeypatch, response=None):
+    """Replace http_request with a recorder; returns the list of calls made."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response if response is not None else {"agent_id": "created-id-999"}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+def _parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestAgentsCreateCommand:
+    def test_missing_name_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--instructions", "p"))
+        assert rc == 1
+        assert calls == []  # no request sent
+        assert "--name" in capsys.readouterr().err
+
+    def test_create_name_only_succeeds_live_with_empty_instructions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--name", "QA Bot"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents")
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "",
+            "is_active": True,
+        }
+
+    def test_create_posts_expected_body_and_prints_id(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--name", "QA Bot", "--instructions", "you are a test agent"))
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "you are a test agent",
+            "is_active": True,
+        }
+        assert "created-id-999" in capsys.readouterr().err  # ok() writes to stderr
+
+
+class TestAgentsUpdateCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_instructions_only_sends_prompt(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--instructions", "new text"))
+        assert calls[-1]["body"] == {"prompt": "new text"}
+
+    def test_nothing_to_update_fails(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_ambiguous_target_refuses_without_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "update", "Blog Writer", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+        err = capsys.readouterr().err
+        assert "agent-def456" in err and "agent-def789" in err
+
+    def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "update", "nope", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestAgentsDeleteCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123", "--yes"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+
+    def test_affirmative_confirmation_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_deleting_active_agent_clears_pointer(self, tmp_config, fake_creds, monkeypatch):
+        # fake_creds stores agent-test-456 as active; delete it and confirm the
+        # stored pointer is cleared.
+        agents = [{"agent_id": "agent-test-456", "name": "Active One"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-test-456", "--yes"))
+        assert rc == 0
+        assert eesel.load_creds().get("agent_id") is None
+
+    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "delete", "Blog Writer", "--yes"))
+        assert rc == 1
+        assert calls == []
+
 
 class TestAgentLabel:
     def test_includes_name_and_short_id(self):
