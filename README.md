@@ -32,7 +32,7 @@ EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/ee
 ## Quick start
 
 ```bash
-eesel login                         # opens dashboard.eesel.ai, captures workspace token
+eesel login                         # opens dashboard.eesel.ai, signs in as you (Auth0)
 eesel whoami
 eesel agents list
 eesel agents use <id-or-name>       # set the active agent
@@ -166,19 +166,29 @@ dashboard's Activity view.
 
 ## How auth works
 
-`eesel login` opens `dashboard.eesel.ai/cli` in your browser. The page
-captures a workspace token from your active dashboard session and
-hands it back to a local HTTP server the CLI runs briefly. Same auth
-as the dashboard — no separate credentials.
+`eesel login` opens `dashboard.eesel.ai/cli` in your browser. The page hands
+your Auth0 access token (and a refresh token) back to a local HTTP server the
+CLI runs briefly. The CLI then calls the API as you, with your real
+permissions — same identity as the dashboard, no separate credentials. The
+access token is short-lived; the CLI refreshes it silently using the refresh
+token, so you stay logged in without re-running `eesel login`.
 
-The token lives at `~/.config/eesel/credentials.json` (chmod 600) and
-expires in 30 days. Re-run `eesel login` when it expires.
+`eesel login --dev` is unchanged: it mints a local workspace JWT against the
+dev secret for the docker stack (no browser).
+
+Tokens live at `~/.config/eesel/credentials.json` (chmod 600). If a refresh
+ever fails (e.g. the token was revoked), re-run `eesel login`.
+
+**MCP clients** (Claude Code, Cursor) authenticate to `/mcp` with a workspace
+token, not the Auth0 token. Mint one with `eesel mcp token` and pass it as the
+`Authorization: Bearer` header — see the MCP setup guide.
 
 ## Local state
 
 ```
 ~/.config/eesel/
-├── credentials.json        env, api_url, workspace_id, agent_id, token, expires_at
+├── credentials.json        env, api_url, workspace_id, agent_id, token,
+│                           refresh_token, expires_at
 ├── current.json            { session_id }
 └── sessions/
     └── <id>.json           { id, name, agent_id, task_id, messages: [...] }

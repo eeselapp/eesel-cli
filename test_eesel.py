@@ -185,6 +185,313 @@ class TestCreds:
         out = eesel.require_creds()
         assert out["workspace_id"] == "ws-test-123"
 
+    def test_require_creds_refreshes_near_expiry(self, tmp_config, monkeypatch):
+        # A prod login with a refresh token and an access token inside the skew
+        # window is renewed silently rather than rejected.
+        eesel.save_creds(
+            {
+                "env": "prod",
+                "workspace_id": "ws-1",
+                "token": "old",
+                "refresh_token": "rt",
+                "expires_at": int(time.time()) + 10,  # within TOKEN_REFRESH_SKEW_SECONDS
+                "dashboard_url": "https://dashboard.eesel.ai",
+            }
+        )
+
+        def fake_refresh(creds):
+            creds["token"] = "fresh"
+            creds["expires_at"] = int(time.time()) + 3600
+            return creds
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", fake_refresh)
+        out = eesel.require_creds()
+        assert out["token"] == "fresh"
+
+    def test_require_creds_exits_when_refresh_fails_and_expired(self, tmp_config, monkeypatch):
+        eesel.save_creds(
+            {
+                "env": "prod",
+                "workspace_id": "ws-1",
+                "token": "old",
+                "refresh_token": "rt",
+                "expires_at": int(time.time()) - 1,  # already dead
+            }
+        )
+        monkeypatch.setattr(eesel, "refresh_prod_token", lambda creds: None)
+        with pytest.raises(SystemExit):
+            eesel.require_creds()
+
+    def test_require_creds_uses_current_token_when_refresh_fails_but_not_expired(
+        self, tmp_config, monkeypatch
+    ):
+        # Refresh failed transiently but the access token is still valid — use
+        # it for this command rather than forcing a re-login.
+        eesel.save_creds(
+            {
+                "env": "prod",
+                "workspace_id": "ws-1",
+                "token": "still-good",
+                "refresh_token": "rt",
+                "expires_at": int(time.time()) + 30,  # near expiry, not past
+            }
+        )
+        monkeypatch.setattr(eesel, "refresh_prod_token", lambda creds: None)
+        out = eesel.require_creds()
+        assert out["token"] == "still-good"
+
+    def test_require_creds_does_not_refresh_dev_token(self, tmp_config, monkeypatch):
+        # A dev login has no refresh token; an expired one means re-login, and
+        # refresh_prod_token must never be called.
+        eesel.save_creds(
+            {
+                "env": "dev",
+                "workspace_id": "ws-1",
+                "token": "x",
+                "expires_at": int(time.time()) - 1,
+            }
+        )
+        called = {"hit": False}
+
+        def boom(creds):
+            called["hit"] = True
+            return creds
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", boom)
+        with pytest.raises(SystemExit):
+            eesel.require_creds()
+        assert called["hit"] is False
+
+
+class TestLoginPayload:
+    """`_creds_from_login_payload` accepts both the Auth0 and legacy workspace
+    handoff shapes, so a current CLI works against any dashboard version."""
+
+    def test_auth0_payload_stores_access_and_refresh(self, tmp_config):
+        creds = eesel._creds_from_login_payload(
+            {
+                "access_token": "auth0-access",
+                "refresh_token": "rt",
+                "workspace_id": "ws-1",
+                "user_email": "a@b.com",
+                "expires_in": 3600,
+            },
+            "https://oracle.eesel.app",
+            "https://dashboard.eesel.ai",
+        )
+        assert creds["token"] == "auth0-access"
+        assert creds["refresh_token"] == "rt"
+        assert creds["workspace_id"] == "ws-1"
+        assert creds["expires_at"] <= int(time.time()) + 3600
+
+    def test_workspace_payload_stores_bare_token_no_refresh(self, tmp_config):
+        # A dashboard that predates the Auth0 handoff (or a rollback) returns a
+        # bare workspace token. The CLI still logs in; no refresh token is set.
+        creds = eesel._creds_from_login_payload(
+            {
+                "token": "ws-jwt",
+                "workspace_id": "ws-1",
+                "expires_in": 2592000,
+            },
+            "https://oracle.eesel.app",
+            "https://dashboard.eesel.ai",
+        )
+        assert creds["token"] == "ws-jwt"
+        assert "refresh_token" not in creds
+        # A workspace-token login is treated like the dev token by require_creds:
+        # no refresh, re-login on expiry.
+        eesel.save_creds(creds)
+        assert eesel.require_creds()["token"] == "ws-jwt"
+
+    def test_workspace_payload_ttl_falls_back_to_30_days(self, tmp_config):
+        creds = eesel._creds_from_login_payload(
+            {"token": "ws-jwt", "workspace_id": "ws-1"},  # no expires_in
+            "https://oracle.eesel.app",
+            "https://dashboard.eesel.ai",
+        )
+        # Workspace tokens are long-lived; the fallback must not be the short
+        # Auth0 window.
+        assert creds["expires_at"] > int(time.time()) + eesel.CLI_TOKEN_TTL_SECONDS - 5
+
+    def test_auth0_payload_ttl_falls_back_to_short_window(self, tmp_config):
+        creds = eesel._creds_from_login_payload(
+            {"access_token": "a", "refresh_token": "r", "workspace_id": "ws-1"},
+            "https://oracle.eesel.app",
+            "https://dashboard.eesel.ai",
+        )
+        expected = int(time.time()) + eesel.PROD_TOKEN_TTL_FALLBACK_SECONDS
+        assert abs(creds["expires_at"] - expected) <= 5
+
+    def test_exits_when_no_token_at_all(self, tmp_config):
+        with pytest.raises(SystemExit):
+            eesel._creds_from_login_payload(
+                {"workspace_id": "ws-1"}, "https://oracle.eesel.app", "https://dashboard.eesel.ai"
+            )
+
+    def test_exits_when_workspace_id_missing(self, tmp_config):
+        with pytest.raises(SystemExit):
+            eesel._creds_from_login_payload(
+                {"access_token": "a", "refresh_token": "r"},
+                "https://oracle.eesel.app",
+                "https://dashboard.eesel.ai",
+            )
+
+
+class _FakeResp:
+    """Minimal stand-in for the object urllib.request.urlopen yields."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps(self._data).encode()
+
+
+class TestRefreshProdToken:
+    def _creds(self, **over):
+        creds = {
+            "env": "prod",
+            "api_url": "https://oracle.eesel.app",
+            "dashboard_url": "https://dashboard.eesel.ai",
+            "workspace_id": "ws-1",
+            "token": "old-access",
+            "refresh_token": "rt-old",
+            "expires_at": int(time.time()) - 1,
+        }
+        creds.update(over)
+        return creds
+
+    def test_success_updates_and_persists(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        eesel.save_creds(creds)
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["body"] = json.loads(req.data)
+            return _FakeResp(
+                {"access_token": "new-access", "refresh_token": "rt-new", "expires_in": 7200}
+            )
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", fake_urlopen)
+        out = eesel.refresh_prod_token(creds)
+        assert out is not None
+        assert out["token"] == "new-access"
+        assert out["refresh_token"] == "rt-new"
+        assert out["expires_at"] > int(time.time()) + 7000
+        assert seen["url"].endswith("/api/cli/refresh")
+        assert seen["body"] == {"refresh_token": "rt-old"}
+        # The new token is written to disk, not just the in-memory dict.
+        assert eesel.load_creds()["token"] == "new-access"
+
+    def test_keeps_refresh_token_when_response_omits_it(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda req, timeout=None: _FakeResp({"access_token": "new-access", "expires_in": 3600}),
+        )
+        out = eesel.refresh_prod_token(creds)
+        assert out["refresh_token"] == "rt-old"
+
+    def test_returns_none_on_network_error(self, tmp_config, monkeypatch):
+        creds = self._creds()
+
+        def boom(req, timeout=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        assert eesel.refresh_prod_token(creds) is None
+
+    def test_returns_none_when_no_access_token(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda req, timeout=None: _FakeResp({"error": "refresh_failed"}),
+        )
+        assert eesel.refresh_prod_token(creds) is None
+
+
+class TestMcpToken:
+    def test_mint_workspace_token_exchanges_auth0_bearer(self, tmp_config, monkeypatch):
+        creds = {"api_url": "https://oracle.eesel.app", "token": "auth0-access", "agent_id": "agent-9"}
+        seen = {}
+
+        def fake_http(method, url, *, token=None, body=None, **kw):
+            seen.update(method=method, url=url, token=token, body=body)
+            return {"token": "ws-token", "expires_in": 2592000, "workspaceId": "ws-1"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        out = eesel.mint_workspace_token(creds, creds["agent_id"])
+        assert out == "ws-token"
+        assert seen["method"] == "POST"
+        assert seen["url"].endswith("/workspaces/token")
+        # The Auth0 access token is the Bearer used to mint the workspace token.
+        assert seen["token"] == "auth0-access"
+        assert seen["body"] == {"client": "cli", "agent_id": "agent-9"}
+
+    def test_mint_omits_agent_when_unset(self, tmp_config, monkeypatch):
+        seen = {}
+
+        def fake_http(method, url, *, token=None, body=None, **kw):
+            seen["body"] = body
+            return {"token": "ws"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        eesel.mint_workspace_token({"api_url": "x", "token": "t"}, None)
+        assert "agent_id" not in seen["body"]
+
+    def test_cmd_mcp_token_prints_only_the_token(self, tmp_config, monkeypatch, capsys):
+        eesel.save_creds(
+            {
+                "env": "prod",
+                "api_url": "https://oracle.eesel.app",
+                "workspace_id": "ws-1",
+                "token": "auth0",
+                "refresh_token": "rt",
+                "expires_at": int(time.time()) + 3600,
+                "agent_id": "agent-9",
+            }
+        )
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"token": "ws-token-xyz"})
+        args = eesel.build_parser(staff=False).parse_args(["mcp", "token"])
+        rc = args.func(args)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "ws-token-xyz"
+
+    def test_cmd_mcp_token_prints_existing_token_for_workspace_login(
+        self, tmp_config, monkeypatch, capsys
+    ):
+        # A workspace-token (or dev) login already holds a token /mcp accepts —
+        # print it as-is instead of trying to mint (which would 401, since the
+        # stored token isn't an Auth0 bearer).
+        eesel.save_creds(
+            {
+                "env": "prod",
+                "api_url": "https://oracle.eesel.app",
+                "workspace_id": "ws-1",
+                "token": "ws-jwt-existing",  # no refresh_token → workspace login
+                "expires_at": int(time.time()) + 3600,
+                "agent_id": "agent-9",
+            }
+        )
+
+        def boom(*a, **k):
+            raise AssertionError("must not mint for a workspace-token login")
+
+        monkeypatch.setattr(eesel, "mint_workspace_token", boom)
+        args = eesel.build_parser(staff=False).parse_args(["mcp", "token"])
+        rc = args.func(args)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "ws-jwt-existing"
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Session storage
@@ -1851,19 +2158,111 @@ class TestTriggerHelpers:
 
 class TestIsSysadmin:
     def test_true_when_allowed(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"allowed": True})
+        monkeypatch.setattr(
+            eesel, "_get_impersonate_status", lambda c: {"allowed": True, "target_user_id": None}
+        )
         assert eesel._is_sysadmin(fake_creds) is True
 
     def test_false_when_not_allowed(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"allowed": False})
+        monkeypatch.setattr(
+            eesel, "_get_impersonate_status", lambda c: {"allowed": False, "target_user_id": None}
+        )
         assert eesel._is_sysadmin(fake_creds) is False
 
-    def test_fails_closed_on_systemexit(self, fake_creds, monkeypatch):
-        def boom(*a, **k):
-            raise SystemExit("GET .../cli/impersonate → 404")
-
-        monkeypatch.setattr(eesel, "http_request", boom)
+    def test_fails_closed_when_status_unavailable(self, fake_creds, monkeypatch):
+        # _get_impersonate_status returns None on any error → not a sysadmin.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
         assert eesel._is_sysadmin(fake_creds) is False
+
+
+class TestImpersonateStatus:
+    """Normalization of /sysadmin/impersonator-status into {allowed, target_user_id}."""
+
+    def _status(self, monkeypatch, payload):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp(payload)
+        )
+        return eesel._get_impersonate_status({"api_url": "https://oracle.eesel.app", "token": "t"})
+
+    def test_active_target_reported_when_origin_present(self, tmp_config, monkeypatch):
+        # A real swap: impersonator_uid (origin) set, target_uid is the target.
+        out = self._status(
+            monkeypatch,
+            {"is_impersonator": True, "is_sysadmin": False,
+             "impersonator_uid": "staff-1", "target_uid": "victim-9"},
+        )
+        assert out == {"allowed": True, "target_user_id": "victim-9"}
+
+    def test_idle_allowlisted_reports_no_target(self, tmp_config, monkeypatch):
+        # Allowlisted but not impersonating: the endpoint echoes the caller as
+        # target_uid with no origin — must NOT be read as an active target.
+        out = self._status(
+            monkeypatch,
+            {"is_impersonator": True, "is_sysadmin": False,
+             "impersonator_uid": None, "target_uid": "self-1"},
+        )
+        assert out == {"allowed": True, "target_user_id": None}
+
+    def test_sysadmin_flag_alone_grants_allowed(self, tmp_config, monkeypatch):
+        out = self._status(
+            monkeypatch,
+            {"is_impersonator": False, "is_sysadmin": True,
+             "impersonator_uid": None, "target_uid": None},
+        )
+        assert out["allowed"] is True
+
+    def test_returns_none_on_error(self, tmp_config, monkeypatch):
+        def boom(req, timeout=None):
+            raise OSError("unreachable")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        assert eesel._get_impersonate_status({"api_url": "https://oracle.eesel.app", "token": "t"}) is None
+
+
+class TestImpersonateCommand:
+    def _creds(self):
+        return {
+            "env": "prod",
+            "api_url": "https://oracle.eesel.app",
+            "workspace_id": "ws-1",
+            "token": "auth0",
+            "refresh_token": "rt",
+            "expires_at": int(time.time()) + 3600,
+        }
+
+    def test_set_hits_sysadmin_endpoint_with_target_query(self, tmp_config, monkeypatch, capsys):
+        eesel.save_creds(self._creds())
+        seen = {}
+
+        def fake_http(method, url, *, token=None, body=None, **kw):
+            seen.update(method=method, url=url)
+            return {"message": "Impersonation target set", "target": "victim-9"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
+        rc = args.func(args)
+        assert rc == 0
+        assert seen["method"] == "GET"
+        assert "/sysadmin/set-impersonator-target?" in seen["url"]
+        assert "target=victim-9" in seen["url"]
+        # ok()/info() write to stderr.
+        assert "Impersonating: victim-9" in capsys.readouterr().err
+
+    def test_clear_hits_clear_endpoint(self, tmp_config, monkeypatch, capsys):
+        eesel.save_creds(self._creds())
+        seen = {}
+
+        def fake_http(method, url, *, token=None, body=None, **kw):
+            seen.update(method=method, url=url)
+            return {"message": "Impersonation target cleared"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "clear"])
+        rc = args.func(args)
+        assert rc == 0
+        assert seen["method"] == "GET"
+        assert seen["url"].endswith("/sysadmin/clear-impersonator-target")
+        assert "cleared" in capsys.readouterr().err.lower()
 
 
 class TestIntegrationsCommand:
