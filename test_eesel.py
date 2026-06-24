@@ -3583,3 +3583,172 @@ class TestSchedulesRemove:
         rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", yes=True))
         assert rc == 0
         assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-3"}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Skills
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_SKILLS_AGENTS = [
+    {"agent_id": "agent-abc123", "name": "Support Bot"},
+    {"agent_id": "agent-def456", "name": "Blog Writer"},
+]
+
+
+def _capture_skill_requests(monkeypatch, response=None):
+    """Replace http_request with a recorder; returns the list of calls made."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response if response is not None else {"status": "ok"}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+def _skills_parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestSkillsList:
+    def test_list_prints_enabled_skills(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            assert method == "GET"
+            assert url.endswith("/agents/agent-abc123/skills")
+            return [
+                {"id": "triage", "name": "Triage", "description": "Sort tickets"},
+                {"id": "summarize", "name": "Summarize", "description": "Recap threads"},
+            ]
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "Support Bot"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "triage" in out and "Triage" in out and "Sort tickets" in out
+        assert "summarize" in out
+
+    def test_list_empty_prints_hint(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [])
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123"))
+        assert rc == 0
+        assert "no skills enabled" in capsys.readouterr().err
+
+    def test_list_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        payload = [{"id": "triage", "name": "Triage", "description": "Sort"}]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: payload)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123", "--json"))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_list_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "ghost"))
+        assert rc == 1
+        # fetch_agents was stubbed; no skills request should have fired.
+        assert calls == []
+        assert "No agent matches" in capsys.readouterr().err
+
+
+class TestSkillsEnable:
+    def test_enable_posts_empty_body(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch, response={"agent_id": "agent-abc123", "skill_id": "triage"})
+        rc = eesel.cmd_skills(_skills_parse("skills", "enable", "agent-abc123", "triage"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage")
+        assert calls[0]["body"] == {}
+        err = capsys.readouterr().err
+        assert "Enabled skill 'triage'" in err
+        assert "eesel skills list" in err  # readback hint
+
+    def test_enable_resolves_agent_by_name(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "enable", "Blog Writer", "triage"))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/agents/agent-def456/skills/triage")
+
+
+class TestSkillsDisable:
+    def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "disable", "agent-abc123", "triage", "-y"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage")
+
+    def test_affirmative_confirmation_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "disable", "agent-abc123", "triage"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "disable", "agent-abc123", "triage"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestSkillsEdit:
+    def test_edit_puts_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(
+            _skills_parse("skills", "edit", "agent-abc123", "triage", "--config", '{"threshold": 3, "label": "urgent"}')
+        )
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
+        assert calls[0]["body"] == {"threshold": 3, "label": "urgent"}
+
+    def test_edit_rejects_invalid_json_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "{not json"))
+        assert rc == 1
+        assert calls == []
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_edit_rejects_non_object_json(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
+        assert rc == 1
+        assert calls == []
+        assert "must be a JSON object" in capsys.readouterr().err
+
+
+class TestSkillsArgParser:
+    def test_list_parses(self):
+        args = _skills_parse("skills", "list", "my-agent")
+        assert args.cmd == "skills"
+        assert args.skills_cmd == "list"
+        assert args.agent == "my-agent"
+        assert args.func is eesel.cmd_skills
+
+    def test_enable_requires_skill_id(self):
+        with pytest.raises(SystemExit):
+            _skills_parse("skills", "enable", "my-agent")  # missing skill_id
+
+    def test_disable_yes_flag_parses(self):
+        args = _skills_parse("skills", "disable", "my-agent", "skill-1", "-y")
+        assert args.skills_cmd == "disable"
+        assert args.yes is True
+
+    def test_edit_requires_config(self):
+        with pytest.raises(SystemExit):
+            _skills_parse("skills", "edit", "my-agent", "skill-1")  # missing --config
