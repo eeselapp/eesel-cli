@@ -2156,19 +2156,27 @@ def _schedules_add(creds: dict, args) -> int:
 
 
 def _schedules_remove(creds: dict, args) -> int:
-    """`eesel schedules remove <id> [-y]`: DELETE /triggers/{id}.
+    """`eesel schedules remove <id|title> [--force]`: DELETE /triggers/{id}.
 
-    Prompts for confirmation unless --yes/-y is passed. The id is the job's own
-    id (the first column of `eesel schedules list`).
+    `<job>` is resolved by id, id-prefix, or title substring (the same way
+    `eesel schedules fire` resolves it), so an unmatched value gives a clean
+    error instead of being sent to the server verbatim. Prompts for
+    confirmation unless --force is passed.
     """
-    job_id = args.job
-    if not getattr(args, "yes", False):
-        if not confirm(f"Remove scheduled job {job_id}? This cannot be undone. [y/N] "):
+    match = resolve_scheduled_job(creds, args.job)
+    if not match:
+        err(f"No scheduled job matches '{args.job}'.")
+        info("Run `eesel schedules list` to see available jobs.")
+        return 1
+
+    title = (match.get("config") or {}).get("title") or "(untitled)"
+    if not getattr(args, "force", False):
+        if not confirm(f"Remove scheduled job '{title}' ({match['id'][:12]})? This cannot be undone. [y/N] "):
             info("Cancelled.")
             return 1
 
-    http_request("DELETE", f"{creds['api_url']}/triggers/{job_id}", token=creds["token"])
-    ok(f"Removed scheduled job {job_id}.")
+    http_request("DELETE", f"{creds['api_url']}/triggers/{match['id']}", token=creds["token"])
+    ok(f"Removed scheduled job {match['id']}.")
     return 0
 
 
@@ -5057,7 +5065,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     t_rm = t_sub.add_parser("remove", help="Remove a trigger by id")
     t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
-    t_rm.add_argument("--force", action="store_true", help="Skip the confirmation prompt")
+    t_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
     sp.set_defaults(func=cmd_triggers)
 
@@ -5079,7 +5087,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sc_rm = sc_sub.add_parser("remove", help="Remove a scheduled job by id")
     sc_rm.add_argument("job", help="The job's id (first column of `eesel schedules list`)")
-    sc_rm.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    sc_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
     sc_fire = sc_sub.add_parser("fire", help="Manually fire a scheduled job once")
     sc_fire.add_argument("job", help="Full id, id prefix, or substring of the job title (e.g. 'heartbeat')")
@@ -5087,7 +5095,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # `delete`/`run` hidden aliases for `remove`/`fire`.
     sc_delete = sc_sub.add_parser("delete", help=argparse.SUPPRESS)
     sc_delete.add_argument("job")
-    sc_delete.add_argument("-y", "--yes", action="store_true")
+    sc_delete.add_argument("-f", "--force", action="store_true")
 
     sc_run = sc_sub.add_parser("run", help=argparse.SUPPRESS)
     sc_run.add_argument("job")

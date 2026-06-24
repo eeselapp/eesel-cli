@@ -2219,12 +2219,12 @@ class TestArgParser:
             # makes it a required flag and fails before sending the request.
             parser.parse_args(["schedules", "add", "Support Bot", "--cron", "0 9 * * *"])
 
-    def test_schedules_remove_parses_yes_flag(self):
+    def test_schedules_remove_parses_force_flag(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["schedules", "remove", "sch-1", "-y"])
+        args = parser.parse_args(["schedules", "remove", "sch-1", "-f"])
         assert args.schedules_cmd == "remove"
         assert args.job == "sch-1"
-        assert args.yes is True
+        assert args.force is True
 
     def test_schedules_fire_parses(self):
         parser = eesel.build_parser()
@@ -4079,29 +4079,42 @@ class TestSchedulesAdd:
 
 
 class TestSchedulesRemove:
-    def test_remove_with_yes_skips_confirm(self, fake_creds, monkeypatch, capsys):
+    def test_remove_with_force_skips_confirm(self, fake_creds, monkeypatch, capsys):
         captured = {}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-1", "config": {"title": "Daily"}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--yes must skip confirm"))
-        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-1", yes=True))
+        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--force must skip confirm"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-1", force=True))
         assert rc == 0
         assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-1"}
         assert "Removed scheduled job sch-1" in capsys.readouterr().err
 
     def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
         sent = {"called": False}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-2", "config": {}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-2", yes=False))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-2", force=False))
         assert rc == 1
         assert sent["called"] is False
 
     def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
         captured = {}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-3", "config": {}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", yes=True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", force=True))
         assert rc == 0
         assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-3"}
+
+    def test_remove_unmatched_job_errors_cleanly(self, fake_creds, monkeypatch, capsys):
+        # A non-matching value (e.g. a title with a space) must NOT be sent to the
+        # server verbatim — it is resolved first, so an unmatched job is a clean
+        # error, never an unhandled URL-construction exception.
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: None)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not call the server on an unmatched job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="No Such Job", force=True))
+        assert rc == 1
+        assert "No scheduled job matches 'No Such Job'" in capsys.readouterr().err
 
 
 # ──────────────────────────────────────────────────────────────────────────
