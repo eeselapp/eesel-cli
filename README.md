@@ -126,11 +126,16 @@ Backed by the same workspace token the chat stream already uses
 login is needed. Staff preview/impersonation tasks are filtered out
 server-side and never appear here.
 
-## Integrations, tools & triggers
+## Integrations, tools, triggers & schedules
 
-Read-only inspectors for how an agent is wired up: which integrations the
-workspace has connected, what tools/actions an agent can take, and what
-triggers fire it.
+Inspect and wire up how an agent runs: which integrations the workspace has
+connected, what tools/actions an agent can take, what event/webhook triggers
+fire it, and what scheduled jobs run it on a cron.
+
+Triggers and scheduled jobs are two separate command groups. An **event/webhook
+trigger** (`zendesk_ticket_created`, etc.) fires the agent when something happens
+in an integration. A **scheduled job** runs the agent on a cron and can also be
+fired manually.
 
 ```bash
 eesel integrations                  # id, type, connection status, subdomain
@@ -141,18 +146,27 @@ eesel tools                         # the scoped agent's tools/actions
 eesel tools <id-or-name>            # ...for a specific agent
 eesel tools --json                  # raw payload
 
-eesel triggers                      # scheduled triggers (the default view)
-eesel triggers --all                # every trigger, grouped by integration,
-                                    # with scheduled triggers on top
-eesel triggers --all --json         # raw payload
+# Event/webhook triggers
+eesel triggers                      # every event trigger, grouped by integration
+eesel triggers --json               # raw payload
+eesel triggers registry             # available trigger types (keys for `add`)
+eesel triggers add <agent> --key zendesk_ticket_created
+eesel triggers remove <id>
+
+# Scheduled jobs (cron)
+eesel schedules                     # every scheduled job (id, title, cron, tz)
+eesel schedules add <agent> --cron "0 9 * * *" --title "Morning digest"
+eesel schedules fire <id-or-title>  # run one manually, now
+eesel schedules remove <id>
 ```
 
-`eesel tools` lists each tool's name, read/write action, permission mode,
-and integration. `eesel triggers --all` shows each trigger's type, config,
-last-run time, and integration. Secret-looking values in trigger config
-(access tokens, signing secrets) are masked in the human view; use `--json`
-for the raw payload. `eesel integrations --secrets` reveals integration
-credentials and is gated to sysadmin/impersonator accounts.
+`eesel tools` lists each tool's name, read/write action, permission mode, and
+integration. `eesel triggers` shows each event trigger's type, config, last-run
+time, and integration. `eesel schedules` shows each job's title, cron, and
+timezone. Secret-looking values in trigger config (access tokens, signing
+secrets) are masked in the human view; use `--json` for the raw payload.
+`eesel integrations --secrets` reveals integration credentials and is gated to
+sysadmin/impersonator accounts.
 
 ## Cost
 

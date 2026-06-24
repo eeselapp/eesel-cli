@@ -1927,38 +1927,99 @@ class TestArgParser:
         assert args.triggers_cmd == "registry"
         assert args.func is eesel.cmd_triggers
 
-    def test_triggers_create_parses_key_and_config(self):
+    def test_triggers_add_parses_key_and_config(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "create", "Support Bot", "--key", "eesel_scheduled", "--config", "{}"])
-        assert args.triggers_cmd == "create"
+        args = parser.parse_args(["triggers", "add", "Support Bot", "--key", "zendesk_ticket_created", "--config", "{}"])
+        assert args.triggers_cmd == "add"
         assert args.agent == "Support Bot"
-        assert args.key == "eesel_scheduled"
+        assert args.key == "zendesk_ticket_created"
         assert args.config == "{}"
 
-    def test_triggers_create_requires_key(self):
+    def test_triggers_add_requires_key(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["triggers", "create", "Support Bot"])  # missing --key
+            parser.parse_args(["triggers", "add", "Support Bot"])  # missing --key
 
-    def test_triggers_delete_parses_yes_flag(self):
+    def test_triggers_remove_parses_yes_flag(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "remove", "trg-1", "-y"])
+        assert args.triggers_cmd == "remove"
+        assert args.trigger_id == "trg-1"
+        assert args.yes is True
+
+    def test_triggers_fire_alias_still_parses(self):
+        # `fire` on triggers is a deprecated alias that forwards to
+        # `eesel schedules fire`; it must still parse for old scripts.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "fire", "heartbeat"])
+        assert args.triggers_cmd == "fire"
+        assert args.trigger_id == "heartbeat"
+
+    def test_triggers_create_alias_still_parses(self):
+        # `create` is a hidden alias for `add`; it must still parse for old scripts.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "create", "Support Bot", "--key", "zendesk_ticket_created"])
+        assert args.triggers_cmd == "create"
+        assert args.agent == "Support Bot"
+        assert args.key == "zendesk_ticket_created"
+
+    def test_triggers_delete_alias_still_parses(self):
+        # `delete` is a hidden alias for `remove`; it must still parse for old scripts.
         parser = eesel.build_parser()
         args = parser.parse_args(["triggers", "delete", "trg-1", "-y"])
         assert args.triggers_cmd == "delete"
         assert args.trigger_id == "trg-1"
         assert args.yes is True
 
-    def test_triggers_run_parses(self):
+    def test_triggers_run_alias_still_parses(self):
+        # `run` is a hidden alias that forwards to `eesel schedules fire`.
         parser = eesel.build_parser()
         args = parser.parse_args(["triggers", "run", "heartbeat"])
         assert args.triggers_cmd == "run"
         assert args.trigger_id == "heartbeat"
 
-    def test_triggers_fire_alias_still_parses(self):
-        # `fire` is a hidden alias for `run`; it must still parse for old scripts.
+    def test_schedules_list_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "fire", "heartbeat"])
-        assert args.triggers_cmd == "fire"
-        assert args.trigger_id == "heartbeat"
+        args = parser.parse_args(["schedules", "list"])
+        assert args.cmd == "schedules"
+        assert args.schedules_cmd == "list"
+        assert args.func is eesel.cmd_schedules
+
+    def test_schedules_add_parses_cron_and_flags(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args([
+            "schedules", "add", "Support Bot",
+            "--cron", "0 9 * * *", "--title", "Morning digest", "--timezone", "Europe/London",
+        ])
+        assert args.schedules_cmd == "add"
+        assert args.agent == "Support Bot"
+        assert args.cron == "0 9 * * *"
+        assert args.title == "Morning digest"
+        assert args.timezone == "Europe/London"
+
+    def test_schedules_add_requires_cron(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["schedules", "add", "Support Bot"])  # missing --cron
+
+    def test_schedules_remove_parses_yes_flag(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["schedules", "remove", "sch-1", "-y"])
+        assert args.schedules_cmd == "remove"
+        assert args.job == "sch-1"
+        assert args.yes is True
+
+    def test_schedules_fire_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["schedules", "fire", "heartbeat"])
+        assert args.schedules_cmd == "fire"
+        assert args.job == "heartbeat"
+
+    def test_new_schedule_flag_and_trigger_alias(self):
+        # `--trigger` is the old name; both map to the same `schedule` dest.
+        parser = eesel.build_parser()
+        assert parser.parse_args(["new", "--schedule", "heartbeat"]).schedule == "heartbeat"
+        assert parser.parse_args(["new", "--trigger", "heartbeat"]).schedule == "heartbeat"
 
 
 class TestConfirm:
@@ -2613,10 +2674,16 @@ class TestTriggerHelpers:
         assert {r["id"] for r in rows} == {"t1", "t2"}
         assert {r["agent_name"] for r in rows} == {"Bot", "Bot2"}
 
-    def test_fetch_all_scheduled_is_subset(self, fake_creds, monkeypatch):
+    def test_fetch_all_scheduled_jobs_is_subset(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
-        scheduled = eesel.fetch_all_scheduled_triggers(fake_creds)
+        scheduled = eesel.fetch_all_scheduled_jobs(fake_creds)
         assert [t["id"] for t in scheduled] == ["sch-1"]
+
+    def test_fetch_all_event_triggers_excludes_scheduled(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        events = eesel.fetch_all_event_triggers(fake_creds)
+        assert "sch-1" not in {t["id"] for t in events}
+        assert all(t.get("trigger_key") != "eesel_scheduled" for t in events)
 
     def test_one_agent_failure_does_not_blank_list(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
@@ -2860,52 +2927,47 @@ class TestToolsCommand:
         assert "no tools" in capsys.readouterr().err
 
 
-class TestTriggersAll:
-    def test_all_groups_scheduled_on_top_then_by_integration(self, fake_creds, monkeypatch, capsys):
+class TestTriggersList:
+    """`eesel triggers list` shows event/webhook triggers only, grouped by
+    integration. Scheduled jobs are excluded — they live under `eesel
+    schedules`."""
+
+    def test_list_groups_event_triggers_by_integration(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert rc == 0
-        # scheduled group renders first, with the existing cron/title format.
-        assert "scheduled (1)" in out and "Heartbeat" in out and "cron=0 9 * * *" in out
+        # The scheduled job is not part of the triggers view.
+        assert "scheduled" not in out and "Heartbeat" not in out
         # zendesk group (resolved via integration map) + intercom (prefix fallback).
         assert "zendesk (1)" in out and "zendesk_ticket_created" in out and "WEBHOOK" in out
         assert "intercom (1)" in out and "intercom_conversation_replied" in out
-        # config shown inline for non-scheduled triggers.
+        # config shown inline for event triggers.
         assert '"foo": "bar"' in out
-        assert out.index("scheduled (1)") < out.index("zendesk (1)")
 
-    def test_all_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_list_json_emits_raw_event_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
         monkeypatch.setattr(eesel, "fetch_integrations", lambda *a, **k: pytest.fail("json path must not fetch integrations"))
-        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=True))
+        eesel.cmd_triggers(_args(triggers_cmd="list", json=True))
         payload = json.loads(capsys.readouterr().out)
-        assert {t["id"] for t in payload} == {"sch-1", "zd-1", "ic-1"}
+        # Only event triggers — the scheduled job (sch-1) is excluded.
+        assert {t["id"] for t in payload} == {"zd-1", "ic-1"}
 
-    def test_all_degrades_when_integrations_unreachable(self, fake_creds, monkeypatch, capsys):
+    def test_list_degrades_when_integrations_unreachable(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
 
         def boom(*a, **k):
             raise SystemExit("GET /integrations → 401")
 
         monkeypatch.setattr(eesel, "fetch_integrations", boom)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert rc == 0
         # zendesk integration_id can't be resolved to a type → prefix label used.
         assert "zendesk (1)" in out and "intercom (1)" in out
 
-    def test_default_list_still_scheduled_only(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=False, json=False))
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "Heartbeat" in out
-        # Non-scheduled triggers are not listed by the default view.
-        assert "zendesk_ticket_created" not in out
-
-    def test_all_redacts_secrets_in_config(self, fake_creds, monkeypatch, capsys):
+    def test_list_redacts_secrets_in_config(self, fake_creds, monkeypatch, capsys):
         triggers = [{
             "id": "ic-1", "type": "WEBHOOK", "trigger_key": "intercom_conversation_replied",
             "config": {"access_token": "tok-LEAK", "app_id": "abc"},
@@ -2913,11 +2975,34 @@ class TestTriggersAll:
         }]
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: triggers)
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
-        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert "tok-LEAK" not in out
         assert '"access_token": "***"' in out
         assert "abc" in out  # non-secret config still shown
+
+
+class TestSchedulesList:
+    def test_list_shows_scheduled_jobs_only(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="list", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Heartbeat" in out and "cron=0 9 * * *" in out
+        # Event triggers are not listed by the schedules view.
+        assert "zendesk_ticket_created" not in out
+
+    def test_list_json_emits_scheduled_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        eesel.cmd_schedules(_args(schedules_cmd="list", json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert {t["id"] for t in payload} == {"sch-1"}
+
+    def test_list_empty_hints_at_add(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: [])
+        rc = eesel.cmd_schedules(_args(schedules_cmd="list", json=False))
+        assert rc == 0
+        assert "no scheduled jobs" in capsys.readouterr().err
 
 
 class TestTriggersRegistry:
@@ -2939,16 +3024,18 @@ class TestTriggersRegistry:
         assert captured["method"] == "GET"
         assert captured["url"] == "http://localhost:8080/triggers/registry"
         cap = capsys.readouterr()
-        # The registry's trigger_id is the key the user passes to `create --key`.
-        assert "eesel_scheduled" in cap.out
+        # The registry's trigger_id is the key the user passes to `add --key`.
         assert "zendesk_ticket_created" in cap.out
+        # The scheduled-job type is filtered out — it's created via `eesel schedules add`.
+        assert "eesel_scheduled" not in cap.out
 
-    def test_registry_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_registry_json_excludes_scheduled_type(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"triggers": list(self._REGISTRY)})
         rc = eesel.cmd_triggers(_args(triggers_cmd="registry", json=True))
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
-        assert {t["trigger_id"] for t in payload} == {"eesel_scheduled", "zendesk_ticket_created"}
+        # Only event trigger types; the scheduled-job sentinel is filtered out.
+        assert {t["trigger_id"] for t in payload} == {"zendesk_ticket_created"}
 
     def test_registry_empty(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"triggers": []})
@@ -2957,28 +3044,28 @@ class TestTriggersRegistry:
         assert "no trigger types" in capsys.readouterr().err
 
 
-class TestTriggersCreate:
+class TestTriggersAdd:
     def _agents(self):
         return [{"agent_id": "agent-test-456", "name": "Support Bot", "agent_type": "support"}]
 
-    def test_create_posts_trigger_key_and_config(self, fake_creds, monkeypatch, capsys):
+    def test_add_posts_trigger_key_and_config(self, fake_creds, monkeypatch, capsys):
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
             captured["method"], captured["url"], captured["body"] = method, url, body
-            return {"trigger": {"id": "trg-new-1", "trigger_key": "eesel_scheduled"}}
+            return {"trigger": {"id": "trg-new-1", "trigger_key": "zendesk_ticket_created"}}
 
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", fake)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="Support Bot", key="eesel_scheduled", config='{"cron": "0 9 * * *"}'))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='{"foo": "bar"}'))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
-        assert captured["body"] == {"trigger_key": "eesel_scheduled", "config": {"cron": "0 9 * * *"}}
+        assert captured["body"] == {"trigger_key": "zendesk_ticket_created", "config": {"foo": "bar"}}
         err_out = capsys.readouterr().err
         assert "trg-new-1" in err_out
 
-    def test_create_defaults_config_to_empty_object(self, fake_creds, monkeypatch):
+    def test_add_defaults_config_to_empty_object(self, fake_creds, monkeypatch):
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
@@ -2987,99 +3074,220 @@ class TestTriggersCreate:
 
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", fake)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="agent-test-456", key="public_chat", config=None))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="agent-test-456", key="public_chat", config=None))
         assert rc == 0
         # Server rejects a null config, so an omitted --config must become {}.
         assert captured["body"] == {"trigger_key": "public_chat", "config": {}}
 
-    def test_create_unknown_agent_errors(self, fake_creds, monkeypatch):
+    def test_create_alias_still_adds(self, fake_creds, monkeypatch):
+        # `create` is a backward-compat alias for `add` and must route the same way.
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"trigger": {"id": "trg-new-3"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="Support Bot", key="zendesk_ticket_created", config=None))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
+
+    def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="nope", key="eesel_scheduled", config=None))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="nope", key="zendesk_ticket_created", config=None))
         assert rc == 1
         assert sent["called"] is False
 
-    def test_create_invalid_json_config_errors(self, fake_creds, monkeypatch):
+    def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="Support Bot", key="eesel_scheduled", config="{not json"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config="{not json"))
         assert rc == 1
         assert sent["called"] is False
 
-    def test_create_non_object_config_errors(self, fake_creds, monkeypatch):
+    def test_add_non_object_config_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="Support Bot", key="eesel_scheduled", config='["a", "b"]'))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='["a", "b"]'))
         assert rc == 1
         assert sent["called"] is False
 
 
-class TestTriggersDelete:
-    def test_delete_with_yes_skips_confirm(self, fake_creds, monkeypatch, capsys):
+class TestTriggersRemove:
+    def test_remove_with_yes_skips_confirm(self, fake_creds, monkeypatch, capsys):
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
             captured["method"], captured["url"] = method, url
-            return {"message": "Trigger deleted"}
+            return {"message": "Trigger removed"}
 
         monkeypatch.setattr(eesel, "http_request", fake)
         monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--yes must skip confirm"))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="delete", trigger_id="trg-1", yes=True))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-1", yes=True))
         assert rc == 0
         assert captured["method"] == "DELETE"
         assert captured["url"] == "http://localhost:8080/triggers/trg-1"
-        assert "Deleted trigger trg-1" in capsys.readouterr().err
+        assert "Removed trigger trg-1" in capsys.readouterr().err
 
-    def test_delete_prompts_and_proceeds_on_yes(self, fake_creds, monkeypatch):
+    def test_remove_prompts_and_proceeds_on_yes(self, fake_creds, monkeypatch):
         captured = {}
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_triggers(_args(triggers_cmd="delete", trigger_id="trg-2", yes=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-2", yes=False))
         assert rc == 0
         assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/trg-2"}
 
-    def test_delete_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
+    def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
         sent = {"called": False}
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="delete", trigger_id="trg-3", yes=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-3", yes=False))
         assert rc == 1
         assert sent["called"] is False
 
+    def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
+        # `delete` is a backward-compat alias for `remove` and must route the same way.
+        captured = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        rc = eesel.cmd_triggers(_args(triggers_cmd="delete", trigger_id="trg-4", yes=True))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/trg-4"}
 
-class TestTriggersRun:
+
+class TestSchedulesFire:
     def _match(self):
         return {"id": "sch-1", "agent_name": "Support Bot", "config": {"title": "Heartbeat"}}
 
-    def test_run_fires_scheduled_trigger(self, fake_creds, monkeypatch, capsys):
+    def test_fire_fires_scheduled_job(self, fake_creds, monkeypatch, capsys):
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
             captured["method"], captured["url"] = method, url
             return {"scheduled_at": "2026-06-24T09:00:00+00:00", "external_reference": "schedule_sch-1_x"}
 
-        monkeypatch.setattr(eesel, "resolve_scheduled_trigger", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
         monkeypatch.setattr(eesel, "http_request", fake)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="run", trigger_id="heartbeat"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="heartbeat"))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/triggers/sch-1/fire"
-        assert "Ran 'Heartbeat'" in capsys.readouterr().err
+        assert "Fired 'Heartbeat'" in capsys.readouterr().err
 
-    def test_fire_alias_still_works(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "resolve_scheduled_trigger", lambda creds, t: self._match())
+    def test_run_alias_still_fires(self, fake_creds, monkeypatch, capsys):
+        # `run` is a backward-compat alias for `fire`.
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
+        rc = eesel.cmd_schedules(_args(schedules_cmd="run", job="heartbeat"))
+        assert rc == 0
+        assert "Fired 'Heartbeat'" in capsys.readouterr().err
+
+    def test_fire_no_match_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: None)
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="nope"))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_triggers_fire_forwards_to_schedules(self, fake_creds, monkeypatch, capsys):
+        # `eesel triggers fire` is a deprecated alias that forwards to the
+        # scheduled-job fire path so older scripts keep working.
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
         rc = eesel.cmd_triggers(_args(triggers_cmd="fire", trigger_id="heartbeat"))
         assert rc == 0
-        assert "Ran 'Heartbeat'" in capsys.readouterr().err
+        assert "Fired 'Heartbeat'" in capsys.readouterr().err
 
-    def test_run_no_match_errors(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "resolve_scheduled_trigger", lambda creds, t: None)
+
+class TestSchedulesAdd:
+    def _agents(self):
+        return [{"agent_id": "agent-test-456", "name": "Support Bot", "agent_type": "support"}]
+
+    def test_add_builds_config_from_flags_and_sends_scheduled_key(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"trigger": {"id": "sch-new-1"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_schedules(_args(
+            schedules_cmd="add", agent="Support Bot",
+            cron="0 9 * * *", title="Morning digest", timezone="Europe/London", config=None,
+        ))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
+        assert captured["body"] == {
+            "trigger_key": "eesel_scheduled",
+            "config": {"cron": "0 9 * * *", "title": "Morning digest", "timezone": "Europe/London"},
+        }
+        assert "sch-new-1" in capsys.readouterr().err
+
+    def test_add_flags_win_over_config_json(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return {"trigger": {"id": "sch-new-2"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        # --config sets cron, but the dedicated --cron flag must override it.
+        rc = eesel.cmd_schedules(_args(
+            schedules_cmd="add", agent="agent-test-456",
+            cron="30 8 * * 1", title=None, timezone=None,
+            config='{"cron": "0 0 * * *", "extra": "kept"}',
+        ))
+        assert rc == 0
+        assert captured["body"]["config"]["cron"] == "30 8 * * 1"
+        assert captured["body"]["config"]["extra"] == "kept"
+
+    def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="run", trigger_id="nope"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="add", agent="nope", cron="0 9 * * *", title=None, timezone=None, config=None))
         assert rc == 1
         assert sent["called"] is False
+
+    def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="add", agent="Support Bot", cron="0 9 * * *", title=None, timezone=None, config="{not json"))
+        assert rc == 1
+        assert sent["called"] is False
+
+
+class TestSchedulesRemove:
+    def test_remove_with_yes_skips_confirm(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--yes must skip confirm"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-1", yes=True))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-1"}
+        assert "Removed scheduled job sch-1" in capsys.readouterr().err
+
+    def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-2", yes=False))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", yes=True))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-3"}
