@@ -1275,6 +1275,126 @@ class TestAgentsDeleteCommand:
         assert calls == []
 
 
+class TestAgentsEditCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+    ]
+
+    def test_edit_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_update_alias_still_works(self, tmp_config, fake_creds, monkeypatch):
+        # `update` was the original name before the rename to `edit`; it is kept
+        # as a hidden alias so existing scripts keep working.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+
+class TestAgentsGetCommand:
+    AGENTS = [
+        {
+            "agent_id": "agent-abc123",
+            "name": "Support Bot",
+            "agent_type": "help_desk_agent",
+            "is_active": True,
+            "description": "Handles tickets",
+            "prompt": "You are support.",
+        },
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_prints_detail_from_listing_without_extra_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "get", "agent-abc123"))
+        assert rc == 0
+        assert calls == []  # the listing already carries every field
+        out = capsys.readouterr().out
+        assert "Support Bot" in out
+        assert "help_desk_agent" in out
+        assert "live" in out
+        assert "You are support." in out
+
+    def test_json_outputs_raw_record(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "get", "agent-abc123", "--json"))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["agent_id"] == "agent-abc123"
+
+    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "get", "Blog Writer"))
+        assert rc == 1
+
+
+class TestAgentsEnableDisableCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_enable_puts_is_active_true(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "enable", "agent-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+        assert calls[0]["body"] == {"is_active": True}
+
+    def test_enable_does_not_prompt(self, tmp_config, fake_creds, monkeypatch):
+        # Enabling is non-destructive, so it must not block on a confirmation.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(AssertionError("should not prompt")))
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "enable", "agent-abc123"))
+        assert rc == 0
+        assert calls[0]["body"] == {"is_active": True}
+
+    def test_disable_yes_skips_prompt(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123", "--yes"))
+        assert rc == 0
+        assert calls[0]["body"] == {"is_active": False}
+
+    def test_disable_affirmative_confirmation_puts_false(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123"))
+        assert rc == 0
+        assert calls[0]["body"] == {"is_active": False}
+
+    def test_disable_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "enable", "Blog Writer"))
+        assert rc == 1
+        assert calls == []
+
+
 class TestAgentLabel:
     def test_includes_name_and_short_id(self):
         label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
