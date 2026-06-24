@@ -2019,3 +2019,172 @@ class TestTriggersAll:
         assert "tok-LEAK" not in out
         assert '"access_token": "***"' in out
         assert "abc" in out  # non-secret config still shown
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# workspaces — operate on the active workspace (creds["workspace_id"])
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _record_requests(monkeypatch, responses):
+    """Replace http_request with a recorder that returns a response chosen by a
+    `(method, url-substring) -> dict` mapping. The first matching entry wins;
+    unmatched calls return {}. Returns the list of recorded calls."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body, "token": token})
+        for (m, frag), resp in responses.items():
+            if method == m and frag in url:
+                return resp
+        return {}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+class TestWorkspacesGet:
+    WS = {
+        "workspaceId": "ws-test-123",
+        "workspaceName": "Acme",
+        "workspaceOwnerUserId": "auth0|owner",
+        "trialDurationDays": 14,
+        "stripeSubscriptionId": "sub_1",
+        "stripeCustomerId": "cus_1",
+        "onboarding_completed": True,
+        "dataResidency": None,
+        "namespaces": ["ns-1", "ns-2"],
+    }
+
+    def test_get_calls_workspace_endpoint_and_prints_fields(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("GET", "/workspaces/ws-test-123"): self.WS})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="get", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123"
+        out = capsys.readouterr().out
+        assert "workspaceName" in out and "Acme" in out
+        assert "trialDurationDays" in out and "14" in out
+        # The large structural field is omitted from the default view.
+        assert "namespaces" not in out
+
+    def test_get_is_the_default_subcommand(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd=None, json=False))
+        assert rc == 0
+        assert "Acme" in capsys.readouterr().out
+
+    def test_get_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="get", json=True))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == self.WS
+
+
+class TestWorkspacesEdit:
+    def test_edit_puts_workspace_name_then_reads_back(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(
+            monkeypatch,
+            {
+                ("PUT", "/workspaces/ws-test-123"): {"message": "Workspace updated successfully"},
+                ("GET", "/workspaces/ws-test-123"): {"workspaceName": "Renamed"},
+            },
+        )
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="edit", name="Renamed", json=False))
+        assert rc == 0
+        # First call is the PUT with the workspaceName body; the field name must
+        # match the server's WorkspaceUpdate schema exactly.
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123"
+        assert calls[0]["body"] == {"workspaceName": "Renamed"}
+        # Second call reads the workspace back (the PUT returns only a message).
+        assert calls[1]["method"] == "GET"
+        assert "Renamed" in capsys.readouterr().err  # ok() writes to stderr
+
+    def test_edit_without_name_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="edit", name=None, json=False))
+        assert rc == 1
+        assert calls == []
+        assert "--name" in capsys.readouterr().err
+
+
+class TestWorkspacesMembers:
+    MEMBERS = [
+        {"user_id": "auth0|owner", "email": "owner@acme.com", "role": "editor", "status": "accepted"},
+        {"user_id": "auth0|m2", "email": "viewer@acme.com", "role": "viewer", "status": "accepted"},
+        {"user_id": None, "email": "invited@acme.com", "role": "editor", "status": "pending"},
+    ]
+
+    def test_members_lists_email_and_role(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("GET", "/members"): {"members": self.MEMBERS}})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        assert rc == 0
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123/members"
+        out = capsys.readouterr().out
+        assert "owner@acme.com" in out and "editor" in out
+        assert "viewer@acme.com" in out and "viewer" in out
+        # A non-accepted member surfaces its status.
+        assert "invited@acme.com" in out and "pending" in out
+
+    def test_members_accepts_bare_list_response(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/members"): self.MEMBERS})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        assert rc == 0
+        assert "owner@acme.com" in capsys.readouterr().out
+
+    def test_members_empty_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/members"): {"members": []}})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        assert rc == 0
+        assert "no members" in capsys.readouterr().err
+
+
+class TestWorkspacesBillingLimit:
+    def test_billing_limit_posts_value_to_singular_path(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("POST", "/workspace/billing-limit"): {"status": "success"}})
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="billing-limit", amount=250))
+        assert rc == 0
+        # Path is the SINGULAR /workspace/billing-limit; body field is `value`.
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == "http://localhost:8080/workspace/billing-limit"
+        assert calls[0]["body"] == {"value": 250}
+        assert "250" in capsys.readouterr().err
+
+
+class TestWorkspacesExtendTrial:
+    def test_extend_trial_posts_and_prints_message(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(
+            monkeypatch,
+            {("POST", "/subscription/extend-trial"): {"success": True, "message": "Trial extended successfully"}},
+        )
+        rc = eesel.cmd_workspaces(_args(workspaces_cmd="extend-trial"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == "http://localhost:8080/subscription/extend-trial"
+        assert calls[0]["body"] == {}
+        assert "Trial extended successfully" in capsys.readouterr().err
+
+
+class TestWorkspacesParser:
+    def _parse(self, *argv):
+        return eesel.build_parser(staff=False).parse_args(list(argv))
+
+    def test_registered_with_get_default(self):
+        args = self._parse("workspaces")
+        assert args.func is eesel.cmd_workspaces
+        assert args.workspaces_cmd is None  # cmd_workspaces defaults to "get"
+
+    def test_edit_takes_name_flag(self):
+        args = self._parse("workspaces", "edit", "--name", "New Name")
+        assert args.workspaces_cmd == "edit"
+        assert args.name == "New Name"
+
+    def test_billing_limit_amount_is_int(self):
+        args = self._parse("workspaces", "billing-limit", "300")
+        assert args.workspaces_cmd == "billing-limit"
+        assert args.amount == 300 and isinstance(args.amount, int)
+
+    def test_members_and_extend_trial_register(self):
+        assert self._parse("workspaces", "members").workspaces_cmd == "members"
+        assert self._parse("workspaces", "extend-trial").workspaces_cmd == "extend-trial"
