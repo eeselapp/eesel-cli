@@ -1906,20 +1906,21 @@ class TestIntegrationsCommand:
         assert "(no integrations)" in capsys.readouterr().err
 
 
-class TestToolsCommand:
+class TestIntegrationActionsList:
+    """`eesel integrations <integration> actions list` (and show)."""
+
     def _agents(self):
         return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
 
-    def test_lists_active_agent_tools(self, fake_creds, monkeypatch, capsys):
+    def test_lists_actions_scoped_to_integration(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         out = capsys.readouterr().out
         assert rc == 0
+        # Only the zendesk action is shown; the ai_actions doc_search is filtered out.
         assert "Leave internal note" in out and "WRITE" in out and "ask" in out
-        assert "Search docs" in out and "READ" in out and "always_allow" in out
-        # integration column shows the resolved key.
-        assert "zendesk" in out
+        assert "Search docs" not in out
 
     def test_resolves_named_agent(self, fake_creds, monkeypatch, capsys):
         captured = {}
@@ -1932,7 +1933,7 @@ class TestToolsCommand:
             return []
 
         monkeypatch.setattr(eesel, "fetch_tools", fake_tools)
-        eesel.cmd_tools(_args(agent="Sales Bot", json=False))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent="Sales Bot", json=False))
         assert captured["aid"] == "agent-other-999"
 
     def test_no_active_agent_errors(self, fake_creds, monkeypatch, capsys):
@@ -1942,23 +1943,42 @@ class TestToolsCommand:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
             {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Bot2"}])
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: pytest.fail("should not fetch"))
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         assert rc == 1
         assert "No active agent" in capsys.readouterr().err
 
-    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_json_emits_scoped_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
-        eesel.cmd_tools(_args(agent=None, json=True))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=True))
         payload = json.loads(capsys.readouterr().out)
-        assert payload[0]["tool_key"] == "zendesk_leave_internal_note"
+        # Filtered to the named integration.
+        assert [t["tool_key"] for t in payload] == ["zendesk_leave_internal_note"]
 
-    def test_empty_tools(self, fake_creds, monkeypatch, capsys):
+    def test_empty_actions(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: [])
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         assert rc == 0
-        assert "no tools" in capsys.readouterr().err
+        assert "no 'zendesk' actions" in capsys.readouterr().err
+
+    def test_show_one_action(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="zendesk_leave_internal_note", agent=None, json=False))
+        cap = capsys.readouterr()
+        combined = cap.out + cap.err
+        assert rc == 0
+        assert "Leave internal note" in combined and "int-zendesk-1" in combined and "ask" in combined
+
+    def test_show_missing_action_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="nope", agent=None, json=False))
+        assert rc == 1
+        assert "No 'nope' action" in capsys.readouterr().err
 
 
 class TestParseToolConfig:
@@ -1976,8 +1996,8 @@ class TestParseToolConfig:
             eesel.parse_tool_config("[1, 2, 3]")
 
 
-class TestToolsWrite:
-    """enable / edit / disable on `eesel tools`."""
+class TestIntegrationActionsWrite:
+    """enable / edit / disable on `eesel integrations <integration> actions`."""
 
     def _agents(self):
         return [
@@ -1985,7 +2005,14 @@ class TestToolsWrite:
             {"agent_id": "agent-other-999", "name": "Sales Bot"},
         ]
 
-    def _capture_http(self, monkeypatch, response=None):
+    def _setup(self, monkeypatch, response=None):
+        """Stub agents + integrations resolution and capture the write request.
+
+        The integration positional (e.g. 'zendesk') is resolved to its connected
+        instance id via fetch_integrations, so write commands stub it here.
+        """
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
@@ -1999,71 +2026,77 @@ class TestToolsWrite:
         return captured
 
     # ── enable ──────────────────────────────────────────────────────────
-    def test_enable_posts_empty_config_to_resolved_agent(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        captured = self._capture_http(monkeypatch, {"tool_id": "t9", "config": {}})
-        rc = eesel.cmd_tools(_args(tools_cmd="enable", agent="Sales Bot", tool_key="zendesk_leave_internal_note", integration=None))
+    def test_enable_posts_empty_config_with_resolved_integration_id(self, fake_creds, monkeypatch, capsys):
+        captured = self._setup(monkeypatch, {"tool_id": "t9", "config": {}})
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Sales Bot", action="zendesk_leave_internal_note"))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/agents/agent-other-999/tools/zendesk_leave_internal_note"
-        # Enable sends an empty config; the server creates the row on first write.
-        assert captured["body"] == {"config": {}}
+        # Enable sends an empty config; the integration type resolves to its instance id.
+        assert captured["body"] == {"config": {}, "integration_id": "int-zendesk-1"}
         assert "Enabled" in capsys.readouterr().err
 
-    def test_enable_passes_integration_id_in_body(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        captured = self._capture_http(monkeypatch)
-        eesel.cmd_tools(_args(tools_cmd="enable", agent="agent-test-456", tool_key="shopify_refund", integration="int-shop-2"))
-        assert captured["body"] == {"config": {}, "integration_id": "int-shop-2"}
+    def test_enable_unresolved_integration_posts_unscoped(self, fake_creds, monkeypatch):
+        # ai_actions has no instance id, so the write proceeds without integration_id.
+        captured = self._setup(monkeypatch)
+        eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="ai_actions", agent="agent-test-456", action="doc_search"))
+        assert captured["body"] == {"config": {}}
 
     def test_enable_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
-        rc = eesel.cmd_tools(_args(tools_cmd="enable", agent="Ghost", tool_key="k", integration=None))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Ghost", action="k"))
         assert rc == 1
         assert "No agent matches" in capsys.readouterr().err
 
     # ── edit ────────────────────────────────────────────────────────────
     def test_edit_posts_parsed_config(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        captured = self._capture_http(monkeypatch, {"config": {"permission_mode": "ask"}})
-        rc = eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="zendesk_leave_internal_note", config='{"permission_mode": "ask"}', integration=None))
+        captured = self._setup(monkeypatch, {"config": {"permission_mode": "ask"}})
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456",
+            action="zendesk_leave_internal_note", config='{"permission_mode": "ask"}'))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
-        assert captured["body"] == {"config": {"permission_mode": "ask"}}
+        assert captured["body"] == {"config": {"permission_mode": "ask"}, "integration_id": "int-zendesk-1"}
 
     def test_edit_rejects_bad_json_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
-        rc = eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="k", config="{bad", integration=None))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config="{bad"))
         assert rc == 1
         assert "not valid JSON" in capsys.readouterr().err
 
     def test_edit_redacts_secrets_in_echoed_config(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        self._capture_http(monkeypatch, {"config": {"access_token": "tok-LEAK", "mode": "ask"}})
-        eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="k", config='{"mode": "ask"}', integration=None))
+        self._setup(monkeypatch, {"config": {"access_token": "tok-LEAK", "mode": "ask"}})
+        eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config='{"mode": "ask"}'))
         err = capsys.readouterr().err
         assert "tok-LEAK" not in err
         assert "***" in err
 
     # ── disable ─────────────────────────────────────────────────────────
-    def test_disable_with_yes_deletes_without_prompt(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        monkeypatch.setattr(eesel, "confirm", lambda prompt: pytest.fail("should not prompt with --yes"))
-        captured = self._capture_http(monkeypatch)
-        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="zendesk_leave_internal_note", integration=None, yes=True))
+    def test_disable_with_force_deletes_without_prompt(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: pytest.fail("should not prompt with --force"))
+        captured = self._setup(monkeypatch)
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456",
+            action="zendesk_leave_internal_note", force=True))
         assert rc == 0
         assert captured["method"] == "DELETE"
-        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
+        # Resolved integration id is passed as a query param to scope the delete.
+        assert captured["url"].endswith("/tools/zendesk_leave_internal_note?integration_id=int-zendesk-1")
         assert "Disabled" in capsys.readouterr().err
 
     def test_disable_affirmative_confirmation_deletes(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        captured = self._capture_http(monkeypatch)
-        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="k", integration=None, yes=False))
+        captured = self._setup(monkeypatch)
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456", action="k", force=False))
         assert rc == 0
         assert captured["method"] == "DELETE"
 
@@ -2071,15 +2104,10 @@ class TestToolsWrite:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not DELETE when declined"))
-        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="k", integration=None, yes=False))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456", action="k", force=False))
         assert rc == 1
         assert "Aborted" in capsys.readouterr().err
-
-    def test_disable_passes_integration_id_as_query_param(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        captured = self._capture_http(monkeypatch)
-        eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="shopify_refund", integration="int-shop-2", yes=True))
-        assert captured["url"].endswith("/tools/shopify_refund?integration_id=int-shop-2")
 
 
 class TestConfirm:
@@ -2101,28 +2129,48 @@ class TestConfirm:
         assert eesel.confirm("? ") is False
 
 
-class TestNormalizeToolsArgv:
-    def test_bare_tools_becomes_list(self):
-        assert eesel._normalize_tools_argv(["tools"]) == ["tools", "list"]
+class TestNormalizeIntegrationsArgv:
+    def test_bare_integrations_untouched(self):
+        # The integration listing path is left alone.
+        assert eesel._normalize_integrations_argv(["integrations"]) == ["integrations"]
+        assert eesel._normalize_integrations_argv(["integrations", "--json"]) == ["integrations", "--json"]
 
-    def test_agent_arg_becomes_list_agent(self):
-        assert eesel._normalize_tools_argv(["tools", "Support Bot"]) == ["tools", "list", "Support Bot"]
+    def test_actions_without_verb_defaults_to_list(self):
+        # `integrations zendesk actions` → `integrations actions zendesk list`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions"]) == [
+            "integrations", "actions", "zendesk", "list"]
 
-    def test_flag_only_becomes_list(self):
-        assert eesel._normalize_tools_argv(["tools", "--json"]) == ["tools", "list", "--json"]
+    def test_actions_reorders_integration_before_keyword(self):
+        # The user-facing path puts the integration first; argparse wants it after `actions`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "enable", "reply"]) == [
+            "integrations", "actions", "zendesk", "enable", "reply"]
 
-    def test_explicit_subcommands_left_untouched(self):
-        for cmd in ("list", "enable", "edit", "disable"):
-            argv = ["tools", cmd, "Bot", "k"]
-            assert eesel._normalize_tools_argv(argv) == argv
+    def test_actions_explicit_verbs_preserved(self):
+        for verb in ("list", "show", "enable", "disable", "edit"):
+            argv = ["integrations", "zendesk", "actions", verb, "reply"]
+            assert eesel._normalize_integrations_argv(argv) == ["integrations", "actions", "zendesk", verb, "reply"]
 
-    def test_non_tools_argv_untouched(self):
-        assert eesel._normalize_tools_argv(["agents", "list"]) == ["agents", "list"]
+    def test_flags_after_verb_kept_in_order(self):
+        assert eesel._normalize_integrations_argv(
+            ["integrations", "zendesk", "actions", "disable", "reply", "--force"]) == [
+            "integrations", "actions", "zendesk", "disable", "reply", "--force"]
+
+    def test_not_actions_path_left_untouched(self):
+        # `integrations <something>` that isn't followed by `actions` is left for
+        # the parser (it'll surface a helpful error).
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk"]) == ["integrations", "zendesk"]
+
+    def test_non_integrations_argv_untouched(self):
+        assert eesel._normalize_integrations_argv(["agents", "list"]) == ["agents", "list"]
 
     def test_help_reaches_parent_parser(self):
-        # `tools --help` must show the subcommand list, not list's help.
-        assert eesel._normalize_tools_argv(["tools", "--help"]) == ["tools", "--help"]
-        assert eesel._normalize_tools_argv(["tools", "-h"]) == ["tools", "-h"]
+        # `integrations --help` shows the integrations help, not the actions help.
+        assert eesel._normalize_integrations_argv(["integrations", "--help"]) == ["integrations", "--help"]
+        assert eesel._normalize_integrations_argv(["integrations", "-h"]) == ["integrations", "-h"]
+
+    def test_actions_help_reaches_actions_parser(self):
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "--help"]) == [
+            "integrations", "actions", "zendesk", "--help"]
 
 
 class TestTriggersAll:
