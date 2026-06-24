@@ -21,21 +21,25 @@ API surface used:
                                        which `eesel instructions` prints)
   GET  /triggers/registry            list available trigger types/keys
                                        (eesel triggers registry)
-  GET  /agents/{id}/triggers         list triggers configured for one agent
-                                       (`eesel triggers --all` groups them by
-                                       integration; scheduled stay on top)
-  POST /agents/{id}/triggers         create a trigger on an agent
-                                       (eesel triggers create)
-  DELETE /triggers/{id}              delete a trigger (eesel triggers delete)
+  GET  /agents/{id}/triggers         list triggers configured for one agent.
+                                       The CLI splits these by trigger_key:
+                                       event/webhook triggers → `eesel triggers
+                                       list` (grouped by integration); scheduled
+                                       jobs → `eesel schedules list`
+  POST /agents/{id}/triggers         add a trigger to an agent (eesel triggers
+                                       add) or a scheduled job (eesel schedules
+                                       add, sends trigger_key=eesel_scheduled)
+  DELETE /triggers/{id}              remove a trigger / scheduled job
+                                       (eesel triggers remove / schedules remove)
   GET  /agents/{id}/tools            list an agent's tools/actions (eesel tools)
   GET  /integrations                 list workspace integrations + connection
                                        status (eesel integrations)
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
                                        optional triggerId → preview a scheduled
-                                       trigger's context in chat
+                                       job's context in chat
   GET  /agents/chat/{id}/raw-stream  SSE stream of UI message chunks
-  POST /triggers/{id}/fire           manually run a scheduled trigger
-                                       (eesel triggers run)
+  POST /triggers/{id}/fire           manually fire a scheduled job
+                                       (eesel schedules fire)
   POST /workspace/tasks              list/count workspace tasks (agent activity)
   GET  /workspace/tasks/{id}/history full transcript of one task, grouped by run
 """
@@ -900,10 +904,23 @@ def fetch_all_triggers(creds: dict) -> list[dict]:
     return out
 
 
-def fetch_all_scheduled_triggers(creds: dict) -> list[dict]:
-    """Scheduled triggers across the workspace — the subset of
-    `fetch_all_triggers` whose `trigger_key` is ``eesel_scheduled``."""
-    return [t for t in fetch_all_triggers(creds) if t.get("trigger_key") == "eesel_scheduled"]
+# A scheduled job is stored on the backend as a trigger whose `trigger_key` is
+# this sentinel. Everything else (`zendesk_ticket_created`, etc.) is an
+# event/webhook trigger. The CLI surfaces the two as separate command groups
+# (`eesel schedules` vs `eesel triggers`) even though they share one endpoint.
+SCHEDULED_TRIGGER_KEY = "eesel_scheduled"
+
+
+def fetch_all_scheduled_jobs(creds: dict) -> list[dict]:
+    """Scheduled jobs across the workspace — the subset of `fetch_all_triggers`
+    whose `trigger_key` is the scheduled-job sentinel."""
+    return [t for t in fetch_all_triggers(creds) if t.get("trigger_key") == SCHEDULED_TRIGGER_KEY]
+
+
+def fetch_all_event_triggers(creds: dict) -> list[dict]:
+    """Event/webhook triggers across the workspace — every trigger that is not a
+    scheduled job."""
+    return [t for t in fetch_all_triggers(creds) if t.get("trigger_key") != SCHEDULED_TRIGGER_KEY]
 
 
 def fetch_integrations(creds: dict, *, agent_id: str | None = None) -> list[dict]:
@@ -992,7 +1009,7 @@ def _redact_secrets(obj):
 
 
 def _trigger_integration_label(t: dict, id_to_type: dict) -> str:
-    """Group label for a non-scheduled trigger: the resolved integration type
+    """Group label for an event/webhook trigger: the resolved integration type
     when known, else the trigger_key's prefix (e.g. ``zendesk_ticket_created`` →
     ``zendesk``), else a catch-all."""
     iid = t.get("integration_id")
@@ -1004,14 +1021,14 @@ def _trigger_integration_label(t: dict, id_to_type: dict) -> str:
     return key or "other"
 
 
-def resolve_scheduled_trigger(creds: dict, target: str) -> dict | None:
-    """Match `target` against scheduled triggers in the workspace.
+def resolve_scheduled_job(creds: dict, target: str) -> dict | None:
+    """Match `target` against scheduled jobs in the workspace.
 
     Resolution order: exact id, id prefix, then case-insensitive substring of
     config.title. Returns the augmented trigger dict, or None if nothing
     matches.
     """
-    rows = fetch_all_scheduled_triggers(creds)
+    rows = fetch_all_scheduled_jobs(creds)
     match = next((t for t in rows if t.get("id") == target), None)
     if match:
         return match
@@ -1358,11 +1375,11 @@ def cmd_new(args) -> int:
         save_creds(creds)
 
     trigger_id = trigger_title = None
-    if getattr(args, "trigger", None):
-        match = resolve_scheduled_trigger(creds, args.trigger)
+    if getattr(args, "schedule", None):
+        match = resolve_scheduled_job(creds, args.schedule)
         if not match:
-            err(f"No scheduled trigger matches '{args.trigger}'.")
-            info("Run `eesel triggers list` to see available triggers.")
+            err(f"No scheduled job matches '{args.schedule}'.")
+            info("Run `eesel schedules list` to see available jobs.")
             return 1
         trigger_id = match["id"]
         trigger_title = (match.get("config") or {}).get("title")
@@ -1379,11 +1396,11 @@ def cmd_new(args) -> int:
         trigger_id=trigger_id,
         trigger_title=trigger_title,
     )
-    suffix = f" [trigger: {trigger_title}]" if trigger_title else ""
+    suffix = f" [schedule: {trigger_title}]" if trigger_title else ""
     ok(f"New session: {sess['id']} ({sess['name']}){suffix}")
 
-    # Auto-fire when bound to a trigger. The whole point of binding a session
-    # to a scheduled trigger is to preview what it would output — making the
+    # Auto-fire when bound to a scheduled job. The whole point of binding a
+    # session to a scheduled job is to preview what it would output — making the
     # user type "go" as a separate `chat` step was friction and polluted the
     # persisted chat history with a "user said: go" turn. Now the session
     # immediately fires once with an empty user message (backend filters it
@@ -1391,7 +1408,7 @@ def cmd_new(args) -> int:
     # state where follow-up `eesel chat "<scenario tweak>"` calls iterate
     # on the preview.
     if trigger_id:
-        info("Firing trigger...")
+        info("Firing scheduled job...")
         send_message(creds, sess, "")
     return 0
 
@@ -1446,67 +1463,47 @@ def cmd_sessions(args) -> int:
 
 
 def cmd_triggers(args) -> int:
+    """`eesel triggers`: event/webhook triggers (the ones that fire themselves on
+    an external event). Scheduled jobs live under `eesel schedules`."""
     creds = require_creds()
     sub = args.triggers_cmd or "list"
 
     if sub == "list":
-        if getattr(args, "all", False):
-            return _triggers_list_all(creds, as_json=getattr(args, "json", False))
-        rows = fetch_all_scheduled_triggers(creds)
-        if not rows:
-            info("(no scheduled triggers in this workspace)")
-            info("Run `eesel triggers --all` to include event/webhook triggers.")
-            return 0
-        for t in rows:
-            cfg = t.get("config") or {}
-            title = cfg.get("title") or "(untitled)"
-            cron = cfg.get("cron") or "?"
-            tz = cfg.get("timezone") or "UTC"
-            tid = (t.get("id") or "?")[:12]
-            print(f" {tid}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
-        return 0
+        return _triggers_list_events(creds, as_json=getattr(args, "json", False))
 
     if sub == "registry":
         return _triggers_registry(creds, as_json=getattr(args, "json", False))
 
-    if sub == "create":
-        return _triggers_create(creds, args)
+    # `add` is the canonical verb; `create` is kept as a hidden alias so older
+    # scripts that call `eesel triggers create ...` keep working.
+    if sub in ("add", "create"):
+        return _triggers_add(creds, args)
 
-    if sub == "delete":
-        return _triggers_delete(creds, args)
+    # `remove` is the canonical verb; `delete` is kept as a hidden alias.
+    if sub in ("remove", "delete"):
+        return _triggers_remove(creds, args)
 
-    # `run` is the canonical verb; `fire` is kept as a hidden alias so older
-    # scripts that call `eesel triggers fire ...` keep working.
-    if sub in ("run", "fire"):
-        match = resolve_scheduled_trigger(creds, args.trigger_id)
-        if not match:
-            err(f"No scheduled trigger matches '{args.trigger_id}'.")
-            info("Run `eesel triggers list` to see available triggers.")
-            return 1
-
-        url = f"{creds['api_url']}/triggers/{match['id']}/fire"
-        resp = http_request("POST", url, token=creds["token"], body={})
-
-        title = (match.get("config") or {}).get("title") or "(untitled)"
-        ok(f"Ran '{title}' (trigger={match['id'][:12]}, agent={match['agent_name']}).")
-        info(f"  scheduled_at: {resp.get('scheduled_at')}")
-        info(f"  external_ref: {resp.get('external_reference')}")
-        info("Tail the worker: docker logs slack-server-1 -f | grep scheduled_trigger")
-        return 0
+    # Firing is a scheduled-job operation — event triggers fire themselves.
+    # `eesel triggers fire/run` is kept as a hidden alias that forwards to
+    # `eesel schedules fire` so older scripts keep working.
+    if sub in ("fire", "run"):
+        warn("`eesel triggers fire` has moved to `eesel schedules fire`. Forwarding…")
+        return _schedules_fire(creds, args.trigger_id)
 
     return 1
 
 
 def _triggers_registry(creds: dict, *, as_json: bool = False) -> int:
-    """`eesel triggers registry`: list the available trigger types.
+    """`eesel triggers registry`: list the available event/webhook trigger types.
 
     Calls GET /triggers/registry and prints each trigger's key, integration and
     description. The `trigger_id` field in the registry is the value to pass as
-    `--key` when creating a trigger with `eesel triggers create`.
+    `--key` when adding a trigger with `eesel triggers add`. The scheduled-job
+    type is filtered out — scheduled jobs are created with `eesel schedules add`.
     """
     data = http_request("GET", f"{creds['api_url']}/triggers/registry", token=creds["token"])
     triggers = data.get("triggers") if isinstance(data, dict) else data
-    triggers = triggers or []
+    triggers = [t for t in (triggers or []) if t.get("trigger_id") != SCHEDULED_TRIGGER_KEY]
     if as_json:
         print(json.dumps(triggers, indent=2))
         return 0
@@ -1514,7 +1511,7 @@ def _triggers_registry(creds: dict, *, as_json: bool = False) -> int:
         info("(no trigger types in the registry)")
         return 0
 
-    info(f"# {len(triggers)} trigger type{'s' if len(triggers) != 1 else ''} — use the key with `eesel triggers create <agent> --key <key>`")
+    info(f"# {len(triggers)} trigger type{'s' if len(triggers) != 1 else ''} — use the key with `eesel triggers add <agent> --key <key>`")
     fmt = " {:<34}  {:<14}  {}"
     info(fmt.format("key", "integration", "name"))
     for t in sorted(triggers, key=lambda r: (r.get("integration_key") or "", r.get("trigger_id") or "")):
@@ -1525,8 +1522,8 @@ def _triggers_registry(creds: dict, *, as_json: bool = False) -> int:
     return 0
 
 
-def _triggers_create(creds: dict, args) -> int:
-    """`eesel triggers create <agent> --key <key> [--config '<JSON>']`.
+def _triggers_add(creds: dict, args) -> int:
+    """`eesel triggers add <agent> --key <key> [--config '<JSON>']`.
 
     POSTs to /agents/{agent_id}/triggers with {"trigger_key", "config"}. The
     server requires a non-null config, so an omitted --config is sent as an
@@ -1558,37 +1555,39 @@ def _triggers_create(creds: dict, args) -> int:
 
     trigger = resp.get("trigger") if isinstance(resp, dict) else None
     trigger_id = (trigger or {}).get("id") or (resp.get("id") if isinstance(resp, dict) else None)
-    ok(f"Created trigger '{args.key}' on {agent.get('name', agent['agent_id'])} (id={trigger_id}).")
-    info("Run `eesel triggers list` (or `--all`) to confirm.")
+    ok(f"Added trigger '{args.key}' to {agent.get('name', agent['agent_id'])} (id={trigger_id}).")
+    info("Run `eesel triggers list` to confirm.")
     return 0
 
 
-def _triggers_delete(creds: dict, args) -> int:
-    """`eesel triggers delete <id> [-y]`: DELETE /triggers/{id}.
+def _triggers_remove(creds: dict, args) -> int:
+    """`eesel triggers remove <id> [-y]`: DELETE /triggers/{id}.
 
     Prompts for confirmation unless --yes/-y is passed. The id is the trigger's
     own id (the first column of `eesel triggers list`), not the trigger key.
     """
     trigger_id = args.trigger_id
     if not getattr(args, "yes", False):
-        if not confirm(f"Delete trigger {trigger_id}? This cannot be undone. [y/N] "):
+        if not confirm(f"Remove trigger {trigger_id}? This cannot be undone. [y/N] "):
             info("Cancelled.")
             return 1
 
     http_request("DELETE", f"{creds['api_url']}/triggers/{trigger_id}", token=creds["token"])
-    ok(f"Deleted trigger {trigger_id}.")
+    ok(f"Removed trigger {trigger_id}.")
     return 0
 
 
-def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
-    """`eesel triggers --all`: every trigger in the workspace, scheduled grouped
-    on top, the rest grouped by integration. Read-only."""
-    rows = fetch_all_triggers(creds)
+def _triggers_list_events(creds: dict, *, as_json: bool = False) -> int:
+    """`eesel triggers list`: every event/webhook trigger in the workspace,
+    grouped by integration. Scheduled jobs are excluded — see `eesel schedules
+    list`. Read-only."""
+    rows = fetch_all_event_triggers(creds)
     if as_json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        info("(no triggers in this workspace)")
+        info("(no event/webhook triggers in this workspace)")
+        info("Run `eesel schedules list` to see scheduled jobs.")
         return 0
 
     # Best-effort integration_id → type map for nicer group labels. Degrade to
@@ -1601,11 +1600,8 @@ def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
     except (Exception, SystemExit):
         pass
 
-    scheduled = [t for t in rows if t.get("trigger_key") == "eesel_scheduled"]
     groups: dict = {}
     for t in rows:
-        if t.get("trigger_key") == "eesel_scheduled":
-            continue
         groups.setdefault(_trigger_integration_label(t, id_to_type), []).append(t)
 
     first = True
@@ -1616,15 +1612,6 @@ def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
             print()
         first = False
         print(_color(label, "1"))  # bold group header
-
-    if scheduled:
-        header(f"scheduled ({len(scheduled)})")
-        for t in scheduled:
-            cfg = t.get("config") or {}
-            title = cfg.get("title") or "(untitled)"
-            cron = cfg.get("cron") or "?"
-            tz = cfg.get("timezone") or "UTC"
-            print(f"  {(t.get('id') or '?')[:12]}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
 
     for label in sorted(groups):
         bucket = groups[label]
@@ -1642,6 +1629,137 @@ def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
                 if len(blob) > 200:
                     blob = blob[:200] + "…"
                 print(_color(f"      config: {blob}", "2;37"))
+    return 0
+
+
+def cmd_schedules(args) -> int:
+    """`eesel schedules`: scheduled jobs — cron-driven agent runs. These are
+    triggers whose key is the scheduled-job sentinel; the CLI gives them their
+    own command group because they behave differently from event triggers
+    (they have a cron, and they can be fired manually)."""
+    creds = require_creds()
+    sub = args.schedules_cmd or "list"
+
+    if sub == "list":
+        return _schedules_list(creds, as_json=getattr(args, "json", False))
+
+    if sub == "add":
+        return _schedules_add(creds, args)
+
+    if sub in ("remove", "delete"):
+        return _schedules_remove(creds, args)
+
+    if sub in ("fire", "run"):
+        return _schedules_fire(creds, args.job)
+
+    return 1
+
+
+def _schedules_list(creds: dict, *, as_json: bool = False) -> int:
+    """`eesel schedules list`: every scheduled job in the workspace, with its
+    cron and timezone. Read-only."""
+    rows = fetch_all_scheduled_jobs(creds)
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        info("(no scheduled jobs in this workspace)")
+        info("Add one with `eesel schedules add <agent> --cron \"0 9 * * *\"`.")
+        return 0
+    for t in rows:
+        cfg = t.get("config") or {}
+        title = cfg.get("title") or "(untitled)"
+        cron = cfg.get("cron") or "?"
+        tz = cfg.get("timezone") or "UTC"
+        tid = (t.get("id") or "?")[:12]
+        print(f" {tid}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
+    return 0
+
+
+def _schedules_add(creds: dict, args) -> int:
+    """`eesel schedules add <agent> --cron "<expr>" [--title ..] [--timezone ..]`.
+
+    POSTs to /agents/{agent_id}/triggers with the scheduled-job key and a config
+    built from the flags. `--config` is an optional JSON object whose keys are
+    merged in first, so the dedicated flags take precedence over it.
+    """
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one with `eesel agents create` first.")
+        return 1
+    agent = resolve_agent(agents, args.agent)
+    if not agent:
+        err(f"No agent matches '{args.agent}'.")
+        info("Run `eesel agents list` to see available agents.")
+        return 1
+
+    config: dict = {}
+    if getattr(args, "config", None):
+        try:
+            config = json.loads(args.config)
+        except json.JSONDecodeError as e:
+            err(f"--config is not valid JSON: {e}")
+            return 1
+        if not isinstance(config, dict):
+            err("--config must be a JSON object (e.g. '{\"cron\": \"0 9 * * *\"}').")
+            return 1
+
+    # Dedicated flags win over anything passed in --config.
+    config["cron"] = args.cron
+    if getattr(args, "title", None):
+        config["title"] = args.title
+    if getattr(args, "timezone", None):
+        config["timezone"] = args.timezone
+
+    url = f"{creds['api_url']}/agents/{agent['agent_id']}/triggers"
+    resp = http_request(
+        "POST", url, token=creds["token"],
+        body={"trigger_key": SCHEDULED_TRIGGER_KEY, "config": config},
+    )
+
+    trigger = resp.get("trigger") if isinstance(resp, dict) else None
+    job_id = (trigger or {}).get("id") or (resp.get("id") if isinstance(resp, dict) else None)
+    label = config.get("title") or args.cron
+    ok(f"Added scheduled job '{label}' to {agent.get('name', agent['agent_id'])} (id={job_id}).")
+    info("Run `eesel schedules list` to confirm.")
+    return 0
+
+
+def _schedules_remove(creds: dict, args) -> int:
+    """`eesel schedules remove <id> [-y]`: DELETE /triggers/{id}.
+
+    Prompts for confirmation unless --yes/-y is passed. The id is the job's own
+    id (the first column of `eesel schedules list`).
+    """
+    job_id = args.job
+    if not getattr(args, "yes", False):
+        if not confirm(f"Remove scheduled job {job_id}? This cannot be undone. [y/N] "):
+            info("Cancelled.")
+            return 1
+
+    http_request("DELETE", f"{creds['api_url']}/triggers/{job_id}", token=creds["token"])
+    ok(f"Removed scheduled job {job_id}.")
+    return 0
+
+
+def _schedules_fire(creds: dict, target: str) -> int:
+    """`eesel schedules fire <id|title>`: manually run a scheduled job once via
+    POST /triggers/{id}/fire. `target` is resolved by id, id-prefix, or title
+    substring."""
+    match = resolve_scheduled_job(creds, target)
+    if not match:
+        err(f"No scheduled job matches '{target}'.")
+        info("Run `eesel schedules list` to see available jobs.")
+        return 1
+
+    url = f"{creds['api_url']}/triggers/{match['id']}/fire"
+    resp = http_request("POST", url, token=creds["token"], body={})
+
+    title = (match.get("config") or {}).get("title") or "(untitled)"
+    ok(f"Fired '{title}' (job={match['id'][:12]}, agent={match['agent_name']}).")
+    info(f"  scheduled_at: {resp.get('scheduled_at')}")
+    info(f"  external_ref: {resp.get('external_reference')}")
+    info("Tail the worker: docker logs slack-server-1 -f | grep scheduled_trigger")
     return 0
 
 
@@ -1825,7 +1943,7 @@ def cmd_chat(args) -> int:
     # under one trigger context and half under another — not useful for
     # iteration.
     task_target = getattr(args, "task", None)
-    target = getattr(args, "trigger", None)
+    target = getattr(args, "schedule", None)
     if task_target and target:
         err("--task and --trigger are mutually exclusive.")
         return 1
@@ -1849,10 +1967,10 @@ def cmd_chat(args) -> int:
             )
         info(f"session {sess['id']} bound to task {task_target}")
     elif target:
-        match = resolve_scheduled_trigger(creds, target)
+        match = resolve_scheduled_job(creds, target)
         if not match:
-            err(f"No scheduled trigger matches '{target}'.")
-            info("Run `eesel triggers list` to see available triggers.")
+            err(f"No scheduled job matches '{target}'.")
+            info("Run `eesel schedules list` to see available jobs.")
             return 1
         creds["agent_id"] = match["agent_id"]
         save_creds(creds)
@@ -2563,7 +2681,8 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp = sub.add_parser("new", help="Start a new chat session")
     sp.add_argument("--agent", help="Agent id to use (default: active agent)")
     sp.add_argument("--name", help="Session name (default: auto)")
-    sp.add_argument("--trigger", help="Bind session to a scheduled trigger (id-prefix or title substring) so the agent runs under that trigger's context (preview mode)")
+    # `--trigger` is the old name, kept as an alias; the noun is now a scheduled job.
+    sp.add_argument("--schedule", "--trigger", dest="schedule", help="Bind session to a scheduled job (id-prefix or title substring) so the agent runs under that job's context (preview mode)")
     sp.set_defaults(func=cmd_new)
 
     sp = sub.add_parser("sessions", help="Manage chat sessions")
@@ -2580,12 +2699,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
     sp.add_argument("message", nargs="?", help="Message to send (omit for REPL)")
     sp.add_argument("--cost", action="store_true", help="After each reply, print a one-line cost + token summary for the whole session (incl. sub-agents)")
+    # `--trigger` is the old name, kept as an alias; the noun is now a scheduled job.
     sp.add_argument(
+        "--schedule",
         "--trigger",
-        help="Open a preview session bound to a scheduled trigger "
+        dest="schedule",
+        help="Open a preview session bound to a scheduled job "
         "(id-prefix or title substring like 'heartbeat'). "
-        "The agent runs under that trigger's context — "
-        "useful for iterating on what the trigger would output",
+        "The agent runs under that job's context — "
+        "useful for iterating on what the job would output",
     )
     sp.add_argument(
         "--task",
@@ -2646,39 +2768,82 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp.set_defaults(func=cmd_tools)
 
-    sp = sub.add_parser("triggers", help="List, run, create, or delete triggers")
-    # --all (+ --json) live on both the parent and the `list` subparser so both
-    # `eesel triggers --all` and `eesel triggers list --all` work.
-    sp.add_argument("--all", action="store_true", help="List every trigger across all agents (scheduled grouped on top), not just scheduled")
-    sp.add_argument("--json", action="store_true", help="With --all: emit the raw trigger payload")
+    # `eesel triggers` covers event/webhook triggers only. Scheduled jobs (cron)
+    # have their own command group below: `eesel schedules`.
+    sp = sub.add_parser("triggers", help="List, add, or remove event/webhook triggers")
+    sp.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
     t_sub = sp.add_subparsers(dest="triggers_cmd")
-    t_ls = t_sub.add_parser("list", help="List scheduled triggers (use --all for every trigger)")
-    t_ls.add_argument("--all", action="store_true", help="List every trigger across all agents, not just scheduled")
-    t_ls.add_argument("--json", action="store_true", help="With --all: emit the raw trigger payload")
+    t_ls = t_sub.add_parser("list", help="List event/webhook triggers, grouped by integration")
+    t_ls.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
 
-    t_reg = t_sub.add_parser("registry", help="List the available trigger types (keys for `create`)")
+    t_reg = t_sub.add_parser("registry", help="List the available trigger types (keys for `add`)")
     t_reg.add_argument("--json", action="store_true", help="Emit the raw registry payload")
 
-    t_create = t_sub.add_parser("create", help="Create a trigger on an agent")
-    t_create.add_argument("agent", help="Agent id, id-prefix, or name to attach the trigger to")
-    t_create.add_argument("--key", required=True, help="Trigger key from `eesel triggers registry` (e.g. 'eesel_scheduled')")
-    t_create.add_argument("--config", help="Trigger config as a JSON object (e.g. '{\"cron\": \"0 9 * * *\"}')")
+    t_add = t_sub.add_parser("add", help="Add a trigger to an agent")
+    t_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the trigger to")
+    t_add.add_argument("--key", required=True, help="Trigger key from `eesel triggers registry` (e.g. 'zendesk_ticket_created')")
+    t_add.add_argument("--config", help="Trigger config as a JSON object")
 
-    t_del = t_sub.add_parser("delete", help="Delete a trigger by id")
-    t_del.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
-    t_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    t_rm = t_sub.add_parser("remove", help="Remove a trigger by id")
+    t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
+    t_rm.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
 
-    t_run = t_sub.add_parser("run", help="Manually run a scheduled trigger")
-    t_run.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
+    # Hidden backward-compat aliases. `create`→`add` and `delete`→`remove` are
+    # the old REST-derived verbs. `fire`/`run` used to live here but firing is a
+    # scheduled-job operation; they forward to `eesel schedules fire`. Kept so
+    # existing scripts keep working. `help=SUPPRESS` only blanks the
+    # description — the name still shows in the choices list — so we also drop
+    # the pseudo-actions to hide them fully.
+    t_create = t_sub.add_parser("create", help=argparse.SUPPRESS)
+    t_create.add_argument("agent")
+    t_create.add_argument("--key", required=True)
+    t_create.add_argument("--config")
 
-    # `fire` is the old verb for `run`; kept as a hidden alias so existing
-    # scripts still work. `help=SUPPRESS` only blanks the description — the name
-    # still shows in the choices list as `fire ==SUPPRESS==` — so we also drop
-    # the pseudo-action to hide it fully, the same idiom `impersonate` uses.
-    fire = t_sub.add_parser("fire", help=argparse.SUPPRESS)
-    fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
-    t_sub._choices_actions = [a for a in t_sub._choices_actions if a.dest != "fire"]
+    t_del = t_sub.add_parser("delete", help=argparse.SUPPRESS)
+    t_del.add_argument("trigger_id")
+    t_del.add_argument("-y", "--yes", action="store_true")
+
+    for _alias in ("fire", "run"):
+        _p = t_sub.add_parser(_alias, help=argparse.SUPPRESS)
+        _p.add_argument("trigger_id")
+
+    _hidden_trigger_aliases = {"create", "delete", "fire", "run"}
+    t_sub._choices_actions = [a for a in t_sub._choices_actions if a.dest not in _hidden_trigger_aliases]
     sp.set_defaults(func=cmd_triggers)
+
+    # `eesel schedules` — scheduled jobs (cron-driven agent runs). Split out from
+    # `eesel triggers` because they carry a cron and can be fired manually.
+    sp = sub.add_parser("schedules", help="List, add, remove, or fire scheduled jobs")
+    sp.add_argument("--json", action="store_true", help="Emit the raw scheduled-job payload")
+    sc_sub = sp.add_subparsers(dest="schedules_cmd")
+    sc_ls = sc_sub.add_parser("list", help="List scheduled jobs")
+    sc_ls.add_argument("--json", action="store_true", help="Emit the raw scheduled-job payload")
+
+    sc_add = sc_sub.add_parser("add", help="Add a scheduled job to an agent")
+    sc_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the job to")
+    sc_add.add_argument("--cron", required=True, help="Cron expression for the schedule (e.g. '0 9 * * *')")
+    sc_add.add_argument("--title", help="Human-readable name for the job")
+    sc_add.add_argument("--timezone", help="IANA timezone for the cron (e.g. 'Europe/London'; default UTC)")
+    sc_add.add_argument("--config", help="Extra job config as a JSON object (merged under the flags above)")
+
+    sc_rm = sc_sub.add_parser("remove", help="Remove a scheduled job by id")
+    sc_rm.add_argument("job", help="The job's id (first column of `eesel schedules list`)")
+    sc_rm.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+
+    sc_fire = sc_sub.add_parser("fire", help="Manually fire a scheduled job once")
+    sc_fire.add_argument("job", help="Full id, id prefix, or substring of the job title (e.g. 'heartbeat')")
+
+    # `delete`/`run` hidden aliases for `remove`/`fire`.
+    sc_delete = sc_sub.add_parser("delete", help=argparse.SUPPRESS)
+    sc_delete.add_argument("job")
+    sc_delete.add_argument("-y", "--yes", action="store_true")
+
+    sc_run = sc_sub.add_parser("run", help=argparse.SUPPRESS)
+    sc_run.add_argument("job")
+
+    _hidden_schedule_aliases = {"delete", "run"}
+    sc_sub._choices_actions = [a for a in sc_sub._choices_actions if a.dest not in _hidden_schedule_aliases]
+    sp.set_defaults(func=cmd_schedules)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
