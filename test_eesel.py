@@ -2022,7 +2022,7 @@ class TestTriggersAll:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# workspaces — operate on the active workspace (creds["workspace_id"])
+# workspace — operate on the active workspace (creds["workspace_id"])
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2043,7 +2043,7 @@ def _record_requests(monkeypatch, responses):
     return calls
 
 
-class TestWorkspacesGet:
+class TestWorkspaceShow:
     WS = {
         "workspaceId": "ws-test-123",
         "workspaceName": "Acme",
@@ -2056,9 +2056,9 @@ class TestWorkspacesGet:
         "namespaces": ["ns-1", "ns-2"],
     }
 
-    def test_get_calls_workspace_endpoint_and_prints_fields(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_show_calls_workspace_endpoint_and_prints_fields(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _record_requests(monkeypatch, {("GET", "/workspaces/ws-test-123"): self.WS})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="get", json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="show", json=False))
         assert rc == 0
         assert calls[0]["method"] == "GET"
         assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123"
@@ -2068,21 +2068,21 @@ class TestWorkspacesGet:
         # The large structural field is omitted from the default view.
         assert "namespaces" not in out
 
-    def test_get_is_the_default_subcommand(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_show_is_the_default_subcommand(self, tmp_config, fake_creds, monkeypatch, capsys):
         _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd=None, json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd=None, json=False))
         assert rc == 0
         assert "Acme" in capsys.readouterr().out
 
-    def test_get_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_show_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
         _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="get", json=True))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="show", json=True))
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == self.WS
 
 
-class TestWorkspacesEdit:
-    def test_edit_puts_workspace_name_then_reads_back(self, tmp_config, fake_creds, monkeypatch, capsys):
+class TestWorkspaceSetName:
+    def test_set_name_puts_workspace_name_then_reads_back(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _record_requests(
             monkeypatch,
             {
@@ -2090,7 +2090,7 @@ class TestWorkspacesEdit:
                 ("GET", "/workspaces/ws-test-123"): {"workspaceName": "Renamed"},
             },
         )
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="edit", name="Renamed", json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="name", value="Renamed"))
         assert rc == 0
         # First call is the PUT with the workspaceName body; the field name must
         # match the server's WorkspaceUpdate schema exactly.
@@ -2101,15 +2101,35 @@ class TestWorkspacesEdit:
         assert calls[1]["method"] == "GET"
         assert "Renamed" in capsys.readouterr().err  # ok() writes to stderr
 
-    def test_edit_without_name_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+
+class TestWorkspaceSetBillingLimit:
+    def test_set_billing_limit_posts_value_to_singular_path(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("POST", "/workspace/billing-limit"): {"status": "success"}})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="250"))
+        assert rc == 0
+        # Path is the SINGULAR /workspace/billing-limit; body field is `value`,
+        # and the string positional is coerced to an int.
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == "http://localhost:8080/workspace/billing-limit"
+        assert calls[0]["body"] == {"value": 250}
+        assert "250" in capsys.readouterr().err
+
+    def test_set_billing_limit_rejects_non_integer_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _record_requests(monkeypatch, {})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="edit", name=None, json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="lots"))
         assert rc == 1
         assert calls == []
-        assert "--name" in capsys.readouterr().err
+        assert "non-negative integer" in capsys.readouterr().err
+
+    def test_set_billing_limit_rejects_negative_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="-5"))
+        assert rc == 1
+        assert calls == []
+        assert "non-negative integer" in capsys.readouterr().err
 
 
-class TestWorkspacesMembers:
+class TestWorkspaceMembers:
     MEMBERS = [
         {"user_id": "auth0|owner", "email": "owner@acme.com", "role": "editor", "status": "accepted"},
         {"user_id": "auth0|m2", "email": "viewer@acme.com", "role": "viewer", "status": "accepted"},
@@ -2118,7 +2138,7 @@ class TestWorkspacesMembers:
 
     def test_members_lists_email_and_role(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _record_requests(monkeypatch, {("GET", "/members"): {"members": self.MEMBERS}})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
         assert rc == 0
         assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123/members"
         out = capsys.readouterr().out
@@ -2129,36 +2149,24 @@ class TestWorkspacesMembers:
 
     def test_members_accepts_bare_list_response(self, tmp_config, fake_creds, monkeypatch, capsys):
         _record_requests(monkeypatch, {("GET", "/members"): self.MEMBERS})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
         assert rc == 0
         assert "owner@acme.com" in capsys.readouterr().out
 
     def test_members_empty_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
         _record_requests(monkeypatch, {("GET", "/members"): {"members": []}})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="members", json=False))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
         assert rc == 0
         assert "no members" in capsys.readouterr().err
 
 
-class TestWorkspacesBillingLimit:
-    def test_billing_limit_posts_value_to_singular_path(self, tmp_config, fake_creds, monkeypatch, capsys):
-        calls = _record_requests(monkeypatch, {("POST", "/workspace/billing-limit"): {"status": "success"}})
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="billing-limit", amount=250))
-        assert rc == 0
-        # Path is the SINGULAR /workspace/billing-limit; body field is `value`.
-        assert calls[0]["method"] == "POST"
-        assert calls[0]["url"] == "http://localhost:8080/workspace/billing-limit"
-        assert calls[0]["body"] == {"value": 250}
-        assert "250" in capsys.readouterr().err
-
-
-class TestWorkspacesExtendTrial:
+class TestWorkspaceExtendTrial:
     def test_extend_trial_posts_and_prints_message(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _record_requests(
             monkeypatch,
             {("POST", "/subscription/extend-trial"): {"success": True, "message": "Trial extended successfully"}},
         )
-        rc = eesel.cmd_workspaces(_args(workspaces_cmd="extend-trial"))
+        rc = eesel.cmd_workspace(_args(workspace_cmd="extend-trial"))
         assert rc == 0
         assert calls[0]["method"] == "POST"
         assert calls[0]["url"] == "http://localhost:8080/subscription/extend-trial"
@@ -2166,25 +2174,34 @@ class TestWorkspacesExtendTrial:
         assert "Trial extended successfully" in capsys.readouterr().err
 
 
-class TestWorkspacesParser:
+class TestWorkspaceParser:
     def _parse(self, *argv):
         return eesel.build_parser(staff=False).parse_args(list(argv))
 
-    def test_registered_with_get_default(self):
-        args = self._parse("workspaces")
-        assert args.func is eesel.cmd_workspaces
-        assert args.workspaces_cmd is None  # cmd_workspaces defaults to "get"
+    def test_registered_with_show_default(self):
+        args = self._parse("workspace")
+        assert args.func is eesel.cmd_workspace
+        assert args.workspace_cmd is None  # cmd_workspace defaults to "show"
 
-    def test_edit_takes_name_flag(self):
-        args = self._parse("workspaces", "edit", "--name", "New Name")
-        assert args.workspaces_cmd == "edit"
-        assert args.name == "New Name"
+    def test_set_name_takes_field_and_value_positionals(self):
+        args = self._parse("workspace", "set", "name", "New Name")
+        assert args.workspace_cmd == "set"
+        assert args.field == "name"
+        assert args.value == "New Name"
 
-    def test_billing_limit_amount_is_int(self):
-        args = self._parse("workspaces", "billing-limit", "300")
-        assert args.workspaces_cmd == "billing-limit"
-        assert args.amount == 300 and isinstance(args.amount, int)
+    def test_set_billing_limit_keeps_value_as_string(self):
+        # The value positional is parsed as a string for every field; the
+        # billing-limit handler coerces and validates the integer itself.
+        args = self._parse("workspace", "set", "billing-limit", "300")
+        assert args.workspace_cmd == "set"
+        assert args.field == "billing-limit"
+        assert args.value == "300"
+
+    def test_set_rejects_unknown_field(self):
+        # `field` is constrained by choices, so an unknown field is a parse error.
+        with pytest.raises(SystemExit):
+            self._parse("workspace", "set", "color", "blue")
 
     def test_members_and_extend_trial_register(self):
-        assert self._parse("workspaces", "members").workspaces_cmd == "members"
-        assert self._parse("workspaces", "extend-trial").workspaces_cmd == "extend-trial"
+        assert self._parse("workspace", "members").workspace_cmd == "members"
+        assert self._parse("workspace", "extend-trial").workspace_cmd == "extend-trial"

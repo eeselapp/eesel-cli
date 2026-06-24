@@ -2405,7 +2405,7 @@ def cmd_document_export(args) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Workspaces — the active workspace from stored creds (no id arg)
+# Workspace — the active workspace from stored creds (no id arg)
 #
 # Every command here operates on creds["workspace_id"], the workspace the
 # current login belongs to. Backed by the Bearer-authed workspace endpoints:
@@ -2416,6 +2416,11 @@ def cmd_document_export(args) -> int:
 #   POST /subscription/extend-trial       extend the free-trial window
 # Writes and billing require the Auth0 login (a workspace-token login 401s on
 # these server-side); reads work with either.
+#
+# Command naming follows the CLI's stable verb set: `show` reads the object
+# (the `cat` verb), `set <field> <value>` writes a single field (the workspace
+# name or the billing limit), `members` lists the members directory, and
+# `extend-trial` is a one-off server action with no field to set.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2435,11 +2440,11 @@ def fetch_workspace_members(creds: dict) -> list[dict]:
     return data.get("members") or data.get("items") or []
 
 
-def cmd_workspaces(args) -> int:
+def cmd_workspace(args) -> int:
     creds = require_creds()
-    sub = getattr(args, "workspaces_cmd", None) or "get"
+    sub = getattr(args, "workspace_cmd", None) or "show"
 
-    if sub == "get":
+    if sub == "show":
         ws = fetch_workspace(creds)
         if getattr(args, "json", False):
             print(json.dumps(ws, indent=2))
@@ -2467,17 +2472,41 @@ def cmd_workspaces(args) -> int:
             print(f"{key:<22}: {value}")
         return 0
 
-    if sub == "edit":
-        if not args.name:
-            err("--name is required.")
-            return 1
-        url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}"
-        http_request("PUT", url, token=creds["token"], body={"workspaceName": args.name})
-        # The update endpoint returns only a status message, so read the
-        # workspace back to confirm and show the new name.
-        ws = fetch_workspace(creds)
-        ok(f"Workspace name: {ws.get('workspaceName')}")
-        return 0
+    if sub == "set":
+        field = args.field
+        if field == "name":
+            url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}"
+            http_request("PUT", url, token=creds["token"], body={"workspaceName": args.value})
+            # The update endpoint returns only a status message, so read the
+            # workspace back to confirm and show the new name.
+            ws = fetch_workspace(creds)
+            ok(f"Workspace name: {ws.get('workspaceName')}")
+            return 0
+
+        if field == "billing-limit":
+            # The value arrives as a string (one positional for every field);
+            # the billing endpoint needs a non-negative integer amount.
+            try:
+                amount = int(args.value)
+            except ValueError:
+                err("billing-limit must be a non-negative integer.")
+                return 1
+            if amount < 0:
+                err("billing-limit must be a non-negative integer.")
+                return 1
+            # The server stores the cap under the `value` field and returns
+            # {"status": "success"} with no echo.
+            http_request(
+                "POST",
+                f"{creds['api_url']}/workspace/billing-limit",
+                token=creds["token"],
+                body={"value": amount},
+            )
+            ok(f"Billing limit set to {amount}.")
+            return 0
+
+        err(f"Unknown workspace field '{field}'.")
+        return 1
 
     if sub == "members":
         members = fetch_workspace_members(creds)
@@ -2493,18 +2522,6 @@ def cmd_workspaces(args) -> int:
             status = m.get("status")
             suffix = f"  [{status}]" if status and status != "accepted" else ""
             print(f"{email:<40}  {role}{suffix}")
-        return 0
-
-    if sub == "billing-limit":
-        # The server stores the cap under the `value` field and accepts a
-        # numeric amount; it returns {"status": "success"} with no echo.
-        http_request(
-            "POST",
-            f"{creds['api_url']}/workspace/billing-limit",
-            token=creds["token"],
-            body={"value": args.amount},
-        )
-        ok(f"Billing limit set to {args.amount}.")
         return 0
 
     if sub == "extend-trial":
@@ -2660,20 +2677,19 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
     sp.set_defaults(func=cmd_triggers)
 
-    # All workspaces commands act on the active workspace (creds["workspace_id"]);
+    # All workspace commands act on the active workspace (creds["workspace_id"]);
     # there is no id argument.
-    sp = sub.add_parser("workspaces", help="View or manage the active workspace")
-    w_sub = sp.add_subparsers(dest="workspaces_cmd")
-    w_get = w_sub.add_parser("get", help="Show the active workspace (name, owner, trial, etc.)")
-    w_get.add_argument("--json", action="store_true", help="Emit the raw workspace payload")
-    w_edit = w_sub.add_parser("edit", help="Rename the active workspace")
-    w_edit.add_argument("--name", help="New workspace name (required)")
+    sp = sub.add_parser("workspace", help="View or manage the active workspace")
+    w_sub = sp.add_subparsers(dest="workspace_cmd")
+    w_show = w_sub.add_parser("show", help="Show the active workspace (name, owner, trial, etc.)")
+    w_show.add_argument("--json", action="store_true", help="Emit the raw workspace payload")
+    w_set = w_sub.add_parser("set", help="Set a workspace field (name or billing-limit)")
+    w_set.add_argument("field", choices=["name", "billing-limit"], help="The field to set")
+    w_set.add_argument("value", help="The new value (a name string, or a non-negative integer for billing-limit)")
     w_members = w_sub.add_parser("members", help="List the workspace's members (email + role)")
     w_members.add_argument("--json", action="store_true", help="Emit the raw members payload")
-    w_limit = w_sub.add_parser("billing-limit", help="Set the workspace's monthly spend cap")
-    w_limit.add_argument("amount", type=int, help="The spend cap amount (non-negative integer)")
     w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
-    sp.set_defaults(func=cmd_workspaces)
+    sp.set_defaults(func=cmd_workspace)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
