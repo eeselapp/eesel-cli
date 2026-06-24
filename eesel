@@ -2516,32 +2516,127 @@ def _print_billing_mode(data: dict) -> None:
     print(f"successful charges : {data.get('successfulCharges')}")
 
 
-# Each billing subcommand maps to one /subscription/* GET and a printer for its
-# response. `usage` is the default when no subcommand is given.
-_BILLING_ROUTES = {
-    "license": ("/subscription/license", _print_billing_license),
-    "usage": ("/subscription/usage", _print_billing_usage),
-    "invoices": ("/subscription/invoices", _print_billing_invoices),
-    "spend": ("/subscription/spend-history", _print_billing_spend),
-    "mode": ("/subscription/billing-mode", _print_billing_mode),
+def _print_billing_license_plain(data: dict) -> None:
+    """Tab-separated key/value lines for `billing show license --plain`."""
+    pricing = data.get("pricing") or {}
+    rows = [
+        ("active", data.get("isActive")),
+        ("plan", data.get("planName")),
+        ("status", data.get("subscriptionStatus")),
+        ("source", data.get("subscriptionSource")),
+        ("payment_amount", data.get("paymentAmount")),
+        ("payment_interval", data.get("paymentInterval")),
+        ("billing_email", data.get("billingEmail")),
+        ("billing_limit", data.get("billingLimit")),
+        ("billing_period_start", data.get("billingPeriodStart")),
+        ("billing_period_end", data.get("billingPeriodEnd")),
+        ("trial_end", data.get("trialEnd")),
+        ("features", ",".join(str(f) for f in (data.get("features") or []))),
+        ("light_task_dollars", pricing.get("lightTaskDollars")),
+        ("regular_task_dollars", pricing.get("regularTaskDollars")),
+        ("heavy_task_dollars", pricing.get("heavyTaskDollars")),
+    ]
+    for key, value in rows:
+        print(f"{key}\t{'' if value is None else value}")
+
+
+def _print_billing_usage_plain(data: dict) -> None:
+    """Tab-separated key/value lines for `billing show usage --plain`."""
+    rows = [
+        ("interactions_used", data.get("numMessages")),
+        ("interactions_max", data.get("maxMessages")),
+        ("namespaces_used", data.get("numNamespaces")),
+        ("namespaces_max", data.get("maxNamespaces")),
+        ("learning_jobs_used", data.get("numLearningJobs")),
+        ("learning_jobs_max", data.get("maxLearningJobs")),
+        ("cost_consumed", data.get("costConsumed")),
+        ("light_tasks", data.get("numLightTasks", 0)),
+        ("regular_tasks", data.get("numRegularTasks", 0)),
+        ("heavy_tasks", data.get("numHeavyTasks", 0)),
+        ("limit_reached", data.get("limitReached")),
+    ]
+    for key, value in rows:
+        print(f"{key}\t{'' if value is None else value}")
+
+
+def _print_billing_mode_plain(data: dict) -> None:
+    """Tab-separated key/value lines for `billing show mode --plain`."""
+    rows = [
+        ("mode", data.get("mode")),
+        ("eligible", data.get("eligible")),
+        ("can_switch_to_monthly", data.get("canSwitchToMonthly")),
+        ("successful_charges", data.get("successfulCharges")),
+    ]
+    for key, value in rows:
+        print(f"{key}\t{'' if value is None else value}")
+
+
+def _print_billing_invoices_plain(invoices: list) -> None:
+    """Tab-separated columns (no header) for `billing list invoices --plain`."""
+    for inv in invoices:
+        number = inv.get("number") or inv.get("id") or ""
+        created = inv.get("created") or ""
+        amount = inv.get("amountPaid")
+        status = inv.get("status") or ""
+        pdf = inv.get("invoicePdf") or inv.get("hostedInvoiceUrl") or ""
+        print(f"{number}\t{created}\t{'' if amount is None else amount}\t{status}\t{pdf}")
+
+
+def _print_billing_spend_plain(series: list) -> None:
+    """Tab-separated columns (no header) for `billing list spend --plain`."""
+    for day in series:
+        amount = day.get("amount")
+        print(f"{day.get('date') or ''}\t{'' if amount is None else amount}")
+
+
+# Single-item detail views — one `/subscription/*` GET each, rendered as a
+# key/value summary. These are `eesel billing show <topic>`.
+_BILLING_SHOW = {
+    "usage": ("/subscription/usage", _print_billing_usage, _print_billing_usage_plain),
+    "license": ("/subscription/license", _print_billing_license, _print_billing_license_plain),
+    "mode": ("/subscription/billing-mode", _print_billing_mode, _print_billing_mode_plain),
+}
+
+# Multi-row views with a column per field — these are `eesel billing list <kind>`.
+_BILLING_LIST = {
+    "invoices": ("/subscription/invoices", _print_billing_invoices, _print_billing_invoices_plain),
+    "spend": ("/subscription/spend-history", _print_billing_spend, _print_billing_spend_plain),
 }
 
 
 def cmd_billing(args) -> int:
     """Read-only views over the workspace's subscription.
 
-    `eesel billing` defaults to `usage`. Each subcommand prints a readable
-    summary; pass `--json` for the raw server payload.
+    `eesel billing show <usage|license|mode>` prints one summary;
+    `eesel billing list <invoices|spend>` prints rows with a column per field.
+    `eesel billing` with no subcommand shows usage. Pass `--json` for the raw
+    server payload or `--plain` for tab-separated, decoration-free output.
     """
     creds = require_creds()
-    sub = getattr(args, "billing_cmd", None) or "usage"
-    if sub not in _BILLING_ROUTES:
-        err(f"Unknown billing command: {sub}")
+    verb = getattr(args, "billing_cmd", None) or "show"
+
+    if verb == "show":
+        topic = getattr(args, "topic", None) or "usage"
+        if topic not in _BILLING_SHOW:
+            err(f"Unknown billing topic: {topic}. Try: {', '.join(_BILLING_SHOW)}")
+            return 1
+        path, printer, plain_printer = _BILLING_SHOW[topic]
+    elif verb == "list":
+        kind = getattr(args, "kind", None)
+        if kind not in _BILLING_LIST:
+            err(f"Unknown billing list: {kind}. Try: {', '.join(_BILLING_LIST)}")
+            return 1
+        path, printer, plain_printer = _BILLING_LIST[kind]
+    else:
+        err(f"Unknown billing command: {verb}. Try 'show' or 'list'.")
         return 1
-    path, printer = _BILLING_ROUTES[sub]
+
     data = http_request("GET", f"{creds['api_url']}{path}", token=creds["token"])
     if getattr(args, "json", False):
         print(json.dumps(data, indent=2))
+        return 0
+    if getattr(args, "plain", False):
+        plain_printer(data)
         return 0
     printer(data)
     return 0
@@ -2550,11 +2645,14 @@ def cmd_billing(args) -> int:
 # ──────────────────────────────────────────────────────────────────────────
 # Settings — per-agent notification configuration
 #
-# `eesel settings notifications get/set <agent>` reads and patches one agent's
-# notification settings via GET/PATCH /agents/{agent_id}/notification-settings.
-# The GET/response nests recipient lists under `email` / `slack`; the PATCH
-# request body is flat (`member_ids` / `channel_ids`). Only the fields passed
-# are sent, so a partial set never clears the others.
+# Notification settings are fields on one agent. The commands map onto the
+# canonical verb set:
+#   eesel settings notifications show <agent>            — read the fields
+#   eesel settings notifications enable|disable <agent>  — flip the `enabled` field
+#   eesel settings notifications set <agent> --channel … — set a value field
+# All three sit on GET/PATCH /agents/{agent_id}/notification-settings. PATCH
+# sends only the field being changed, so the server's unset-exclusion leaves the
+# others untouched.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2567,17 +2665,27 @@ def _print_notification_settings(data: dict) -> None:
     print(f"slack    : {', '.join(channel_ids) if channel_ids else '(no channels)'}")
 
 
+def _print_notification_settings_plain(data: dict) -> None:
+    """Tab-separated key/value lines for `--plain`."""
+    member_ids = (data.get("email") or {}).get("member_ids") or []
+    channel_ids = (data.get("slack") or {}).get("channel_ids") or []
+    print(f"enabled\t{'' if data.get('enabled') is None else data.get('enabled')}")
+    print(f"channel\t{data.get('channel') or ''}")
+    print(f"email\t{','.join(member_ids)}")
+    print(f"slack\t{','.join(channel_ids)}")
+
+
 def cmd_settings(args) -> int:
-    """`eesel settings notifications get/set <agent>` — read or change one
-    agent's notification configuration."""
+    """`eesel settings notifications show|enable|disable|set <agent>` — read or
+    change one agent's notification configuration."""
     creds = require_creds()
     if getattr(args, "settings_cmd", None) != "notifications":
-        err("Usage: eesel settings notifications get|set <agent>")
+        err("Usage: eesel settings notifications show|enable|disable|set <agent>")
         return 1
 
     action = getattr(args, "notifications_cmd", None)
-    if action not in ("get", "set"):
-        err("Usage: eesel settings notifications get|set <agent>")
+    if action not in ("show", "enable", "disable", "set"):
+        err("Usage: eesel settings notifications show|enable|disable|set <agent>")
         return 1
 
     agents = fetch_agents(creds)
@@ -2591,25 +2699,32 @@ def cmd_settings(args) -> int:
     agent_id = agent["agent_id"]
     url = f"{creds['api_url']}/agents/{agent_id}/notification-settings"
 
-    if action == "get":
+    if action == "show":
         data = http_request("GET", url, token=creds["token"])
         if getattr(args, "json", False):
             print(json.dumps(data, indent=2))
+            return 0
+        if getattr(args, "plain", False):
+            _print_notification_settings_plain(data)
             return 0
         info(f"# {agent.get('name', '?')} ({agent_id[:12]}) — notification settings")
         _print_notification_settings(data)
         return 0
 
-    # action == "set": PATCH only the fields the user actually passed, so the
-    # server's unset-exclusion leaves everything else untouched.
-    body: dict = {}
-    if args.enabled is not None:
-        body["enabled"] = args.enabled
-    if args.channel is not None:
-        body["channel"] = args.channel
-    if not body:
-        err("Nothing to set. Pass --enabled true|false and/or --channel CHANNEL.")
-        return 1
+    # enable/disable/set all PATCH only the field they own, so the server's
+    # unset-exclusion leaves everything else untouched.
+    if action == "enable":
+        body = {"enabled": True}
+    elif action == "disable":
+        body = {"enabled": False}
+    else:  # action == "set"
+        body = {}
+        if args.channel is not None:
+            body["channel"] = args.channel
+        if not body:
+            err("Nothing to set. Pass --channel dashboard|email|slack.")
+            return 1
+
     data = http_request("PATCH", url, token=creds["token"], body=body)
     ok(f"Updated notification settings for {agent.get('name')} ({agent_id[:12]}): {', '.join(body.keys())}")
     if getattr(args, "json", False):
@@ -2617,17 +2732,6 @@ def cmd_settings(args) -> int:
         return 0
     _print_notification_settings(data)
     return 0
-
-
-def _parse_bool_flag(value: str) -> bool:
-    """Parse a true/false CLI argument. Accepts common spellings so
-    `--enabled true`, `--enabled 1`, `--enabled yes`, `--enabled off` all work."""
-    lowered = value.strip().lower()
-    if lowered in ("true", "t", "yes", "y", "1", "on"):
-        return True
-    if lowered in ("false", "f", "no", "n", "0", "off"):
-        return False
-    raise argparse.ArgumentTypeError(f"expected true/false, got '{value}'")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2772,26 +2876,34 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("billing", help="View the workspace's subscription (read-only)")
     b_sub = sp.add_subparsers(dest="billing_cmd")
-    b_sub.add_parser("usage", help="Interactions, namespaces, cost consumed, task counts (default)")
-    b_sub.add_parser("license", help="Plan, status, billing period, features, task pricing")
-    b_sub.add_parser("invoices", help="Recent invoices (number, amount, status, PDF link)")
-    b_sub.add_parser("spend", help="Daily spend for the current billing period")
-    b_sub.add_parser("mode", help="Billing mode (threshold vs monthly) and switch eligibility")
-    # --json lives on the parent so it applies whatever subcommand runs, including
-    # the default `usage`.
-    sp.add_argument("--json", action="store_true", help="Emit the raw subscription payload")
-    sp.set_defaults(func=cmd_billing, billing_cmd="usage")
+    # `show <topic>` is one summary; `list <kind>` is rows with a column per field.
+    b_show = b_sub.add_parser("show", help="Show one subscription summary (usage|license|mode)")
+    b_show.add_argument("topic", nargs="?", default="usage", choices=["usage", "license", "mode"],
+                        help="usage (default), license, or mode")
+    b_show.add_argument("--json", action="store_true", help="Emit the raw subscription payload")
+    b_show.add_argument("--plain", action="store_true", help="Tab-separated key/value output for scripts")
+    b_list = b_sub.add_parser("list", help="List subscription rows (invoices|spend)")
+    b_list.add_argument("kind", choices=["invoices", "spend"],
+                        help="invoices (number, amount, status, PDF) or spend (daily spend this period)")
+    b_list.add_argument("--json", action="store_true", help="Emit the raw subscription payload")
+    b_list.add_argument("--plain", action="store_true", help="Tab-separated columns for scripts")
+    # `eesel billing` with no subcommand defaults to `show usage`.
+    sp.set_defaults(func=cmd_billing, billing_cmd="show", topic="usage", json=False, plain=False)
 
     sp = sub.add_parser("settings", help="Read or change agent settings")
     se_sub = sp.add_subparsers(dest="settings_cmd")
-    notif = se_sub.add_parser("notifications", help="Get or set an agent's notification settings")
+    notif = se_sub.add_parser("notifications", help="Show or change an agent's notification settings")
     n_sub = notif.add_subparsers(dest="notifications_cmd")
-    n_get = n_sub.add_parser("get", help="Print an agent's notification settings")
-    n_get.add_argument("agent", help="Agent id, id-prefix, or name")
-    n_get.add_argument("--json", action="store_true", help="Emit the raw settings payload")
-    n_set = n_sub.add_parser("set", help="Change an agent's notification settings (only the flags you pass)")
+    n_show = n_sub.add_parser("show", help="Print an agent's notification settings")
+    n_show.add_argument("agent", help="Agent id, id-prefix, or name")
+    n_show.add_argument("--json", action="store_true", help="Emit the raw settings payload")
+    n_show.add_argument("--plain", action="store_true", help="Tab-separated key/value output for scripts")
+    n_enable = n_sub.add_parser("enable", help="Turn an agent's notifications on")
+    n_enable.add_argument("agent", help="Agent id, id-prefix, or name")
+    n_disable = n_sub.add_parser("disable", help="Turn an agent's notifications off")
+    n_disable.add_argument("agent", help="Agent id, id-prefix, or name")
+    n_set = n_sub.add_parser("set", help="Set a notification value field (e.g. the delivery channel)")
     n_set.add_argument("agent", help="Agent id, id-prefix, or name")
-    n_set.add_argument("--enabled", type=_parse_bool_flag, default=None, metavar="true|false", help="Turn notifications on or off")
     n_set.add_argument("--channel", default=None, choices=["dashboard", "email", "slack"], help="Where notifications are delivered")
     n_set.add_argument("--json", action="store_true", help="Emit the raw settings readback")
     sp.set_defaults(func=cmd_settings)
