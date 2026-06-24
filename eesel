@@ -19,9 +19,14 @@ API surface used:
   GET  /agents                       list agents in the workspace (each row
                                        already includes the agent's `prompt`,
                                        which `eesel instructions` prints)
+  GET  /triggers/registry            list available trigger types/keys
+                                       (eesel triggers registry)
   GET  /agents/{id}/triggers         list triggers configured for one agent
                                        (`eesel triggers --all` groups them by
                                        integration; scheduled stay on top)
+  POST /agents/{id}/triggers         create a trigger on an agent
+                                       (eesel triggers create)
+  DELETE /triggers/{id}              delete a trigger (eesel triggers delete)
   GET  /agents/{id}/tools            list an agent's tools/actions (eesel tools)
   GET  /integrations                 list workspace integrations + connection
                                        status (eesel integrations)
@@ -29,7 +34,8 @@ API surface used:
                                        optional triggerId → preview a scheduled
                                        trigger's context in chat
   GET  /agents/chat/{id}/raw-stream  SSE stream of UI message chunks
-  POST /triggers/{id}/fire           manually enqueue a scheduled trigger
+  POST /triggers/{id}/fire           manually run a scheduled trigger
+                                       (eesel triggers run)
   POST /workspace/tasks              list/count workspace tasks (agent activity)
   GET  /workspace/tasks/{id}/history full transcript of one task, grouped by run
 """
@@ -118,6 +124,21 @@ def err(msg: str) -> None:
 
 def ok(msg: str) -> None:
     print(_color(f"✓ {msg}", "32"), file=sys.stderr)
+
+
+def confirm(prompt: str) -> bool:
+    """Ask a yes/no question on stderr and return True only on an explicit yes.
+
+    Anything other than "y" or "yes" (case-insensitive) — including an empty
+    line or EOF on a non-interactive stdin — counts as "no", so destructive
+    operations default to not happening.
+    """
+    print(_color(prompt, "33"), end="", file=sys.stderr, flush=True)
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1445,7 +1466,18 @@ def cmd_triggers(args) -> int:
             print(f" {tid}  {title:<28}  cron={cron} ({tz})  agent={t['agent_name']}")
         return 0
 
-    if sub == "fire":
+    if sub == "registry":
+        return _triggers_registry(creds, as_json=getattr(args, "json", False))
+
+    if sub == "create":
+        return _triggers_create(creds, args)
+
+    if sub == "delete":
+        return _triggers_delete(creds, args)
+
+    # `run` is the canonical verb; `fire` is kept as a hidden alias so older
+    # scripts that call `eesel triggers fire ...` keep working.
+    if sub in ("run", "fire"):
         match = resolve_scheduled_trigger(creds, args.trigger_id)
         if not match:
             err(f"No scheduled trigger matches '{args.trigger_id}'.")
@@ -1456,13 +1488,96 @@ def cmd_triggers(args) -> int:
         resp = http_request("POST", url, token=creds["token"], body={})
 
         title = (match.get("config") or {}).get("title") or "(untitled)"
-        ok(f"Fired '{title}' (trigger={match['id'][:12]}, agent={match['agent_name']}).")
+        ok(f"Ran '{title}' (trigger={match['id'][:12]}, agent={match['agent_name']}).")
         info(f"  scheduled_at: {resp.get('scheduled_at')}")
         info(f"  external_ref: {resp.get('external_reference')}")
         info("Tail the worker: docker logs slack-server-1 -f | grep scheduled_trigger")
         return 0
 
     return 1
+
+
+def _triggers_registry(creds: dict, *, as_json: bool = False) -> int:
+    """`eesel triggers registry`: list the available trigger types.
+
+    Calls GET /triggers/registry and prints each trigger's key, integration and
+    description. The `trigger_id` field in the registry is the value to pass as
+    `--key` when creating a trigger with `eesel triggers create`.
+    """
+    data = http_request("GET", f"{creds['api_url']}/triggers/registry", token=creds["token"])
+    triggers = data.get("triggers") if isinstance(data, dict) else data
+    triggers = triggers or []
+    if as_json:
+        print(json.dumps(triggers, indent=2))
+        return 0
+    if not triggers:
+        info("(no trigger types in the registry)")
+        return 0
+
+    info(f"# {len(triggers)} trigger type{'s' if len(triggers) != 1 else ''} — use the key with `eesel triggers create <agent> --key <key>`")
+    fmt = " {:<34}  {:<14}  {}"
+    info(fmt.format("key", "integration", "name"))
+    for t in sorted(triggers, key=lambda r: (r.get("integration_key") or "", r.get("trigger_id") or "")):
+        key = t.get("trigger_id") or "?"
+        integration = t.get("integration_key") or "—"
+        name = t.get("name") or t.get("description") or ""
+        print(fmt.format(key[:34], integration[:14], name))
+    return 0
+
+
+def _triggers_create(creds: dict, args) -> int:
+    """`eesel triggers create <agent> --key <key> [--config '<JSON>']`.
+
+    POSTs to /agents/{agent_id}/triggers with {"trigger_key", "config"}. The
+    server requires a non-null config, so an omitted --config is sent as an
+    empty object. --config must be a JSON object.
+    """
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one with `eesel agents create` first.")
+        return 1
+    agent = resolve_agent(agents, args.agent)
+    if not agent:
+        err(f"No agent matches '{args.agent}'.")
+        info("Run `eesel agents list` to see available agents.")
+        return 1
+
+    config: dict = {}
+    if getattr(args, "config", None):
+        try:
+            config = json.loads(args.config)
+        except json.JSONDecodeError as e:
+            err(f"--config is not valid JSON: {e}")
+            return 1
+        if not isinstance(config, dict):
+            err("--config must be a JSON object (e.g. '{\"cron\": \"0 9 * * *\"}').")
+            return 1
+
+    url = f"{creds['api_url']}/agents/{agent['agent_id']}/triggers"
+    resp = http_request("POST", url, token=creds["token"], body={"trigger_key": args.key, "config": config})
+
+    trigger = resp.get("trigger") if isinstance(resp, dict) else None
+    trigger_id = (trigger or {}).get("id") or (resp.get("id") if isinstance(resp, dict) else None)
+    ok(f"Created trigger '{args.key}' on {agent.get('name', agent['agent_id'])} (id={trigger_id}).")
+    info("Run `eesel triggers list` (or `--all`) to confirm.")
+    return 0
+
+
+def _triggers_delete(creds: dict, args) -> int:
+    """`eesel triggers delete <id> [-y]`: DELETE /triggers/{id}.
+
+    Prompts for confirmation unless --yes/-y is passed. The id is the trigger's
+    own id (the first column of `eesel triggers list`), not the trigger key.
+    """
+    trigger_id = args.trigger_id
+    if not getattr(args, "yes", False):
+        if not confirm(f"Delete trigger {trigger_id}? This cannot be undone. [y/N] "):
+            info("Cancelled.")
+            return 1
+
+    http_request("DELETE", f"{creds['api_url']}/triggers/{trigger_id}", token=creds["token"])
+    ok(f"Deleted trigger {trigger_id}.")
+    return 0
 
 
 def _triggers_list_all(creds: dict, *, as_json: bool = False) -> int:
@@ -2531,7 +2646,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp.set_defaults(func=cmd_tools)
 
-    sp = sub.add_parser("triggers", help="List or fire triggers")
+    sp = sub.add_parser("triggers", help="List, run, create, or delete triggers")
     # --all (+ --json) live on both the parent and the `list` subparser so both
     # `eesel triggers --all` and `eesel triggers list --all` work.
     sp.add_argument("--all", action="store_true", help="List every trigger across all agents (scheduled grouped on top), not just scheduled")
@@ -2540,8 +2655,29 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     t_ls = t_sub.add_parser("list", help="List scheduled triggers (use --all for every trigger)")
     t_ls.add_argument("--all", action="store_true", help="List every trigger across all agents, not just scheduled")
     t_ls.add_argument("--json", action="store_true", help="With --all: emit the raw trigger payload")
-    fire = t_sub.add_parser("fire", help="Manually fire a scheduled trigger")
+
+    t_reg = t_sub.add_parser("registry", help="List the available trigger types (keys for `create`)")
+    t_reg.add_argument("--json", action="store_true", help="Emit the raw registry payload")
+
+    t_create = t_sub.add_parser("create", help="Create a trigger on an agent")
+    t_create.add_argument("agent", help="Agent id, id-prefix, or name to attach the trigger to")
+    t_create.add_argument("--key", required=True, help="Trigger key from `eesel triggers registry` (e.g. 'eesel_scheduled')")
+    t_create.add_argument("--config", help="Trigger config as a JSON object (e.g. '{\"cron\": \"0 9 * * *\"}')")
+
+    t_del = t_sub.add_parser("delete", help="Delete a trigger by id")
+    t_del.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
+    t_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+
+    t_run = t_sub.add_parser("run", help="Manually run a scheduled trigger")
+    t_run.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
+
+    # `fire` is the old verb for `run`; kept as a hidden alias so existing
+    # scripts still work. `help=SUPPRESS` only blanks the description — the name
+    # still shows in the choices list as `fire ==SUPPRESS==` — so we also drop
+    # the pseudo-action to hide it fully, the same idiom `impersonate` uses.
+    fire = t_sub.add_parser("fire", help=argparse.SUPPRESS)
     fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
+    t_sub._choices_actions = [a for a in t_sub._choices_actions if a.dest != "fire"]
     sp.set_defaults(func=cmd_triggers)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
