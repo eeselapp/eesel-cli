@@ -1053,6 +1053,206 @@ class TestHttpFetch:
         assert out.read_bytes() == b"DATA"
 
 
+class TestDocumentsCreate:
+    def _args(self, **over):
+        base = {"document_cmd": "create", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
+        base.update(over)
+        return type("Args", (), base)()
+
+    def test_posts_title_content_source_type_and_agent_then_prints_key(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"id": "doc-99", "key": "files/agent-test-456/my-doc.md", "name": "My Doc"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._args(content="hello world"))
+        assert rc == 0
+        assert calls == [
+            (
+                "POST",
+                "http://localhost:8080/documents",
+                {"title": "My Doc", "content": "hello world", "source_type": "files", "agent_id": "agent-test-456"},
+            )
+        ]
+        # The key is printed to stdout so it can be captured by a script.
+        assert capsys.readouterr().out.strip() == "files/agent-test-456/my-doc.md"
+
+    def test_reads_content_from_file(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured.update(body or {})
+            return {"key": "files/agent-test-456/from-file.md"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        content_file = tmp_path / "body.md"
+        content_file.write_text("# From a file\n")
+        rc = eesel.cmd_document(self._args(content_file=str(content_file)))
+        assert rc == 0
+        assert captured["content"] == "# From a file\n"
+
+    def test_falls_back_to_id_when_no_key(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"id": "doc-only-id"})
+        rc = eesel.cmd_document(self._args(content="x"))
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "doc-only-id"
+
+
+class TestDocumentsSearch:
+    def _args(self, query, limit=None):
+        return type("Args", (), {"document_cmd": "search", "query": query, "limit": limit})()
+
+    def test_posts_prefix_body_and_prints_matches(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return [
+                {"id": "doc-aaaaaaa1", "key": "files/agent-test-456/notes.md", "name": "notes.md"},
+                {"id": "doc-bbbbbbb2", "key": "files/agent-test-456/spec.md", "name": "spec.md"},
+            ]
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._args("files/agent-test-456", limit=5))
+        assert rc == 0
+        assert calls == [
+            ("POST", "http://localhost:8080/documents/search", {"prefix": "files/agent-test-456", "limit": 5})
+        ]
+        out = capsys.readouterr().out
+        assert "files/agent-test-456/notes.md" in out
+        assert "files/agent-test-456/spec.md" in out
+
+    def test_omits_limit_when_not_given(self, tmp_config, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured.update({"body": body})
+            return []
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        eesel.cmd_document(self._args("foo"))
+        assert captured["body"] == {"prefix": "foo"}
+
+    def test_handles_paginated_object_response(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"documents": [{"id": "doc-1", "key": "files/agent-test-456/x.md", "name": "x.md"}], "total": 1},
+        )
+        rc = eesel.cmd_document(self._args("files/", limit=10))
+        assert rc == 0
+        assert "files/agent-test-456/x.md" in capsys.readouterr().out
+
+    def test_empty_result_reports_no_matches(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [])
+        rc = eesel.cmd_document(self._args("nope"))
+        assert rc == 0
+        assert "no matching documents" in capsys.readouterr().err
+
+
+class TestDocumentsDelete:
+    def _args(self, keys, yes=False):
+        return type("Args", (), {"document_cmd": "delete", "keys": keys, "yes": yes})()
+
+    def test_deletes_with_keys_body_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"message": "Documents deleted successfully"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/a.md", "files/b.md"]))
+        assert rc == 0
+        assert calls == [
+            ("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md", "files/b.md"]})
+        ]
+
+    def test_yes_flag_skips_confirmation(self, tmp_config, fake_creds, monkeypatch):
+        calls = []
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, url, k.get("body"))) or {})
+
+        def boom(prompt):
+            raise AssertionError("confirm() must not be called when --yes is passed")
+
+        monkeypatch.setattr(eesel, "confirm", boom)
+        rc = eesel.cmd_document(self._args(["files/a.md"], yes=True))
+        assert rc == 0
+        assert calls == [("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md"]})]
+
+    def test_aborts_without_confirmation(self, tmp_config, fake_creds, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("must not call the API when the user declines")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        rc = eesel.cmd_document(self._args(["files/a.md"]))
+        assert rc == 1
+
+
+class TestDocumentsAcl:
+    AGENTS = [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+
+    def _get_args(self, agent):
+        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "get", "agent": agent})()
+
+    def _set_args(self, agent, prefixes):
+        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "set", "agent": agent, "prefix": prefixes})()
+
+    def test_get_prints_key_prefixes(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"key_prefixes": ["files/agent-test-456", "outputs/skills/agent-test-456"]}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._get_args("Support Bot"))
+        assert rc == 0
+        assert calls == [("GET", "http://localhost:8080/agents/agent-test-456/knowledge-acl", None)]
+        out = capsys.readouterr().out
+        assert "files/agent-test-456" in out
+        assert "outputs/skills/agent-test-456" in out
+
+    def test_set_replaces_prefixes_via_put_and_prints_readback(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            # The server always re-adds the agent's own files/ prefix.
+            return {"key_prefixes": body["key_prefixes"] + ["files/agent-test-456"]}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._set_args("agent-test-456", ["outputs/skills/agent-test-456", "files/shared"]))
+        assert rc == 0
+        assert calls == [
+            (
+                "PUT",
+                "http://localhost:8080/agents/agent-test-456/knowledge-acl",
+                {"key_prefixes": ["outputs/skills/agent-test-456", "files/shared"]},
+            )
+        ]
+        out = capsys.readouterr().out
+        assert "outputs/skills/agent-test-456" in out
+        assert "files/shared" in out
+        assert "files/agent-test-456" in out  # server-added, shown in readback
+
+    def test_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+
+        def boom(*a, **k):
+            raise AssertionError("must not hit the API when the agent can't be resolved")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        rc = eesel.cmd_document(self._get_args("does-not-exist"))
+        assert rc == 1
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Misc
 # ──────────────────────────────────────────────────────────────────────────
@@ -2094,6 +2294,96 @@ class TestConfirm:
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["export", "--document-id", "doc-123"])
+
+    def test_documents_plural_is_canonical_noun(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "list"])
+        assert args.cmd == "documents"
+        assert args.document_cmd == "list"
+        assert args.func is eesel.cmd_document
+
+    def test_singular_document_still_parses_as_alias(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "list"])
+        assert args.cmd == "document"
+        assert args.document_cmd == "list"
+        assert args.func is eesel.cmd_document
+
+    def test_singular_document_hidden_from_help(self):
+        # The alias parses but is dropped from the top-level command listing.
+        help_text = eesel.build_parser().format_help()
+        assert "documents" in help_text
+        assert "\n    document " not in help_text
+
+    def test_get_is_documented_synonym_of_read(self):
+        parser = eesel.build_parser()
+        get_args = parser.parse_args(["documents", "get", "doc-1", "--format", "html"])
+        read_args = parser.parse_args(["documents", "read", "doc-1", "--format", "html"])
+        assert get_args.document_cmd == "get"
+        assert read_args.document_cmd == "read"
+        # Both route to the same handler, which treats get/read identically.
+        assert get_args.func is eesel.cmd_document and read_args.func is eesel.cmd_document
+
+    def test_read_hidden_from_documents_help(self):
+        # `read` stays parseable but is not advertised under `documents --help`.
+        documents_action = next(
+            a for a in eesel.build_parser()._subparsers._group_actions[0].choices.values()
+            if a.prog.endswith("documents")
+        )
+        sub_help = documents_action.format_help()
+        assert "get " in sub_help
+        assert "read" not in sub_help.split("optional arguments")[0].replace("==SUPPRESS==", "")
+
+    def test_documents_create_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "create", "--title", "T", "--content", "C"])
+        assert args.document_cmd == "create"
+        assert args.title == "T"
+        assert args.content == "C"
+        assert args.source_type == "files"
+
+    def test_documents_create_requires_content(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "create", "--title", "T"])
+
+    def test_documents_create_rejects_both_content_sources(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "create", "--title", "T", "--content", "C", "--content-file", "f"])
+
+    def test_documents_search_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "search", "files/abc", "--limit", "5"])
+        assert args.document_cmd == "search"
+        assert args.query == "files/abc"
+        assert args.limit == 5
+
+    def test_documents_delete_parses_multiple_keys_and_yes(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "delete", "k1", "k2", "-y"])
+        assert args.document_cmd == "delete"
+        assert args.keys == ["k1", "k2"]
+        assert args.yes is True
+
+    def test_documents_acl_get_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "acl", "get", "Support Bot"])
+        assert args.document_cmd == "acl"
+        assert args.acl_cmd == "get"
+        assert args.agent == "Support Bot"
+
+    def test_documents_acl_set_parses_repeatable_prefix(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "acl", "set", "agent-1", "--prefix", "a/", "--prefix", "b/"])
+        assert args.acl_cmd == "set"
+        assert args.agent == "agent-1"
+        assert args.prefix == ["a/", "b/"]
+
+    def test_documents_acl_set_requires_prefix(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "acl", "set", "agent-1"])
 
 
 # ──────────────────────────────────────────────────────────────────────────
