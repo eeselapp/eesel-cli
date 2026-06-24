@@ -4529,7 +4529,7 @@ def _record_http(monkeypatch, response):
 
 
 class TestBillingCommand:
-    def test_default_subcommand_is_usage(self, fake_creds, monkeypatch, capsys):
+    def test_bare_billing_shows_usage(self, fake_creds, monkeypatch, capsys):
         calls = _record_http(monkeypatch, {
             "numMessages": 12, "maxMessages": 100,
             "numNamespaces": 3, "maxNamespaces": 5,
@@ -4538,7 +4538,8 @@ class TestBillingCommand:
             "numLightTasks": 2, "numRegularTasks": 1, "numHeavyTasks": 0,
             "limitReached": False,
         })
-        rc = eesel.cmd_billing(_args(billing_cmd=None, json=False))
+        # `eesel billing` with no subcommand falls back to `show usage`.
+        rc = eesel.cmd_billing(_args(billing_cmd=None, topic=None, json=False, plain=False))
         assert rc == 0
         assert calls[0]["method"] == "GET"
         assert calls[0]["url"].endswith("/subscription/usage")
@@ -4546,7 +4547,7 @@ class TestBillingCommand:
         assert "12 / 100" in out
         assert "$4.50" in out
 
-    def test_license_hits_license_endpoint_and_summarizes(self, fake_creds, monkeypatch, capsys):
+    def test_show_license_hits_license_endpoint_and_summarizes(self, fake_creds, monkeypatch, capsys):
         calls = _record_http(monkeypatch, {
             "isActive": True,
             "planName": "Team",
@@ -4557,55 +4558,86 @@ class TestBillingCommand:
             "features": ["AI_AGENTS", "ANALYTICS"],
             "pricing": {"lightTaskDollars": 0.01, "regularTaskDollars": 0.05, "heavyTaskDollars": 0.2},
         })
-        rc = eesel.cmd_billing(_args(billing_cmd="license", json=False))
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="license", json=False, plain=False))
         assert rc == 0
         assert calls[0]["url"].endswith("/subscription/license")
         out = capsys.readouterr().out
         assert "Team" in out
         assert "AI_AGENTS, ANALYTICS" in out
 
-    def test_invoices_endpoint_and_empty_list(self, fake_creds, monkeypatch, capsys):
+    def test_list_invoices_endpoint_and_empty_list(self, fake_creds, monkeypatch, capsys):
         calls = _record_http(monkeypatch, [])
-        rc = eesel.cmd_billing(_args(billing_cmd="invoices", json=False))
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="invoices", json=False, plain=False))
         assert rc == 0
         assert calls[0]["url"].endswith("/subscription/invoices")
         assert "(no invoices)" in capsys.readouterr().err
 
-    def test_spend_endpoint_totals_amounts(self, fake_creds, monkeypatch, capsys):
+    def test_list_spend_endpoint_totals_amounts(self, fake_creds, monkeypatch, capsys):
         calls = _record_http(monkeypatch, [
             {"date": "2026-06-01", "amount": 1.5},
             {"date": "2026-06-02", "amount": 2.25},
         ])
-        rc = eesel.cmd_billing(_args(billing_cmd="spend", json=False))
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="spend", json=False, plain=False))
         assert rc == 0
         assert calls[0]["url"].endswith("/subscription/spend-history")
         out = capsys.readouterr().out
         assert "$3.75" in out  # total
 
-    def test_mode_endpoint(self, fake_creds, monkeypatch, capsys):
+    def test_show_mode_endpoint(self, fake_creds, monkeypatch, capsys):
         calls = _record_http(monkeypatch, {
             "mode": "threshold", "eligible": True, "canSwitchToMonthly": False, "successfulCharges": 2,
         })
-        rc = eesel.cmd_billing(_args(billing_cmd="mode", json=False))
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=False, plain=False))
         assert rc == 0
         assert calls[0]["url"].endswith("/subscription/billing-mode")
         assert "threshold" in capsys.readouterr().out
 
     def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
         _record_http(monkeypatch, {"mode": "monthly"})
-        rc = eesel.cmd_billing(_args(billing_cmd="mode", json=True))
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=True, plain=False))
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == {"mode": "monthly"}
 
-    def test_parser_defaults_to_usage(self):
+    def test_plain_emits_tab_separated_keyvalues(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, {"mode": "monthly", "eligible": True})
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=False, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "mode\tmonthly" in out
+
+    def test_list_plain_emits_tab_separated_columns(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, [{"date": "2026-06-01", "amount": 1.5}])
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="spend", json=False, plain=True))
+        assert rc == 0
+        assert "2026-06-01\t1.5" in capsys.readouterr().out
+
+    def test_unknown_topic_errors(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {})
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="bogus", json=False, plain=False))
+        assert rc == 1
+        assert calls == []
+
+    def test_parser_bare_billing_defaults_to_show_usage(self):
         args = eesel.build_parser(staff=False).parse_args(["billing"])
-        assert args.billing_cmd == "usage"
+        assert args.billing_cmd == "show"
+        assert args.topic == "usage"
         assert args.func is eesel.cmd_billing
 
-    def test_parser_accepts_each_subcommand(self):
-        for name in ("usage", "license", "invoices", "spend", "mode"):
-            args = eesel.build_parser(staff=False).parse_args(["billing", name])
-            assert args.billing_cmd == name
+    def test_parser_show_accepts_each_topic(self):
+        for name in ("usage", "license", "mode"):
+            args = eesel.build_parser(staff=False).parse_args(["billing", "show", name])
+            assert args.billing_cmd == "show"
+            assert args.topic == name
+
+    def test_parser_list_accepts_each_kind(self):
+        for name in ("invoices", "spend"):
+            args = eesel.build_parser(staff=False).parse_args(["billing", "list", name])
+            assert args.billing_cmd == "list"
+            assert args.kind == name
+
+    def test_parser_show_rejects_unknown_topic(self):
+        with pytest.raises(SystemExit):
+            eesel.build_parser(staff=False).parse_args(["billing", "show", "invoices"])
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -4626,11 +4658,11 @@ _NOTIF_RESPONSE = {
 }
 
 
-class TestSettingsNotificationsGet:
-    def test_get_hits_endpoint_and_prints_summary(self, fake_creds, monkeypatch, capsys):
+class TestSettingsNotificationsShow:
+    def test_show_hits_endpoint_and_prints_summary(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
-        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="Support Bot", json=False))
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="Support Bot", json=False, plain=False))
         assert rc == 0
         assert calls[0]["method"] == "GET"
         assert calls[0]["url"].endswith("/agents/agent-test-456/notification-settings")
@@ -4639,75 +4671,93 @@ class TestSettingsNotificationsGet:
         assert "C123" in out
         assert "u-1, u-2" in out
 
-    def test_get_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_show_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         _record_http(monkeypatch, _NOTIF_RESPONSE)
-        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="agent-test-456", json=True))
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="agent-test-456", json=True, plain=False))
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == _NOTIF_RESPONSE
 
-    def test_get_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
+    def test_show_plain_emits_tab_separated(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="agent-test-456", json=False, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "enabled\tTrue" in out
+        assert "slack\tC123" in out
+
+    def test_show_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
-        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="nope", json=False))
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="nope", json=False, plain=False))
         assert rc == 1
         assert calls == []
 
 
-class TestSettingsNotificationsSet:
-    def test_set_patches_only_provided_fields(self, fake_creds, monkeypatch, capsys):
+class TestSettingsNotificationsEnableDisable:
+    def test_enable_patches_enabled_true(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
-        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-zzz999", enabled=False, channel=None, json=False))
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="enable", agent="agent-zzz999", json=False))
         assert rc == 0
         assert calls[0]["method"] == "PATCH"
         assert calls[0]["url"].endswith("/agents/agent-zzz999/notification-settings")
-        assert calls[0]["body"] == {"enabled": False}
+        assert calls[0]["body"] == {"enabled": True}
 
-    def test_set_sends_both_fields(self, fake_creds, monkeypatch):
+    def test_disable_patches_enabled_false(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
-        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=True, channel="email", json=False))
-        assert calls[-1]["body"] == {"enabled": True, "channel": "email"}
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="disable", agent="agent-zzz999", json=False))
+        assert rc == 0
+        assert calls[0]["body"] == {"enabled": False}
+
+
+class TestSettingsNotificationsSet:
+    def test_set_patches_only_the_channel_field(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel="email", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["body"] == {"channel": "email"}
 
     def test_set_nothing_fails_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
-        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=None, channel=None, json=False))
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel=None, json=False))
         assert rc == 1
         assert calls == []
 
     def test_set_prints_readback(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
         _record_http(monkeypatch, _NOTIF_RESPONSE)
-        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=True, channel=None, json=False))
+        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel="email", json=False))
         out = capsys.readouterr().out
         # The readback reflects the server response shape (nested email/slack).
         assert "C123" in out
 
 
 class TestSettingsParser:
-    def test_get_parses_agent_positional(self):
-        args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "get", "my-agent"])
+    def test_show_parses_agent_positional(self):
+        args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "show", "my-agent"])
         assert args.settings_cmd == "notifications"
-        assert args.notifications_cmd == "get"
+        assert args.notifications_cmd == "show"
         assert args.agent == "my-agent"
         assert args.func is eesel.cmd_settings
 
-    def test_set_parses_flags(self):
-        args = eesel.build_parser(staff=False).parse_args(
-            ["settings", "notifications", "set", "my-agent", "--enabled", "false", "--channel", "slack"]
-        )
-        assert args.enabled is False
-        assert args.channel == "slack"
+    def test_enable_disable_parse_agent_positional(self):
+        for verb in ("enable", "disable"):
+            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", verb, "my-agent"])
+            assert args.notifications_cmd == verb
+            assert args.agent == "my-agent"
 
-    def test_set_enabled_accepts_various_spellings(self):
-        for truthy in ("true", "1", "yes", "on"):
-            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--enabled", truthy])
-            assert args.enabled is True
-        for falsy in ("false", "0", "no", "off"):
-            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--enabled", falsy])
-            assert args.enabled is False
+    def test_set_parses_channel_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(
+            ["settings", "notifications", "set", "my-agent", "--channel", "slack"]
+        )
+        assert args.notifications_cmd == "set"
+        assert args.channel == "slack"
 
     def test_set_rejects_invalid_channel(self):
         with pytest.raises(SystemExit):
