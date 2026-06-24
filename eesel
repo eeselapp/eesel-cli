@@ -1466,10 +1466,6 @@ def cmd_agents(args) -> int:
     if sub in ("edit", "update"):
         # `update` is the original name, kept as a hidden alias for `edit`.
         return _agents_update(args, creds)
-    if sub == "enable":
-        return _agents_set_active(args, creds, active=True)
-    if sub == "disable":
-        return _agents_set_active(args, creds, active=False)
     if sub == "delete":
         return _agents_delete(args, creds)
     return 1
@@ -1560,29 +1556,6 @@ def _agents_get(args, creds: dict) -> int:
     print("  instructions:")
     print()
     print(prompt)
-    return 0
-
-
-def _agents_set_active(args, creds: dict, *, active: bool) -> int:
-    """Bring an agent live (`enable`) or take it offline (`disable`) via the
-    `is_active` flag on `PUT /agents/{id}`. Disabling stops the agent responding
-    on its channels until re-enabled, so it confirms first unless `--yes`."""
-    agent = _resolve_one_agent(args.agent_id, creds)
-    if not agent:
-        return 1
-    if not active and not args.yes and not confirm(
-        f"Disable agent '{agent.get('name')}' ({agent['agent_id']})? "
-        "It stops responding until re-enabled. [y/N] "
-    ):
-        info("Aborted.")
-        return 1
-    http_request(
-        "PUT",
-        f"{creds['api_url']}/agents/{agent['agent_id']}",
-        token=creds["token"],
-        body={"is_active": active},
-    )
-    ok(f"{'Enabled' if active else 'Disabled'} {agent.get('name')} ({agent['agent_id']}) — now {'live' if active else 'off'}.")
     return 0
 
 
@@ -2799,13 +2772,6 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     update.add_argument("agent_id")
     update.add_argument("--name")
     update.add_argument("--instructions")
-
-    enable = a_sub.add_parser("enable", help="Bring an agent live (it starts responding on its channels)")
-    enable.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
-
-    disable = a_sub.add_parser("disable", help="Take an agent offline (it stops responding until re-enabled)")
-    disable.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
-    disable.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     delete = a_sub.add_parser("delete", help="Delete an agent (asks for confirmation)")
     delete.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")

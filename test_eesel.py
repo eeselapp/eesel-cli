@@ -1339,62 +1339,6 @@ class TestAgentsGetCommand:
         assert rc == 1
 
 
-class TestAgentsEnableDisableCommand:
-    AGENTS = [
-        {"agent_id": "agent-abc123", "name": "Support Bot"},
-        {"agent_id": "agent-def456", "name": "Blog Writer"},
-        {"agent_id": "agent-def789", "name": "Blog Writer"},
-    ]
-
-    def test_enable_puts_is_active_true(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "enable", "agent-abc123"))
-        assert rc == 0
-        assert calls[0]["method"] == "PUT"
-        assert calls[0]["url"].endswith("/agents/agent-abc123")
-        assert calls[0]["body"] == {"is_active": True}
-
-    def test_enable_does_not_prompt(self, tmp_config, fake_creds, monkeypatch):
-        # Enabling is non-destructive, so it must not block on a confirmation.
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(AssertionError("should not prompt")))
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "enable", "agent-abc123"))
-        assert rc == 0
-        assert calls[0]["body"] == {"is_active": True}
-
-    def test_disable_yes_skips_prompt(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123", "--yes"))
-        assert rc == 0
-        assert calls[0]["body"] == {"is_active": False}
-
-    def test_disable_affirmative_confirmation_puts_false(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        monkeypatch.setattr("builtins.input", lambda prompt="": "y")
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123"))
-        assert rc == 0
-        assert calls[0]["body"] == {"is_active": False}
-
-    def test_disable_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "disable", "agent-abc123"))
-        assert rc == 1
-        assert calls == []
-
-    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "enable", "Blog Writer"))
-        assert rc == 1
-        assert calls == []
-
-
 class TestAgentLabel:
     def test_includes_name_and_short_id(self):
         label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
