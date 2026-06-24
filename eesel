@@ -3686,6 +3686,122 @@ def cmd_skills(args) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Workspaces — the active workspace from stored creds (no id arg)
+#
+# Every command here operates on creds["workspace_id"], the workspace the
+# current login belongs to. Backed by the Bearer-authed workspace endpoints:
+#   GET  /workspaces/{id}                 the workspace object
+#   PUT  /workspaces/{id}                 rename (body {"workspaceName": ...})
+#   GET  /workspaces/{id}/members         members (each: email, role, status)
+#   POST /workspace/billing-limit         set the monthly spend cap (singular path)
+#   POST /subscription/extend-trial       extend the free-trial window
+# Writes and billing require the Auth0 login (a workspace-token login 401s on
+# these server-side); reads work with either.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def fetch_workspace(creds: dict) -> dict:
+    """Return the active workspace object (name, owner, trial length, etc.)."""
+    url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}"
+    return http_request("GET", url, token=creds["token"])
+
+
+def fetch_workspace_members(creds: dict) -> list[dict]:
+    """Return the active workspace's members. Each row carries email, role, and
+    status (accepted members and pending invitations both appear)."""
+    url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}/members"
+    data = http_request("GET", url, token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("members") or data.get("items") or []
+
+
+def cmd_workspaces(args) -> int:
+    creds = require_creds()
+    sub = getattr(args, "workspaces_cmd", None) or "get"
+
+    if sub == "get":
+        ws = fetch_workspace(creds)
+        if getattr(args, "json", False):
+            print(json.dumps(ws, indent=2))
+            return 0
+        # Print the fields the server returns, most useful first; skip the
+        # large/structural ones (namespaces) from the default view.
+        order = [
+            "workspaceId",
+            "workspaceName",
+            "workspaceOwnerUserId",
+            "trialDurationDays",
+            "stripeSubscriptionId",
+            "stripeCustomerId",
+            "onboarding_completed",
+            "dataResidency",
+        ]
+        printed = set()
+        for key in order:
+            if key in ws:
+                print(f"{key:<22}: {ws.get(key)}")
+                printed.add(key)
+        for key, value in ws.items():
+            if key in printed or key == "namespaces":
+                continue
+            print(f"{key:<22}: {value}")
+        return 0
+
+    if sub == "edit":
+        if not args.name:
+            err("--name is required.")
+            return 1
+        url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}"
+        http_request("PUT", url, token=creds["token"], body={"workspaceName": args.name})
+        # The update endpoint returns only a status message, so read the
+        # workspace back to confirm and show the new name.
+        ws = fetch_workspace(creds)
+        ok(f"Workspace name: {ws.get('workspaceName')}")
+        return 0
+
+    if sub == "members":
+        members = fetch_workspace_members(creds)
+        if getattr(args, "json", False):
+            print(json.dumps(members, indent=2))
+            return 0
+        if not members:
+            info("(no members)")
+            return 0
+        for m in members:
+            email = m.get("email") or "?"
+            role = m.get("role") or "?"
+            status = m.get("status")
+            suffix = f"  [{status}]" if status and status != "accepted" else ""
+            print(f"{email:<40}  {role}{suffix}")
+        return 0
+
+    if sub == "billing-limit":
+        # The server stores the cap under the `value` field and accepts a
+        # numeric amount; it returns {"status": "success"} with no echo.
+        http_request(
+            "POST",
+            f"{creds['api_url']}/workspace/billing-limit",
+            token=creds["token"],
+            body={"value": args.amount},
+        )
+        ok(f"Billing limit set to {args.amount}.")
+        return 0
+
+    if sub == "extend-trial":
+        resp = http_request(
+            "POST",
+            f"{creds['api_url']}/subscription/extend-trial",
+            token=creds["token"],
+            body={},
+        )
+        ok(resp.get("message") or "Trial extended.")
+        return 0
+
+    return 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -4071,6 +4187,21 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_ed.add_argument("skill_id", help="Skill id to configure")
     sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
     sp.set_defaults(func=cmd_skills)
+
+    # All workspaces commands act on the active workspace (creds["workspace_id"]);
+    # there is no id argument.
+    sp = sub.add_parser("workspaces", help="View or manage the active workspace")
+    w_sub = sp.add_subparsers(dest="workspaces_cmd")
+    w_get = w_sub.add_parser("get", help="Show the active workspace (name, owner, trial, etc.)")
+    w_get.add_argument("--json", action="store_true", help="Emit the raw workspace payload")
+    w_edit = w_sub.add_parser("edit", help="Rename the active workspace")
+    w_edit.add_argument("--name", help="New workspace name (required)")
+    w_members = w_sub.add_parser("members", help="List the workspace's members (email + role)")
+    w_members.add_argument("--json", action="store_true", help="Emit the raw members payload")
+    w_limit = w_sub.add_parser("billing-limit", help="Set the workspace's monthly spend cap")
+    w_limit.add_argument("amount", type=int, help="The spend cap amount (non-negative integer)")
+    w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
+    sp.set_defaults(func=cmd_workspaces)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
