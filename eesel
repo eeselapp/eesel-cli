@@ -2542,7 +2542,7 @@ def cmd_skills(args) -> int:
         return 0
 
     if sub == "remove":
-        if not args.yes and not confirm(
+        if not args.force and not confirm(
             f"Remove skill '{args.skill_id}' from {agent.get('name')} ({agent_id})? [y/N] "
         ):
             info("Aborted.")
@@ -2726,7 +2726,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_rm = sk_sub.add_parser("remove", help="Uninstall a skill from an agent (asks for confirmation)")
     sk_rm.add_argument("agent", help=_AGENT_HELP)
     sk_rm.add_argument("skill_id", help="Skill id to uninstall")
-    sk_rm.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    sk_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     sk_ed = sk_sub.add_parser("edit", help="Replace a skill's per-agent config with a JSON object")
     sk_ed.add_argument("agent", help=_AGENT_HELP)
     sk_ed.add_argument("skill_id", help="Skill id to configure")

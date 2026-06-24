@@ -2182,7 +2182,7 @@ class TestSkillsRemove:
     def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
-        rc = eesel.cmd_skills(_skills_parse("skills", "remove", "agent-abc123", "triage", "-y"))
+        rc = eesel.cmd_skills(_skills_parse("skills", "remove", "agent-abc123", "triage", "-f"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
         assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage")
@@ -2251,9 +2251,9 @@ class TestSkillsArgParser:
             _skills_parse("skills", "add", "my-agent")  # missing skill_id
 
     def test_remove_yes_flag_parses(self):
-        args = _skills_parse("skills", "remove", "my-agent", "skill-1", "-y")
+        args = _skills_parse("skills", "remove", "my-agent", "skill-1", "-f")
         assert args.skills_cmd == "remove"
-        assert args.yes is True
+        assert args.force is True
 
     def test_show_parses(self):
         args = _skills_parse("skills", "show", "my-agent", "skill-1")
