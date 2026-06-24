@@ -1260,7 +1260,7 @@ class TestAgentsRemoveCommand:
     def test_yes_flag_skips_prompt_and_removes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--force"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
@@ -1287,14 +1287,14 @@ class TestAgentsRemoveCommand:
         agents = [{"agent_id": "agent-test-456", "name": "Active One"}]
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
         _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-test-456", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-test-456", "--force"))
         assert rc == 0
         assert eesel.load_creds().get("agent_id") is None
 
     def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "remove", "Blog Writer", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "Blog Writer", "--force"))
         assert rc == 1
         assert calls == []
 
@@ -1390,7 +1390,7 @@ class TestAgentsVerbNaming:
     def test_remove_deletes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--force"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
