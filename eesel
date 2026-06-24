@@ -3819,6 +3819,232 @@ def cmd_workspace(args) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Billing — subscription license, usage, invoices, spend, billing mode
+#
+# Read-only views over the workspace's subscription. Backed by the
+# /subscription/* endpoints, which the CLI's Auth0 token can reach in prod.
+# Each subcommand prints a readable summary of the key fields; pass --json for
+# the raw payload.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _fmt_money(amount) -> str:
+    """Format a dollar amount, or '—' when it's missing/non-numeric."""
+    if not isinstance(amount, (int, float)):
+        return "—"
+    return f"${amount:,.2f}"
+
+
+def _fmt_iso_date(value) -> str:
+    """Render an ISO-8601 timestamp as 'YYYY-MM-DD HH:MM', or pass it through
+    unchanged when it isn't a parseable timestamp."""
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return str(value)
+
+
+def _print_billing_license(data: dict) -> None:
+    print(f"active           : {data.get('isActive')}")
+    print(f"plan             : {data.get('planName') or '—'}")
+    print(f"status           : {data.get('subscriptionStatus') or '—'}")
+    print(f"source           : {data.get('subscriptionSource') or '—'}")
+    amount = data.get("paymentAmount")
+    if amount is not None:
+        interval = data.get("paymentInterval") or "—"
+        print(f"payment          : {_fmt_money(amount)} / {interval}")
+    else:
+        print("payment          : —")
+    print(f"billing email    : {data.get('billingEmail') or '—'}")
+    print(f"billing limit    : {_fmt_money(data.get('billingLimit'))}")
+    print(f"billing period   : {_fmt_iso_date(data.get('billingPeriodStart'))} → {_fmt_iso_date(data.get('billingPeriodEnd'))}")
+    if data.get("trialEnd"):
+        print(f"trial ends       : {_fmt_iso_date(data.get('trialEnd'))}")
+    features = data.get("features") or []
+    if features:
+        print(f"features         : {', '.join(str(f) for f in features)}")
+    pricing = data.get("pricing") or {}
+    if pricing:
+        print(
+            "task pricing     : "
+            f"light {_fmt_money(pricing.get('lightTaskDollars'))}, "
+            f"regular {_fmt_money(pricing.get('regularTaskDollars'))}, "
+            f"heavy {_fmt_money(pricing.get('heavyTaskDollars'))}"
+        )
+
+
+def _print_billing_usage(data: dict) -> None:
+    def line(label: str, used, limit) -> None:
+        cap = "∞" if limit in (None, "") else str(limit)
+        print(f"{label:<16} : {used} / {cap}")
+
+    line("interactions", data.get("numMessages"), data.get("maxMessages"))
+    line("namespaces", data.get("numNamespaces"), data.get("maxNamespaces"))
+    line("learning jobs", data.get("numLearningJobs"), data.get("maxLearningJobs"))
+    print(f"{'cost consumed':<16} : {_fmt_money(data.get('costConsumed'))}")
+    print(
+        f"{'tasks':<16} : "
+        f"light {data.get('numLightTasks', 0)}, "
+        f"regular {data.get('numRegularTasks', 0)}, "
+        f"heavy {data.get('numHeavyTasks', 0)}"
+    )
+    if data.get("limitReached"):
+        reason = data.get("limitReachedReason") or "limit reached"
+        warn(f"usage limit reached ({reason})")
+
+
+def _print_billing_invoices(invoices: list) -> None:
+    if not invoices:
+        info("(no invoices)")
+        return
+    fmt = " {:<14}  {:<12}  {:<10}  {:<8}  {}"
+    info(fmt.format("number", "created", "amount", "status", "pdf"))
+    for inv in invoices:
+        number = inv.get("number") or inv.get("id") or "—"
+        created = _fmt_iso_date(inv.get("created"))
+        amount = _fmt_money(inv.get("amountPaid"))
+        status = inv.get("status") or "—"
+        pdf = inv.get("invoicePdf") or inv.get("hostedInvoiceUrl") or "—"
+        print(fmt.format(str(number)[:14], created[:12], amount, str(status)[:8], pdf))
+
+
+def _print_billing_spend(series: list) -> None:
+    if not series:
+        info("(no spend recorded this period)")
+        return
+    total = 0.0
+    for day in series:
+        amount = day.get("amount")
+        if isinstance(amount, (int, float)):
+            total += amount
+        print(f" {day.get('date') or '—':<12}  {_fmt_money(amount)}")
+    print(f" {'total':<12}  {_fmt_money(total)}")
+
+
+def _print_billing_mode(data: dict) -> None:
+    print(f"mode               : {data.get('mode') or '—'}")
+    print(f"eligible to switch : {data.get('eligible')}")
+    print(f"can go monthly     : {data.get('canSwitchToMonthly')}")
+    print(f"successful charges : {data.get('successfulCharges')}")
+
+
+# Each billing subcommand maps to one /subscription/* GET and a printer for its
+# response. `usage` is the default when no subcommand is given.
+_BILLING_ROUTES = {
+    "license": ("/subscription/license", _print_billing_license),
+    "usage": ("/subscription/usage", _print_billing_usage),
+    "invoices": ("/subscription/invoices", _print_billing_invoices),
+    "spend": ("/subscription/spend-history", _print_billing_spend),
+    "mode": ("/subscription/billing-mode", _print_billing_mode),
+}
+
+
+def cmd_billing(args) -> int:
+    """Read-only views over the workspace's subscription.
+
+    `eesel billing` defaults to `usage`. Each subcommand prints a readable
+    summary; pass `--json` for the raw server payload.
+    """
+    creds = require_creds()
+    sub = getattr(args, "billing_cmd", None) or "usage"
+    if sub not in _BILLING_ROUTES:
+        err(f"Unknown billing command: {sub}")
+        return 1
+    path, printer = _BILLING_ROUTES[sub]
+    data = http_request("GET", f"{creds['api_url']}{path}", token=creds["token"])
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+    printer(data)
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Settings — per-agent notification configuration
+#
+# `eesel settings notifications get/set <agent>` reads and patches one agent's
+# notification settings via GET/PATCH /agents/{agent_id}/notification-settings.
+# The GET/response nests recipient lists under `email` / `slack`; the PATCH
+# request body is flat (`member_ids` / `channel_ids`). Only the fields passed
+# are sent, so a partial set never clears the others.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _print_notification_settings(data: dict) -> None:
+    print(f"enabled  : {data.get('enabled')}")
+    print(f"channel  : {data.get('channel') or 'dashboard'}")
+    member_ids = (data.get("email") or {}).get("member_ids") or []
+    channel_ids = (data.get("slack") or {}).get("channel_ids") or []
+    print(f"email    : {', '.join(member_ids) if member_ids else '(no recipients)'}")
+    print(f"slack    : {', '.join(channel_ids) if channel_ids else '(no channels)'}")
+
+
+def cmd_settings(args) -> int:
+    """`eesel settings notifications get/set <agent>` — read or change one
+    agent's notification configuration."""
+    creds = require_creds()
+    if getattr(args, "settings_cmd", None) != "notifications":
+        err("Usage: eesel settings notifications get|set <agent>")
+        return 1
+
+    action = getattr(args, "notifications_cmd", None)
+    if action not in ("get", "set"):
+        err("Usage: eesel settings notifications get|set <agent>")
+        return 1
+
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return 1
+    agent = resolve_agent(agents, args.agent)
+    if not agent:
+        err(f"No agent matches '{args.agent}'.")
+        return 1
+    agent_id = agent["agent_id"]
+    url = f"{creds['api_url']}/agents/{agent_id}/notification-settings"
+
+    if action == "get":
+        data = http_request("GET", url, token=creds["token"])
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+            return 0
+        info(f"# {agent.get('name', '?')} ({agent_id[:12]}) — notification settings")
+        _print_notification_settings(data)
+        return 0
+
+    # action == "set": PATCH only the fields the user actually passed, so the
+    # server's unset-exclusion leaves everything else untouched.
+    body: dict = {}
+    if args.enabled is not None:
+        body["enabled"] = args.enabled
+    if args.channel is not None:
+        body["channel"] = args.channel
+    if not body:
+        err("Nothing to set. Pass --enabled true|false and/or --channel CHANNEL.")
+        return 1
+    data = http_request("PATCH", url, token=creds["token"], body=body)
+    ok(f"Updated notification settings for {agent.get('name')} ({agent_id[:12]}): {', '.join(body.keys())}")
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+    _print_notification_settings(data)
+    return 0
+
+
+def _parse_bool_flag(value: str) -> bool:
+    """Parse a true/false CLI argument. Accepts common spellings so
+    `--enabled true`, `--enabled 1`, `--enabled yes`, `--enabled off` all work."""
+    lowered = value.strip().lower()
+    if lowered in ("true", "t", "yes", "y", "1", "on"):
+        return True
+    if lowered in ("false", "f", "no", "n", "0", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got '{value}'")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -4218,6 +4444,32 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     w_members.add_argument("--json", action="store_true", help="Emit the raw members payload")
     w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
     sp.set_defaults(func=cmd_workspace)
+
+    sp = sub.add_parser("billing", help="View the workspace's subscription (read-only)")
+    b_sub = sp.add_subparsers(dest="billing_cmd")
+    b_sub.add_parser("usage", help="Interactions, namespaces, cost consumed, task counts (default)")
+    b_sub.add_parser("license", help="Plan, status, billing period, features, task pricing")
+    b_sub.add_parser("invoices", help="Recent invoices (number, amount, status, PDF link)")
+    b_sub.add_parser("spend", help="Daily spend for the current billing period")
+    b_sub.add_parser("mode", help="Billing mode (threshold vs monthly) and switch eligibility")
+    # --json lives on the parent so it applies whatever subcommand runs, including
+    # the default `usage`.
+    sp.add_argument("--json", action="store_true", help="Emit the raw subscription payload")
+    sp.set_defaults(func=cmd_billing, billing_cmd="usage")
+
+    sp = sub.add_parser("settings", help="Read or change agent settings")
+    se_sub = sp.add_subparsers(dest="settings_cmd")
+    notif = se_sub.add_parser("notifications", help="Get or set an agent's notification settings")
+    n_sub = notif.add_subparsers(dest="notifications_cmd")
+    n_get = n_sub.add_parser("get", help="Print an agent's notification settings")
+    n_get.add_argument("agent", help="Agent id, id-prefix, or name")
+    n_get.add_argument("--json", action="store_true", help="Emit the raw settings payload")
+    n_set = n_sub.add_parser("set", help="Change an agent's notification settings (only the flags you pass)")
+    n_set.add_argument("agent", help="Agent id, id-prefix, or name")
+    n_set.add_argument("--enabled", type=_parse_bool_flag, default=None, metavar="true|false", help="Turn notifications on or off")
+    n_set.add_argument("--channel", default=None, choices=["dashboard", "email", "slack"], help="Where notifications are delivered")
+    n_set.add_argument("--json", action="store_true", help="Emit the raw settings readback")
+    sp.set_defaults(func=cmd_settings)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
