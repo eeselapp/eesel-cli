@@ -2895,31 +2895,6 @@ def workspace_token(creds: dict) -> str:
     return cached
 
 
-def cmd_mcp(args) -> int:
-    """`eesel mcp token` — print a workspace token for an MCP client header.
-
-    External MCP clients (Claude Code, Cursor) send the workspace token as
-    their `Authorization: Bearer`. Since `eesel login` now stores an Auth0
-    token instead, this mints the workspace token on demand:
-
-        claude mcp add --transport http eesel "$(eesel whoami ...)/mcp" \\
-          --header "Authorization: Bearer $(eesel mcp token)"
-    """
-    creds = require_creds()
-    sub = args.mcp_cmd or "token"
-    if sub == "token":
-        # Auth0 logins must exchange their access token for a workspace token,
-        # since `/mcp` only accepts the latter. Workspace-token and dev logins
-        # already hold a token `/mcp` accepts — print it directly.
-        if creds.get("refresh_token"):
-            print(mint_workspace_token(creds, creds.get("agent_id")))
-        else:
-            print(creds["token"])
-        return 0
-    err(f"Unknown mcp command: {sub}")
-    return 1
-
-
 def _document_record(creds: dict, *, document_id: str | None = None, document_key: str | None = None) -> dict | None:
     """Look up a single document dict (id, key, name) the CLI agent owns."""
     if document_key:
@@ -2955,6 +2930,187 @@ def doc_export_signed_url(creds: dict, *, document_id: str, document_key: str | 
         raise RuntimeError(f"Export format '{fmt}' is not available for this document.")
     stem = Path((document_key or document_id).rstrip("/").rsplit("/", 1)[-1]).stem or document_id
     return f"{stem}.{fmt}", url
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MCP servers — external MCP server registrations on the workspace
+#
+# These are third-party MCP servers (e.g. a company's own tool server) that the
+# workspace's agents load at runtime for extra tools. Distinct from `eesel`'s
+# own MCP endpoint that external clients connect *to*.
+#   GET    /workspaces/{ws}/mcp-servers
+#   POST   /workspaces/{ws}/mcp-servers
+#   PUT    /workspaces/{ws}/mcp-servers/{id}
+#   POST   /workspaces/{ws}/mcp-servers/{id}/toggle   body {"is_active": bool}
+#   DELETE /workspaces/{ws}/mcp-servers/{id}
+# The server stores the URL under `base_url` on the wire; the CLI exposes it as
+# the friendlier `--url`.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def fetch_mcp_servers(creds: dict, *, include_inactive: bool = True) -> list[dict]:
+    """List the MCP servers registered on the workspace.
+
+    The server returns inactive servers only when asked, so the default here
+    requests them too — the CLI prints an active/inactive column and would
+    otherwise hide disabled ones. Each row carries id, name, base_url,
+    auth_type, has_auth_token, is_active.
+    """
+    params = {"include_inactive": "true"} if include_inactive else {}
+    qs = f"?{urllib.parse.urlencode(params)}" if params else ""
+    url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}/mcp-servers{qs}"
+    data = http_request("GET", url, token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("mcp_servers") or data.get("servers") or data.get("items") or []
+
+
+def resolve_mcp_server(servers: list[dict], target: str) -> dict | None:
+    """Match `target` against MCP servers by exact id, id prefix, then exact
+    name, returning the first match or None. Mirrors the agent resolver."""
+    exact = next((s for s in servers if s.get("id") == target), None)
+    if exact:
+        return exact
+    prefix = next((s for s in servers if (s.get("id") or "").startswith(target)), None)
+    if prefix:
+        return prefix
+    return next((s for s in servers if s.get("name") == target), None)
+
+
+def _mcp_create_body(name: str, url: str, config: dict | None = None) -> dict:
+    """Request body for `POST .../mcp-servers`. `url` rides the server's
+    `base_url` wire field. An optional `config` dict (parsed from `--config`)
+    is merged in for advanced fields like `auth_type` / `auth_token`; explicit
+    name/url win over anything the config repeats."""
+    body: dict = {}
+    if config:
+        body.update(config)
+    body["name"] = name
+    body["base_url"] = url
+    return body
+
+
+def _mcp_update_body(*, name: str | None = None, url: str | None = None) -> dict:
+    """Request body for `PUT .../mcp-servers/{id}`, containing only the fields
+    the user passed. `url` rides the `base_url` wire field. Fields left out are
+    untouched by the server."""
+    body: dict = {}
+    if name is not None:
+        body["name"] = name
+    if url is not None:
+        body["base_url"] = url
+    return body
+
+
+def _mcp_server_url(creds: dict, server_id: str, suffix: str = "") -> str:
+    return f"{creds['api_url']}/workspaces/{creds['workspace_id']}/mcp-servers/{server_id}{suffix}"
+
+
+def _resolve_one_mcp_server(creds: dict, target: str) -> dict | None:
+    """Resolve `target` to a single MCP server for a write/destructive command,
+    or print why it couldn't and return None."""
+    server = resolve_mcp_server(fetch_mcp_servers(creds), target)
+    if not server:
+        err(f"No MCP server matches '{target}'.")
+    return server
+
+
+def cmd_mcp(args) -> int:
+    """Manage external MCP servers registered on the workspace, and (via `token`)
+    print the workspace token an external MCP client needs in its header."""
+    creds = require_creds()
+    sub = args.mcp_cmd or "list"
+
+    if sub == "token":
+        # External MCP clients (Claude Code, Cursor) send the workspace token as
+        # their `Authorization: Bearer`. Auth0 logins must exchange their access
+        # token for a workspace token, since `/mcp` only accepts the latter;
+        # workspace-token and dev logins already hold one — print it directly.
+        #
+        #     claude mcp add --transport http eesel "<api>/mcp" \\
+        #       --header "Authorization: Bearer $(eesel mcp token)"
+        if creds.get("refresh_token"):
+            print(mint_workspace_token(creds, creds.get("agent_id")))
+        else:
+            print(creds["token"])
+        return 0
+
+    if sub == "list":
+        servers = fetch_mcp_servers(creds)
+        if not servers:
+            info("(no MCP servers)")
+            return 0
+        for s in servers:
+            state = "active" if s.get("is_active") else "inactive"
+            sid = (s.get("id") or "?")[:12]
+            print(f"{sid}  {s.get('name', '?')}  {s.get('base_url', '?')}  [{state}]")
+        return 0
+
+    if sub == "create":
+        config = None
+        if args.config:
+            try:
+                config = json.loads(args.config)
+            except json.JSONDecodeError as e:
+                err(f"--config is not valid JSON: {e}")
+                return 1
+            if not isinstance(config, dict):
+                err("--config must be a JSON object.")
+                return 1
+        body = _mcp_create_body(args.name, args.url, config)
+        data = http_request(
+            "POST",
+            f"{creds['api_url']}/workspaces/{creds['workspace_id']}/mcp-servers",
+            token=creds["token"],
+            body=body,
+        )
+        server_id = data.get("id") or (data.get("mcp_server") or {}).get("id")
+        if server_id:
+            ok(f"Created MCP server '{args.name}' ({server_id})")
+        else:
+            ok(f"Created MCP server '{args.name}'")
+            info("(server returned no id; run `eesel mcp list` to confirm)")
+        return 0
+
+    if sub == "edit":
+        server = _resolve_one_mcp_server(creds, args.id)
+        if not server:
+            return 1
+        body = _mcp_update_body(name=args.name, url=args.url)
+        if not body:
+            err("Nothing to update. Pass --name and/or --url.")
+            return 1
+        http_request("PUT", _mcp_server_url(creds, server["id"]), token=creds["token"], body=body)
+        ok(f"Updated {server.get('name')} ({server['id']}): {', '.join(body.keys())}")
+        return 0
+
+    if sub in ("enable", "disable"):
+        server = _resolve_one_mcp_server(creds, args.id)
+        if not server:
+            return 1
+        is_active = sub == "enable"
+        http_request(
+            "POST",
+            _mcp_server_url(creds, server["id"], "/toggle"),
+            token=creds["token"],
+            body={"is_active": is_active},
+        )
+        ok(f"{'Enabled' if is_active else 'Disabled'} {server.get('name')} ({server['id']}).")
+        return 0
+
+    if sub == "delete":
+        server = _resolve_one_mcp_server(creds, args.id)
+        if not server:
+            return 1
+        if not args.yes and not confirm(f"Delete MCP server '{server.get('name')}' ({server['id']})? [y/N] "):
+            info("Aborted.")
+            return 1
+        http_request("DELETE", _mcp_server_url(creds, server["id"]), token=creds["token"])
+        ok(f"Deleted {server.get('name')} ({server['id']}).")
+        return 0
+
+    err(f"Unknown mcp command: {sub}")
+    return 1
 
 
 def cmd_document(args) -> int:
@@ -3597,10 +3753,34 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp.set_defaults(func=cmd_tools)
 
-    sp = sub.add_parser("mcp", help="Set up eesel's MCP server for external clients (Claude Code, Cursor)")
+    sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
+    m_sub.add_parser("list", help="List MCP servers registered on this workspace")
+
+    m_create = m_sub.add_parser("create", help="Register a new MCP server")
+    m_create.add_argument("--name", required=True, help="Display name for the MCP server")
+    m_create.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
+    m_create.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
+
+    m_edit = m_sub.add_parser("edit", help="Change an MCP server's name or URL (only the flags you pass)")
+    m_edit.add_argument("id", help="Full id, id prefix, or exact name")
+    m_edit.add_argument("--name", help="New display name")
+    m_edit.add_argument("--url", help="New base URL")
+
+    m_enable = m_sub.add_parser("enable", help="Activate an MCP server")
+    m_enable.add_argument("id", help="Full id, id prefix, or exact name")
+    m_disable = m_sub.add_parser("disable", help="Deactivate an MCP server")
+    m_disable.add_argument("id", help="Full id, id prefix, or exact name")
+
+    m_delete = m_sub.add_parser("delete", help="Delete an MCP server (asks for confirmation)")
+    m_delete.add_argument("id", help="Full id, id prefix, or exact name")
+    m_delete.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+
+    # `token` prints the HS256 workspace token an external MCP client needs in
+    # its Authorization header (Auth0 logins no longer store one in credentials).
     m_sub.add_parser("token", help="Print a workspace token for the MCP client's Authorization header")
-    sp.set_defaults(func=cmd_mcp, mcp_cmd="token")
+
+    sp.set_defaults(func=cmd_mcp, mcp_cmd="list")
 
     # `eesel triggers` covers event/webhook triggers only. Scheduled jobs (cron)
     # have their own command group below: `eesel schedules`.

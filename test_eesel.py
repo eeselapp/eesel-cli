@@ -3827,3 +3827,247 @@ class TestSkillsArgParser:
     def test_edit_requires_config(self):
         with pytest.raises(SystemExit):
             _skills_parse("skills", "edit", "my-agent", "skill-1")  # missing --config
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MCP servers
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _mcp_capture(monkeypatch, response=None):
+    """Replace http_request with a recorder; returns the list of calls made.
+
+    Default response carries an id so create can echo it; pass response={} for
+    the endpoints whose return value the CLI ignores (toggle/delete/edit)."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response if response is not None else {"id": "mcp-new-999"}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+def _mcp_parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestMcpCreateBody:
+    def test_url_maps_to_base_url(self):
+        body = eesel._mcp_create_body("Srv", "https://mcp.example.com")
+        assert body == {"name": "Srv", "base_url": "https://mcp.example.com"}
+
+    def test_config_merged_but_name_and_url_win(self):
+        body = eesel._mcp_create_body(
+            "Srv",
+            "https://real",
+            {"auth_type": "bearer", "auth_token": "tok", "name": "ignored", "base_url": "ignored"},
+        )
+        assert body == {
+            "auth_type": "bearer",
+            "auth_token": "tok",
+            "name": "Srv",
+            "base_url": "https://real",
+        }
+
+
+class TestMcpUpdateBody:
+    def test_empty_when_nothing_passed(self):
+        assert eesel._mcp_update_body() == {}
+
+    def test_name_only(self):
+        assert eesel._mcp_update_body(name="Renamed") == {"name": "Renamed"}
+
+    def test_url_maps_to_base_url(self):
+        assert eesel._mcp_update_body(url="https://new") == {"base_url": "https://new"}
+
+    def test_both(self):
+        assert eesel._mcp_update_body(name="N", url="https://u") == {
+            "name": "N",
+            "base_url": "https://u",
+        }
+
+
+class TestResolveMcpServer:
+    SERVERS = [
+        {"id": "srv-abc123", "name": "Alpha"},
+        {"id": "srv-def456", "name": "Beta"},
+    ]
+
+    def test_exact_id(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "srv-abc123")["name"] == "Alpha"
+
+    def test_id_prefix(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "srv-def")["name"] == "Beta"
+
+    def test_exact_name(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "Alpha")["id"] == "srv-abc123"
+
+    def test_no_match_returns_none(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "nope") is None
+
+
+class TestMcpListCommand:
+    def test_lists_servers_with_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        servers = [
+            {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True},
+            {"id": "srv-def456", "name": "Beta", "base_url": "https://b", "is_active": False},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Alpha" in out and "https://a" in out and "[active]" in out
+        assert "Beta" in out and "[inactive]" in out
+
+    def test_empty_list(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: [])
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list"))
+        assert rc == 0
+        assert "no MCP servers" in capsys.readouterr().err
+
+    def test_bare_mcp_defaults_to_list(self):
+        # `eesel mcp` with no subcommand dispatches to the list view.
+        args = _mcp_parse("mcp")
+        assert args.func is eesel.cmd_mcp
+        assert args.mcp_cmd == "list"
+
+    def test_fetch_hits_workspace_scoped_path(self, tmp_config, fake_creds, monkeypatch):
+        calls = _mcp_capture(monkeypatch, response={"mcp_servers": []})
+        eesel.fetch_mcp_servers(fake_creds)
+        assert calls[0]["method"] == "GET"
+        assert "/workspaces/ws-test-123/mcp-servers" in calls[0]["url"]
+
+
+class TestMcpCreateCommand:
+    def test_posts_base_url_and_prints_id(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "create", "--name", "Alpha", "--url", "https://a"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers")
+        assert calls[0]["body"] == {"name": "Alpha", "base_url": "https://a"}
+        assert "mcp-new-999" in capsys.readouterr().err  # ok() writes to stderr
+
+    def test_config_json_is_merged(self, tmp_config, fake_creds, monkeypatch):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(
+            _mcp_parse("mcp", "create", "--name", "Alpha", "--url", "https://a",
+                       "--config", '{"auth_type": "bearer", "auth_token": "tok"}')
+        )
+        assert rc == 0
+        assert calls[0]["body"] == {
+            "auth_type": "bearer",
+            "auth_token": "tok",
+            "name": "Alpha",
+            "base_url": "https://a",
+        }
+
+    def test_invalid_config_json_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(
+            _mcp_parse("mcp", "create", "--name", "A", "--url", "https://a", "--config", "{not json}")
+        )
+        assert rc == 1
+        assert calls == []
+        assert "valid JSON" in capsys.readouterr().err
+
+
+class TestMcpEditCommand:
+    SERVERS = [
+        {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True},
+        {"id": "srv-def456", "name": "Beta", "base_url": "https://b", "is_active": True},
+    ]
+
+    def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_url_only_sends_base_url(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--url", "https://new"))
+        assert calls[-1]["body"] == {"base_url": "https://new"}
+
+    def test_nothing_to_update_fails(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "nope", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestMcpToggleCommands:
+    SERVERS = [{"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": False}]
+
+    def test_enable_posts_true(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "enable", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123/toggle")
+        assert calls[0]["body"] == {"is_active": True}
+
+    def test_disable_posts_false(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "disable", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["body"] == {"is_active": False}
+        assert calls[0]["url"].endswith("/toggle")
+
+
+class TestMcpDeleteCommand:
+    SERVERS = [{"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True}]
+
+    def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "delete", "srv-abc123", "--yes"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
+
+    def test_short_y_flag_also_skips_prompt(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "delete", "srv-abc123", "-y"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_affirmative_confirmation_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "delete", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "delete", "srv-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_unknown_target_errors_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "delete", "nope", "--yes"))
+        assert rc == 1
+        assert calls == []
