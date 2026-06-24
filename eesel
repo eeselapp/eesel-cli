@@ -1153,12 +1153,14 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
     if sess.get("trigger_id"):
         body["triggerId"] = sess["trigger_id"]
     url = f"{creds['api_url']}/agents/sandbox/start"
+    # sandbox/start decodes the bearer with HS256 only (it predates the Auth0
+    # migration), so an Auth0 login must send a minted workspace token here.
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {creds['token']}",
+            "Authorization": f"Bearer {workspace_token(creds)}",
         },
         method="POST",
     )
@@ -1194,7 +1196,9 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
         headers = {}
     else:
         url = f"{creds['api_url']}/agents/chat/{task_id}/raw-stream"
-        headers = {"Authorization": f"Bearer {creds['token']}"}
+        # Same HS256-only chat auth as sandbox/start — mint a workspace token
+        # for Auth0 logins (the streamUrl path above is presigned, no header).
+        headers = {"Authorization": f"Bearer {workspace_token(creds)}"}
     req = urllib.request.Request(url, headers=headers)
 
     text_buffers: dict[str, str] = {}
@@ -1978,10 +1982,11 @@ def cmd_cost(args) -> int:
 # chats, the website widget, helpdesk ticket replies, scheduled-trigger runs,
 # and sub-agent spawns. This is the same data the dashboard's Activity view
 # shows — distinct from CLI "sessions", which are just local handles you
-# created. Backed entirely by the workspace-JWT endpoints POST /workspace/tasks
-# and GET /workspace/tasks/{id}/history, so this needs no extra auth and no
-# backend changes. (Staff preview/impersonation tasks are filtered out
-# server-side, so they never appear here.)
+# created. Backed by the workspace-JWT endpoints POST /workspace/tasks and
+# GET /workspace/tasks/{id}/history, which decode the bearer with HS256 only —
+# so an Auth0 login routes through `workspace_token()` to send a minted
+# workspace token rather than its RS256 access token. (Staff preview/
+# impersonation tasks are filtered out server-side, so they never appear here.)
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2003,7 +2008,7 @@ def fetch_tasks(creds: dict, *, limit: int = 50, page: int = 1, agent_id: str | 
         "sorting": "updatedDate",
         "sort_order": 1,  # descending — most recently updated first
     }
-    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=workspace_token(creds), body=body)
     rows = data.get("tasks") or []
     # Server already sorts, but belt-and-braces in case grouping reorders.
     rows.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
@@ -2020,13 +2025,13 @@ def count_tasks(creds: dict, *, agent_id: str | None = None) -> int:
     if agent_id:
         filters["agent"] = [agent_id]
     body = {"page": 1, "limit": 1, "filters": filters, "grouping": "status"}
-    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=workspace_token(creds), body=body)
     return int(data.get("totalCount") or 0)
 
 
 def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
     """Return one task's history as a list of runs: ``[{run_id, items:[...]}]``."""
-    data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=creds["token"])
+    data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=workspace_token(creds))
     return data.get("runs") or []
 
 
@@ -2373,6 +2378,28 @@ def mint_workspace_token(creds: dict, agent_id: str | None = None) -> str:
     if not token:
         sys.exit("Mint failed: /workspaces/token returned no token.")
     return token
+
+
+def workspace_token(creds: dict) -> str:
+    """Return a token accepted by the legacy HS256 workspace-token endpoints.
+
+    A handful of routes predate the Auth0 migration and still decode the bearer
+    with HS256 only — `/workspace/tasks`, `/workspace/tasks/analytics`,
+    `/workspace/tasks/{id}/history`, and `/agents/sandbox/start` (chat). An Auth0
+    login holds an RS256 access token these routes reject, so exchange it for an
+    HS256 workspace token. Workspace-token and dev logins already hold a token
+    these routes accept, so use it directly.
+
+    The minted token is cached on `creds` for the life of the process so a
+    multi-turn chat or a tasks command doesn't re-mint on every request.
+    """
+    if not creds.get("refresh_token"):
+        return creds["token"]
+    cached = creds.get("_workspace_token")
+    if not cached:
+        cached = mint_workspace_token(creds, creds.get("agent_id"))
+        creds["_workspace_token"] = cached
+    return cached
 
 
 def cmd_mcp(args) -> int:

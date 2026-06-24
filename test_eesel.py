@@ -493,6 +493,51 @@ class TestMcpToken:
         assert capsys.readouterr().out.strip() == "ws-jwt-existing"
 
 
+class TestWorkspaceToken:
+    """`workspace_token()` picks the right bearer for the HS256-only endpoints
+    (tasks + chat). A few server routes decode the bearer with HS256 only, so an
+    Auth0 login must send a minted workspace token rather than its RS256 token."""
+
+    def test_passes_through_when_no_refresh_token(self, monkeypatch):
+        # Workspace-token / dev logins already hold a token these routes accept.
+        def boom(*a, **k):
+            raise AssertionError("must not mint for a non-Auth0 login")
+
+        monkeypatch.setattr(eesel, "mint_workspace_token", boom)
+        creds = {"api_url": "x", "token": "ws-jwt"}
+        assert eesel.workspace_token(creds) == "ws-jwt"
+
+    def test_mints_and_caches_for_auth0_login(self, monkeypatch):
+        calls = {"n": 0}
+
+        def fake_mint(creds, agent_id):
+            calls["n"] += 1
+            assert agent_id == "agent-9"  # mints scoped to the active agent
+            return "minted-ws-token"
+
+        monkeypatch.setattr(eesel, "mint_workspace_token", fake_mint)
+        creds = {"api_url": "x", "token": "auth0", "refresh_token": "rt", "agent_id": "agent-9"}
+        assert eesel.workspace_token(creds) == "minted-ws-token"
+        # Second call reuses the cached token rather than re-minting.
+        assert eesel.workspace_token(creds) == "minted-ws-token"
+        assert calls["n"] == 1
+
+    def test_tasks_send_minted_token_for_auth0_login(self, monkeypatch):
+        # fetch_tasks must authenticate with the minted workspace token, not the
+        # Auth0 access token (which the HS256-only /workspace/tasks route rejects).
+        monkeypatch.setattr(eesel, "mint_workspace_token", lambda creds, agent_id: "minted-ws-token")
+        seen = {}
+
+        def fake_http(method, url, *, token=None, body=None, **kw):
+            seen["token"] = token
+            return {"tasks": [], "totalCount": 0}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        creds = {"api_url": "http://x", "token": "auth0", "refresh_token": "rt", "agent_id": "agent-9"}
+        eesel.fetch_tasks(creds)
+        assert seen["token"] == "minted-ws-token"
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Session storage
 # ──────────────────────────────────────────────────────────────────────────
