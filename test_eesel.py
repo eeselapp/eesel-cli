@@ -1961,6 +1961,170 @@ class TestToolsCommand:
         assert "no tools" in capsys.readouterr().err
 
 
+class TestParseToolConfig:
+    def test_parses_json_object(self):
+        assert eesel.parse_tool_config('{"permission_mode": "ask"}') == {"permission_mode": "ask"}
+
+    def test_rejects_malformed_json(self):
+        with pytest.raises(ValueError, match="not valid JSON"):
+            eesel.parse_tool_config("{not json}")
+
+    def test_rejects_non_object_top_level(self):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            eesel.parse_tool_config('"a string"')
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            eesel.parse_tool_config("[1, 2, 3]")
+
+
+class TestToolsWrite:
+    """enable / edit / disable on `eesel tools`."""
+
+    def _agents(self):
+        return [
+            {"agent_id": "agent-test-456", "name": "Support Bot"},
+            {"agent_id": "agent-other-999", "name": "Sales Bot"},
+        ]
+
+    def _capture_http(self, monkeypatch, response=None):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = body
+            captured["token"] = token
+            return response if response is not None else {}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        return captured
+
+    # ── enable ──────────────────────────────────────────────────────────
+    def test_enable_posts_empty_config_to_resolved_agent(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        captured = self._capture_http(monkeypatch, {"tool_id": "t9", "config": {}})
+        rc = eesel.cmd_tools(_args(tools_cmd="enable", agent="Sales Bot", tool_key="zendesk_leave_internal_note", integration=None))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-other-999/tools/zendesk_leave_internal_note"
+        # Enable sends an empty config; the server creates the row on first write.
+        assert captured["body"] == {"config": {}}
+        assert "Enabled" in capsys.readouterr().err
+
+    def test_enable_passes_integration_id_in_body(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        captured = self._capture_http(monkeypatch)
+        eesel.cmd_tools(_args(tools_cmd="enable", agent="agent-test-456", tool_key="shopify_refund", integration="int-shop-2"))
+        assert captured["body"] == {"config": {}, "integration_id": "int-shop-2"}
+
+    def test_enable_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
+        rc = eesel.cmd_tools(_args(tools_cmd="enable", agent="Ghost", tool_key="k", integration=None))
+        assert rc == 1
+        assert "No agent matches" in capsys.readouterr().err
+
+    # ── edit ────────────────────────────────────────────────────────────
+    def test_edit_posts_parsed_config(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        captured = self._capture_http(monkeypatch, {"config": {"permission_mode": "ask"}})
+        rc = eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="zendesk_leave_internal_note", config='{"permission_mode": "ask"}', integration=None))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
+        assert captured["body"] == {"config": {"permission_mode": "ask"}}
+
+    def test_edit_rejects_bad_json_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
+        rc = eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="k", config="{bad", integration=None))
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_edit_redacts_secrets_in_echoed_config(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        self._capture_http(monkeypatch, {"config": {"access_token": "tok-LEAK", "mode": "ask"}})
+        eesel.cmd_tools(_args(tools_cmd="edit", agent="agent-test-456", tool_key="k", config='{"mode": "ask"}', integration=None))
+        err = capsys.readouterr().err
+        assert "tok-LEAK" not in err
+        assert "***" in err
+
+    # ── disable ─────────────────────────────────────────────────────────
+    def test_disable_with_yes_deletes_without_prompt(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: pytest.fail("should not prompt with --yes"))
+        captured = self._capture_http(monkeypatch)
+        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="zendesk_leave_internal_note", integration=None, yes=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
+        assert "Disabled" in capsys.readouterr().err
+
+    def test_disable_affirmative_confirmation_deletes(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        captured = self._capture_http(monkeypatch)
+        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="k", integration=None, yes=False))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+
+    def test_disable_declined_confirmation_aborts(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not DELETE when declined"))
+        rc = eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="k", integration=None, yes=False))
+        assert rc == 1
+        assert "Aborted" in capsys.readouterr().err
+
+    def test_disable_passes_integration_id_as_query_param(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        captured = self._capture_http(monkeypatch)
+        eesel.cmd_tools(_args(tools_cmd="disable", agent="agent-test-456", tool_key="shopify_refund", integration="int-shop-2", yes=True))
+        assert captured["url"].endswith("/tools/shopify_refund?integration_id=int-shop-2")
+
+
+class TestConfirm:
+    def test_yes_variants_are_affirmative(self, monkeypatch):
+        for answer in ("y", "Y", "yes", "YES", " yes "):
+            monkeypatch.setattr("builtins.input", lambda prompt, _a=answer: _a)
+            assert eesel.confirm("? ") is True
+
+    def test_anything_else_is_negative(self, monkeypatch):
+        for answer in ("", "n", "no", "nope", "maybe"):
+            monkeypatch.setattr("builtins.input", lambda prompt, _a=answer: _a)
+            assert eesel.confirm("? ") is False
+
+    def test_eof_is_negative(self, monkeypatch):
+        def raise_eof(prompt):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", raise_eof)
+        assert eesel.confirm("? ") is False
+
+
+class TestNormalizeToolsArgv:
+    def test_bare_tools_becomes_list(self):
+        assert eesel._normalize_tools_argv(["tools"]) == ["tools", "list"]
+
+    def test_agent_arg_becomes_list_agent(self):
+        assert eesel._normalize_tools_argv(["tools", "Support Bot"]) == ["tools", "list", "Support Bot"]
+
+    def test_flag_only_becomes_list(self):
+        assert eesel._normalize_tools_argv(["tools", "--json"]) == ["tools", "list", "--json"]
+
+    def test_explicit_subcommands_left_untouched(self):
+        for cmd in ("list", "enable", "edit", "disable"):
+            argv = ["tools", cmd, "Bot", "k"]
+            assert eesel._normalize_tools_argv(argv) == argv
+
+    def test_non_tools_argv_untouched(self):
+        assert eesel._normalize_tools_argv(["agents", "list"]) == ["agents", "list"]
+
+    def test_help_reaches_parent_parser(self):
+        # `tools --help` must show the subcommand list, not list's help.
+        assert eesel._normalize_tools_argv(["tools", "--help"]) == ["tools", "--help"]
+        assert eesel._normalize_tools_argv(["tools", "-h"]) == ["tools", "-h"]
+
+
 class TestTriggersAll:
     def test_all_groups_scheduled_on_top_then_by_integration(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
