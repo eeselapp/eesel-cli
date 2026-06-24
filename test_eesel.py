@@ -676,6 +676,28 @@ class TestDocumentCommand:
         assert "POST.md" in out
         assert "files/other-agent/random.md" not in out
 
+    def test_document_list_json_emits_agent_scoped_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {
+                "documents": [
+                    {"id": "doc-1", "key": "files/agent-test-456/a.md", "name": "a.md"},
+                    {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
+                ]
+            },
+        )
+        args = type(
+            "Args",
+            (),
+            {"document_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "json": True},
+        )()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Only the current agent's document survives the scope filter.
+        assert [d["id"] for d in payload] == ["doc-1"]
+
     def test_document_export_by_document_key_downloads_file(self, tmp_config, fake_creds, tmp_path, monkeypatch):
         # cli resolves the key to a document id via GET /documents (agent-scoped),
         # mints a signed link via /documents/{id}/export-link, then downloads it.
@@ -1053,9 +1075,9 @@ class TestHttpFetch:
         assert out.read_bytes() == b"DATA"
 
 
-class TestDocumentsCreate:
+class TestDocumentsAdd:
     def _args(self, **over):
-        base = {"document_cmd": "create", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
+        base = {"document_cmd": "add", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
         base.update(over)
         return type("Args", (), base)()
 
@@ -1100,63 +1122,11 @@ class TestDocumentsCreate:
         assert capsys.readouterr().out.strip() == "doc-only-id"
 
 
-class TestDocumentsSearch:
-    def _args(self, query, limit=None):
-        return type("Args", (), {"document_cmd": "search", "query": query, "limit": limit})()
+class TestDocumentsRemove:
+    def _args(self, keys, force=False):
+        return type("Args", (), {"document_cmd": "remove", "keys": keys, "force": force})()
 
-    def test_posts_prefix_body_and_prints_matches(self, tmp_config, fake_creds, monkeypatch, capsys):
-        calls = []
-
-        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
-            calls.append((method, url, body))
-            return [
-                {"id": "doc-aaaaaaa1", "key": "files/agent-test-456/notes.md", "name": "notes.md"},
-                {"id": "doc-bbbbbbb2", "key": "files/agent-test-456/spec.md", "name": "spec.md"},
-            ]
-
-        monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_document(self._args("files/agent-test-456", limit=5))
-        assert rc == 0
-        assert calls == [
-            ("POST", "http://localhost:8080/documents/search", {"prefix": "files/agent-test-456", "limit": 5})
-        ]
-        out = capsys.readouterr().out
-        assert "files/agent-test-456/notes.md" in out
-        assert "files/agent-test-456/spec.md" in out
-
-    def test_omits_limit_when_not_given(self, tmp_config, fake_creds, monkeypatch):
-        captured = {}
-
-        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
-            captured.update({"body": body})
-            return []
-
-        monkeypatch.setattr(eesel, "http_request", fake_http)
-        eesel.cmd_document(self._args("foo"))
-        assert captured["body"] == {"prefix": "foo"}
-
-    def test_handles_paginated_object_response(self, tmp_config, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(
-            eesel,
-            "http_request",
-            lambda *a, **k: {"documents": [{"id": "doc-1", "key": "files/agent-test-456/x.md", "name": "x.md"}], "total": 1},
-        )
-        rc = eesel.cmd_document(self._args("files/", limit=10))
-        assert rc == 0
-        assert "files/agent-test-456/x.md" in capsys.readouterr().out
-
-    def test_empty_result_reports_no_matches(self, tmp_config, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [])
-        rc = eesel.cmd_document(self._args("nope"))
-        assert rc == 0
-        assert "no matching documents" in capsys.readouterr().err
-
-
-class TestDocumentsDelete:
-    def _args(self, keys, yes=False):
-        return type("Args", (), {"document_cmd": "delete", "keys": keys, "yes": yes})()
-
-    def test_deletes_with_keys_body_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
+    def test_removes_with_keys_body_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
         calls = []
 
         def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
@@ -1171,15 +1141,15 @@ class TestDocumentsDelete:
             ("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md", "files/b.md"]})
         ]
 
-    def test_yes_flag_skips_confirmation(self, tmp_config, fake_creds, monkeypatch):
+    def test_force_flag_skips_confirmation(self, tmp_config, fake_creds, monkeypatch):
         calls = []
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, url, k.get("body"))) or {})
 
         def boom(prompt):
-            raise AssertionError("confirm() must not be called when --yes is passed")
+            raise AssertionError("confirm() must not be called when --force is passed")
 
         monkeypatch.setattr(eesel, "confirm", boom)
-        rc = eesel.cmd_document(self._args(["files/a.md"], yes=True))
+        rc = eesel.cmd_document(self._args(["files/a.md"], force=True))
         assert rc == 0
         assert calls == [("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md"]})]
 
@@ -1197,12 +1167,12 @@ class TestDocumentsAcl:
     AGENTS = [{"agent_id": "agent-test-456", "name": "Support Bot"}]
 
     def _get_args(self, agent):
-        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "get", "agent": agent})()
+        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": agent, "json": False})()
 
     def _set_args(self, agent, prefixes):
         return type("Args", (), {"document_cmd": "acl", "acl_cmd": "set", "agent": agent, "prefix": prefixes})()
 
-    def test_get_prints_key_prefixes(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_show_prints_key_prefixes(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = []
 
         def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
@@ -1217,6 +1187,18 @@ class TestDocumentsAcl:
         out = capsys.readouterr().out
         assert "files/agent-test-456" in out
         assert "outputs/skills/agent-test-456" in out
+
+    def test_show_json_emits_prefix_array(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"key_prefixes": ["files/agent-test-456", "outputs/skills/agent-test-456"]},
+        )
+        args = type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": "Support Bot", "json": True})()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == ["files/agent-test-456", "outputs/skills/agent-test-456"]
 
     def test_set_replaces_prefixes_via_put_and_prints_readback(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = []
@@ -2315,14 +2297,14 @@ class TestConfirm:
         assert "documents" in help_text
         assert "\n    document " not in help_text
 
-    def test_get_is_documented_synonym_of_read(self):
+    def test_show_is_documented_synonym_of_read(self):
         parser = eesel.build_parser()
-        get_args = parser.parse_args(["documents", "get", "doc-1", "--format", "html"])
+        show_args = parser.parse_args(["documents", "show", "doc-1", "--format", "html"])
         read_args = parser.parse_args(["documents", "read", "doc-1", "--format", "html"])
-        assert get_args.document_cmd == "get"
+        assert show_args.document_cmd == "show"
         assert read_args.document_cmd == "read"
-        # Both route to the same handler, which treats get/read identically.
-        assert get_args.func is eesel.cmd_document and read_args.func is eesel.cmd_document
+        # Both route to the same handler, which treats show/read identically.
+        assert show_args.func is eesel.cmd_document and read_args.func is eesel.cmd_document
 
     def test_read_hidden_from_documents_help(self):
         # `read` stays parseable but is not advertised under `documents --help`.
@@ -2331,46 +2313,52 @@ class TestConfirm:
             if a.prog.endswith("documents")
         )
         sub_help = documents_action.format_help()
-        assert "get " in sub_help
+        assert "show " in sub_help
         assert "read" not in sub_help.split("optional arguments")[0].replace("==SUPPRESS==", "")
 
-    def test_documents_create_parses(self):
+    def test_documents_list_accepts_json(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "create", "--title", "T", "--content", "C"])
-        assert args.document_cmd == "create"
+        args = parser.parse_args(["documents", "list", "--search", "post", "--json"])
+        assert args.document_cmd == "list"
+        assert args.search == "post"
+        assert args.json is True
+
+    def test_documents_add_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "add", "--title", "T", "--content", "C"])
+        assert args.document_cmd == "add"
         assert args.title == "T"
         assert args.content == "C"
         assert args.source_type == "files"
 
-    def test_documents_create_requires_content(self):
+    def test_documents_add_requires_content(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "create", "--title", "T"])
+            parser.parse_args(["documents", "add", "--title", "T"])
 
-    def test_documents_create_rejects_both_content_sources(self):
+    def test_documents_add_rejects_both_content_sources(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "create", "--title", "T", "--content", "C", "--content-file", "f"])
+            parser.parse_args(["documents", "add", "--title", "T", "--content", "C", "--content-file", "f"])
 
-    def test_documents_search_parses(self):
+    def test_documents_search_is_a_list_flag_not_a_verb(self):
+        # A free-text query folds into `list --search`; there is no `search` verb.
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "search", "files/abc", "--limit", "5"])
-        assert args.document_cmd == "search"
-        assert args.query == "files/abc"
-        assert args.limit == 5
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "search", "files/abc"])
 
-    def test_documents_delete_parses_multiple_keys_and_yes(self):
+    def test_documents_remove_parses_multiple_keys_and_force(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "delete", "k1", "k2", "-y"])
-        assert args.document_cmd == "delete"
+        args = parser.parse_args(["documents", "remove", "k1", "k2", "-f"])
+        assert args.document_cmd == "remove"
         assert args.keys == ["k1", "k2"]
-        assert args.yes is True
+        assert args.force is True
 
-    def test_documents_acl_get_parses(self):
+    def test_documents_acl_show_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "acl", "get", "Support Bot"])
+        args = parser.parse_args(["documents", "acl", "show", "Support Bot"])
         assert args.document_cmd == "acl"
-        assert args.acl_cmd == "get"
+        assert args.acl_cmd == "show"
         assert args.agent == "Support Bot"
 
     def test_documents_acl_set_parses_repeatable_prefix(self):

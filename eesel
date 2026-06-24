@@ -2950,8 +2950,9 @@ def doc_export_signed_url(creds: dict, *, document_id: str, document_key: str | 
 def cmd_document(args) -> int:
     """Dispatch the `documents` (and legacy singular `document`) subcommands.
 
-    `read` is a hidden alias of `get` — both print one document's contents — so
-    they route to the same handler here."""
+    `read` is a hidden alias of `show` — both print one document's contents — so
+    they route to the same handler here. A free-text query is `list --search
+    <q>`, not a separate verb."""
     sub = args.document_cmd or "list"
     if sub == "list":
         creds = require_creds()
@@ -2963,6 +2964,9 @@ def cmd_document(args) -> int:
             offset=args.offset,
         )
         documents = [doc for doc in documents if document_matches_agent(creds, doc)]
+        if getattr(args, "json", False):
+            print(json.dumps(documents, indent=2))
+            return 0
         if not documents:
             info("(no documents)")
             return 0
@@ -2974,14 +2978,12 @@ def cmd_document(args) -> int:
         return 0
     if sub == "export":
         return cmd_document_export(args)
-    if sub in ("get", "read"):
+    if sub in ("show", "read"):
         return cmd_document_read(args)
-    if sub == "create":
-        return _documents_create(args)
-    if sub == "search":
-        return _documents_search(args)
-    if sub == "delete":
-        return _documents_delete(args)
+    if sub == "add":
+        return _documents_add(args)
+    if sub == "remove":
+        return _documents_remove(args)
     if sub == "acl":
         return _documents_acl(args)
     return 1
@@ -2998,7 +3000,9 @@ def build_document_create_body(*, title: str, content: str, source_type: str, ag
     return body
 
 
-def _documents_create(args) -> int:
+def _documents_add(args) -> int:
+    """`eesel documents add` — bring a new document into the workspace
+    (POST /documents). Prints the new document's key so it can be captured."""
     creds = require_creds()
     if args.content is not None and args.content_file is not None:
         err("Pass either --content or --content-file, not both.")
@@ -3025,9 +3029,9 @@ def _documents_create(args) -> int:
     data = http_request("POST", f"{creds['api_url']}/documents", token=creds["token"], body=body)
     key = data.get("key") or data.get("document_key")
     doc_id = data.get("id")
-    ok(f"Created document '{args.title}'")
-    # The key is the stable address used by delete/export; print it to stdout so
-    # it can be captured and reused (e.g. `KEY=$(eesel documents create ...)`).
+    ok(f"Added document '{args.title}'")
+    # The key is the stable address used by remove/export; print it to stdout so
+    # it can be captured and reused (e.g. `KEY=$(eesel documents add ...)`).
     if key:
         print(key)
     elif doc_id:
@@ -3037,53 +3041,26 @@ def _documents_create(args) -> int:
     return 0
 
 
-def _documents_search(args) -> int:
-    """`eesel documents search <query>` — POST /documents/search.
-
-    The server's search endpoint filters by a key `prefix` (plus optional
-    property filters and pagination); it has no free-text field. The query is
-    therefore sent as the `prefix` filter, so it matches against document keys.
-    """
-    creds = require_creds()
-    body: dict = {"prefix": args.query}
-    if args.limit is not None:
-        body["limit"] = args.limit
-    data = http_request("POST", f"{creds['api_url']}/documents/search", token=creds["token"], body=body)
-    # The endpoint returns a bare array, or a paginated {documents, total, ...}
-    # object when limit/offset are sent.
-    if isinstance(data, list):
-        documents = data
-    else:
-        documents = data.get("documents") or data.get("items") or []
-    if not documents:
-        info("(no matching documents)")
-        return 0
-    for doc in documents:
-        doc_id = doc.get("id", "?")
-        key = doc.get("key") or doc.get("document_key") or "?"
-        name = doc.get("name") or key.rsplit("/", 1)[-1]
-        print(f"{doc_id[:12]}  {key}  {name}")
-    return 0
-
-
-def _documents_delete(args) -> int:
+def _documents_remove(args) -> int:
+    """`eesel documents remove <key>...` — take documents out of the workspace
+    (DELETE /documents). Prompts before deleting; `--force` skips the prompt."""
     creds = require_creds()
     keys = args.keys
-    if not args.yes:
+    if not args.force:
         listed = "\n".join(f"  {k}" for k in keys)
-        if not confirm(f"Delete {len(keys)} document(s)?\n{listed}\n[y/N] "):
+        if not confirm(f"Remove {len(keys)} document(s)?\n{listed}\n[y/N] "):
             info("Aborted.")
             return 1
     http_request("DELETE", f"{creds['api_url']}/documents", token=creds["token"], body={"keys": keys})
-    ok(f"Deleted {len(keys)} document(s).")
+    ok(f"Removed {len(keys)} document(s).")
     return 0
 
 
 def _documents_acl(args) -> int:
-    """`eesel documents acl get|set <agent>` — read or replace an agent's
+    """`eesel documents acl show|set <agent>` — read or replace an agent's
     knowledge-ACL key prefixes (GET/PUT /agents/{agent_id}/knowledge-acl)."""
     creds = require_creds()
-    sub = args.acl_cmd or "get"
+    sub = args.acl_cmd or "show"
     agents = fetch_agents(creds)
     agent = resolve_agent(agents, args.agent)
     if not agent:
@@ -3092,9 +3069,12 @@ def _documents_acl(args) -> int:
     agent_id = agent["agent_id"]
     url = f"{creds['api_url']}/agents/{agent_id}/knowledge-acl"
 
-    if sub == "get":
+    if sub == "show":
         data = http_request("GET", url, token=creds["token"])
         prefixes = data.get("key_prefixes") or []
+        if getattr(args, "json", False):
+            print(json.dumps(prefixes, indent=2))
+            return 0
         if not prefixes:
             info("(no key prefixes)")
             return 0
@@ -3165,6 +3145,13 @@ def cmd_document_read(args) -> int:
         return 1
 
     content = http_fetch(url, token=creds["token"])
+    if getattr(args, "json", False):
+        try:
+            body = content.decode("utf-8")
+        except UnicodeDecodeError:
+            body = None
+        print(json.dumps({"id": doc_id, "key": key, "format": fmt, "content": body}, indent=2))
+        return 0
     info(f"# {key or doc_id}  ({(doc_id or '')[:12]}, {fmt})")
     try:
         text = content.decode("utf-8")
@@ -3227,19 +3214,20 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     """
     sp = sub.add_parser(
         name,
-        help=argparse.SUPPRESS if hidden else "List, get, create, search, delete documents (and manage knowledge ACLs)",
+        help=argparse.SUPPRESS if hidden else "List, show, add, remove documents (and manage knowledge ACLs)",
     )
     d_sub = sp.add_subparsers(dest="document_cmd")
 
     ls = d_sub.add_parser("list", help="List documents in this workspace")
     ls.add_argument("--prefix", help="Filter by document key prefix")
-    ls.add_argument("--search", help="Search document names/keys")
+    ls.add_argument("--search", help="Free-text query over document names/keys")
     ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    ls.add_argument("--json", action="store_true", help="Emit the raw documents payload")
 
-    # `get` is the canonical verb for "see one document"; `read` is its hidden
+    # `show` is the canonical verb for "see one document"; `read` is its hidden
     # alias, kept for existing scripts. Both print a document's contents.
-    for verb, hide in (("get", False), ("read", True)):
+    for verb, hide in (("show", False), ("read", True)):
         rd = d_sub.add_parser(
             verb,
             help=argparse.SUPPRESS if hide else "Print a document's contents (omit id for an interactive menu)",
@@ -3247,6 +3235,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         rd.add_argument("target", nargs="?", help="Document id, id-prefix, key, or filename (omit to pick from a menu)")
         rd.add_argument("--prefix", help="Filter the menu/list to keys under this prefix (e.g. files/, outputs/)")
         rd.add_argument("--format", default="md", choices=["md", "html"], help="Content format (default: md)")
+        rd.add_argument("--json", action="store_true", help="Emit the document as a JSON object (id, key, content)")
         if hide:
             # Drop the alias from the listed choices so `--help` doesn't show a
             # bare `==SUPPRESS==` row; it stays parseable.
@@ -3259,25 +3248,22 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     exp.add_argument("--format", default="md", choices=["md", "html"], help="Export format")
     exp.add_argument("-o", "--output", help="Output file path")
 
-    cr = d_sub.add_parser("create", help="Create a document (prints its key)")
+    cr = d_sub.add_parser("add", help="Add a document to the workspace (prints its key)")
     cr.add_argument("--title", required=True, help="Document title")
     content = cr.add_mutually_exclusive_group(required=True)
     content.add_argument("--content", help="Document content (inline)")
     content.add_argument("--content-file", help="Read document content from this file")
     cr.add_argument("--source-type", default="files", help="Source type the document is filed under (default: files)")
 
-    se = d_sub.add_parser("search", help="Search documents by key prefix")
-    se.add_argument("query", help="Key prefix to match against document keys")
-    se.add_argument("--limit", type=int, help="Maximum results to return")
+    de = d_sub.add_parser("remove", help="Remove documents by key (asks for confirmation)")
+    de.add_argument("keys", nargs="+", help="One or more exact document keys to remove")
+    de.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
-    de = d_sub.add_parser("delete", help="Delete documents by key (asks for confirmation)")
-    de.add_argument("keys", nargs="+", help="One or more exact document keys to delete")
-    de.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-
-    acl = d_sub.add_parser("acl", help="Get or set an agent's knowledge-ACL key prefixes")
+    acl = d_sub.add_parser("acl", help="Show or set an agent's knowledge-ACL key prefixes")
     acl_sub = acl.add_subparsers(dest="acl_cmd")
-    acl_get = acl_sub.add_parser("get", help="Print an agent's knowledge-ACL key prefixes")
+    acl_get = acl_sub.add_parser("show", help="Print an agent's knowledge-ACL key prefixes")
     acl_get.add_argument("agent", help="Agent id, id-prefix, or name")
+    acl_get.add_argument("--json", action="store_true", help="Emit the key prefixes as a JSON array")
     acl_set = acl_sub.add_parser(
         "set",
         help="Replace an agent's knowledge-ACL key prefixes (this REPLACES the existing prefixes, it does not append)",
