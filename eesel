@@ -1664,7 +1664,7 @@ def _schedules_list(creds: dict, *, as_json: bool = False) -> int:
         return 0
     if not rows:
         info("(no scheduled jobs in this workspace)")
-        info("Add one with `eesel schedules add <agent> --cron \"0 9 * * *\"`.")
+        info("Add one with `eesel schedules add <agent> --cron \"0 9 * * *\" --prompt \"...\"`.")
         return 0
     for t in rows:
         cfg = t.get("config") or {}
@@ -1677,11 +1677,13 @@ def _schedules_list(creds: dict, *, as_json: bool = False) -> int:
 
 
 def _schedules_add(creds: dict, args) -> int:
-    """`eesel schedules add <agent> --cron "<expr>" [--title ..] [--timezone ..]`.
+    """`eesel schedules add <agent> --cron "<expr>" --prompt "<text>" [--title ..] [--timezone ..]`.
 
     POSTs to /agents/{agent_id}/triggers with the scheduled-job key and a config
-    built from the flags. `--config` is an optional JSON object whose keys are
-    merged in first, so the dedicated flags take precedence over it.
+    built from the flags. The server requires a `prompt` (the instruction the
+    agent runs on each fire), so it is a dedicated required flag. `--config` is an
+    optional JSON object whose keys are merged in first, so the dedicated flags
+    (`cron`, `prompt`, `title`, `timezone`) take precedence over it.
     """
     agents = fetch_agents(creds)
     if not agents:
@@ -1706,6 +1708,7 @@ def _schedules_add(creds: dict, args) -> int:
 
     # Dedicated flags win over anything passed in --config.
     config["cron"] = args.cron
+    config["prompt"] = args.prompt
     if getattr(args, "title", None):
         config["title"] = args.title
     if getattr(args, "timezone", None):
@@ -2822,6 +2825,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_add = sc_sub.add_parser("add", help="Add a scheduled job to an agent")
     sc_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the job to")
     sc_add.add_argument("--cron", required=True, help="Cron expression for the schedule (e.g. '0 9 * * *')")
+    sc_add.add_argument("--prompt", required=True, help="The instruction the agent runs each time the job fires")
     sc_add.add_argument("--title", help="Human-readable name for the job")
     sc_add.add_argument("--timezone", help="IANA timezone for the cron (e.g. 'Europe/London'; default UTC)")
     sc_add.add_argument("--config", help="Extra job config as a JSON object (merged under the flags above)")

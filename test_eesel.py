@@ -1241,18 +1241,28 @@ class TestArgParser:
         parser = eesel.build_parser()
         args = parser.parse_args([
             "schedules", "add", "Support Bot",
-            "--cron", "0 9 * * *", "--title", "Morning digest", "--timezone", "Europe/London",
+            "--cron", "0 9 * * *", "--prompt", "Send the morning digest",
+            "--title", "Morning digest", "--timezone", "Europe/London",
         ])
         assert args.schedules_cmd == "add"
         assert args.agent == "Support Bot"
         assert args.cron == "0 9 * * *"
+        assert args.prompt == "Send the morning digest"
         assert args.title == "Morning digest"
         assert args.timezone == "Europe/London"
 
     def test_schedules_add_requires_cron(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["schedules", "add", "Support Bot"])  # missing --cron
+            # missing --cron (--prompt also required, but --cron alone is enough to reject)
+            parser.parse_args(["schedules", "add", "Support Bot", "--prompt", "x"])
+
+    def test_schedules_add_requires_prompt(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            # The server rejects scheduled triggers without a prompt, so the CLI
+            # makes it a required flag and fails before sending the request.
+            parser.parse_args(["schedules", "add", "Support Bot", "--cron", "0 9 * * *"])
 
     def test_schedules_remove_parses_yes_flag(self):
         parser = eesel.build_parser()
@@ -2380,14 +2390,18 @@ class TestSchedulesAdd:
         monkeypatch.setattr(eesel, "http_request", fake)
         rc = eesel.cmd_schedules(_args(
             schedules_cmd="add", agent="Support Bot",
-            cron="0 9 * * *", title="Morning digest", timezone="Europe/London", config=None,
+            cron="0 9 * * *", prompt="Send the morning digest",
+            title="Morning digest", timezone="Europe/London", config=None,
         ))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
         assert captured["body"] == {
             "trigger_key": "eesel_scheduled",
-            "config": {"cron": "0 9 * * *", "title": "Morning digest", "timezone": "Europe/London"},
+            "config": {
+                "cron": "0 9 * * *", "prompt": "Send the morning digest",
+                "title": "Morning digest", "timezone": "Europe/London",
+            },
         }
         assert "sch-new-1" in capsys.readouterr().err
 
@@ -2403,11 +2417,12 @@ class TestSchedulesAdd:
         # --config sets cron, but the dedicated --cron flag must override it.
         rc = eesel.cmd_schedules(_args(
             schedules_cmd="add", agent="agent-test-456",
-            cron="30 8 * * 1", title=None, timezone=None,
+            cron="30 8 * * 1", prompt="Weekly review", title=None, timezone=None,
             config='{"cron": "0 0 * * *", "extra": "kept"}',
         ))
         assert rc == 0
         assert captured["body"]["config"]["cron"] == "30 8 * * 1"
+        assert captured["body"]["config"]["prompt"] == "Weekly review"
         assert captured["body"]["config"]["extra"] == "kept"
 
     def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
