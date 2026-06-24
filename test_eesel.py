@@ -2019,3 +2019,207 @@ class TestTriggersAll:
         assert "tok-LEAK" not in out
         assert '"access_token": "***"' in out
         assert "abc" in out  # non-secret config still shown
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Billing (read-only subscription views)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _record_http(monkeypatch, response):
+    """Replace http_request with a recorder returning `response`. Returns the
+    list of recorded calls so a test can assert method/url."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+class TestBillingCommand:
+    def test_default_subcommand_is_usage(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "numMessages": 12, "maxMessages": 100,
+            "numNamespaces": 3, "maxNamespaces": 5,
+            "numLearningJobs": 1, "maxLearningJobs": 10,
+            "costConsumed": 4.5,
+            "numLightTasks": 2, "numRegularTasks": 1, "numHeavyTasks": 0,
+            "limitReached": False,
+        })
+        rc = eesel.cmd_billing(_args(billing_cmd=None, json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"].endswith("/subscription/usage")
+        out = capsys.readouterr().out
+        assert "12 / 100" in out
+        assert "$4.50" in out
+
+    def test_license_hits_license_endpoint_and_summarizes(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "isActive": True,
+            "planName": "Team",
+            "subscriptionStatus": "active",
+            "subscriptionSource": "STRIPE",
+            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            "features": ["AI_AGENTS", "ANALYTICS"],
+            "pricing": {"lightTaskDollars": 0.01, "regularTaskDollars": 0.05, "heavyTaskDollars": 0.2},
+        })
+        rc = eesel.cmd_billing(_args(billing_cmd="license", json=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/license")
+        out = capsys.readouterr().out
+        assert "Team" in out
+        assert "AI_AGENTS, ANALYTICS" in out
+
+    def test_invoices_endpoint_and_empty_list(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, [])
+        rc = eesel.cmd_billing(_args(billing_cmd="invoices", json=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/invoices")
+        assert "(no invoices)" in capsys.readouterr().err
+
+    def test_spend_endpoint_totals_amounts(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, [
+            {"date": "2026-06-01", "amount": 1.5},
+            {"date": "2026-06-02", "amount": 2.25},
+        ])
+        rc = eesel.cmd_billing(_args(billing_cmd="spend", json=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/spend-history")
+        out = capsys.readouterr().out
+        assert "$3.75" in out  # total
+
+    def test_mode_endpoint(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "mode": "threshold", "eligible": True, "canSwitchToMonthly": False, "successfulCharges": 2,
+        })
+        rc = eesel.cmd_billing(_args(billing_cmd="mode", json=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/billing-mode")
+        assert "threshold" in capsys.readouterr().out
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, {"mode": "monthly"})
+        rc = eesel.cmd_billing(_args(billing_cmd="mode", json=True))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == {"mode": "monthly"}
+
+    def test_parser_defaults_to_usage(self):
+        args = eesel.build_parser(staff=False).parse_args(["billing"])
+        assert args.billing_cmd == "usage"
+        assert args.func is eesel.cmd_billing
+
+    def test_parser_accepts_each_subcommand(self):
+        for name in ("usage", "license", "invoices", "spend", "mode"):
+            args = eesel.build_parser(staff=False).parse_args(["billing", name])
+            assert args.billing_cmd == name
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Settings — agent notification configuration
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_NOTIF_AGENTS = [
+    {"agent_id": "agent-test-456", "name": "Support Bot"},
+    {"agent_id": "agent-zzz999", "name": "Blog Writer"},
+]
+
+_NOTIF_RESPONSE = {
+    "enabled": True,
+    "channel": "slack",
+    "email": {"member_ids": ["u-1", "u-2"]},
+    "slack": {"channel_ids": ["C123"]},
+}
+
+
+class TestSettingsNotificationsGet:
+    def test_get_hits_endpoint_and_prints_summary(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="Support Bot", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"].endswith("/agents/agent-test-456/notification-settings")
+        out = capsys.readouterr().out
+        assert "slack" in out
+        assert "C123" in out
+        assert "u-1, u-2" in out
+
+    def test_get_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="agent-test-456", json=True))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == _NOTIF_RESPONSE
+
+    def test_get_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="get", agent="nope", json=False))
+        assert rc == 1
+        assert calls == []
+
+
+class TestSettingsNotificationsSet:
+    def test_set_patches_only_provided_fields(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-zzz999", enabled=False, channel=None, json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["url"].endswith("/agents/agent-zzz999/notification-settings")
+        assert calls[0]["body"] == {"enabled": False}
+
+    def test_set_sends_both_fields(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=True, channel="email", json=False))
+        assert calls[-1]["body"] == {"enabled": True, "channel": "email"}
+
+    def test_set_nothing_fails_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=None, channel=None, json=False))
+        assert rc == 1
+        assert calls == []
+
+    def test_set_prints_readback(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", enabled=True, channel=None, json=False))
+        out = capsys.readouterr().out
+        # The readback reflects the server response shape (nested email/slack).
+        assert "C123" in out
+
+
+class TestSettingsParser:
+    def test_get_parses_agent_positional(self):
+        args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "get", "my-agent"])
+        assert args.settings_cmd == "notifications"
+        assert args.notifications_cmd == "get"
+        assert args.agent == "my-agent"
+        assert args.func is eesel.cmd_settings
+
+    def test_set_parses_flags(self):
+        args = eesel.build_parser(staff=False).parse_args(
+            ["settings", "notifications", "set", "my-agent", "--enabled", "false", "--channel", "slack"]
+        )
+        assert args.enabled is False
+        assert args.channel == "slack"
+
+    def test_set_enabled_accepts_various_spellings(self):
+        for truthy in ("true", "1", "yes", "on"):
+            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--enabled", truthy])
+            assert args.enabled is True
+        for falsy in ("false", "0", "no", "off"):
+            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--enabled", falsy])
+            assert args.enabled is False
+
+    def test_set_rejects_invalid_channel(self):
+        with pytest.raises(SystemExit):
+            eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--channel", "carrier-pigeon"])
