@@ -31,7 +31,8 @@ API surface used:
                                        add, sends trigger_key=eesel_scheduled)
   DELETE /triggers/{id}              remove a trigger / scheduled job
                                        (eesel triggers remove / schedules remove)
-  GET  /agents/{id}/tools            list an agent's tools/actions (eesel tools)
+  GET  /agents/{id}/tools            list an agent's actions
+                                       (eesel integrations <integration> actions)
   GET  /integrations                 list workspace integrations + connection
                                        status (eesel integrations)
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
@@ -1231,7 +1232,7 @@ def _is_sysadmin(creds: dict) -> bool:
 
 
 def _tool_row(t: dict) -> dict:
-    """Flatten a /agents/{id}/tools entry into the columns `eesel tools` prints."""
+    """Flatten a /agents/{id}/tools entry into the columns the actions commands print."""
     cfg = t.get("config") if isinstance(t.get("config"), dict) else {}
     tool_data = (cfg or {}).get("tool_data") or {}
     return {
@@ -2463,12 +2464,16 @@ def _integrations_remove(args, creds: dict) -> int:
     return 0
 
 
-def _resolve_tools_agent(creds: dict, target: str | None) -> dict | None:
-    """Resolve the agent a `tools` subcommand acts on, printing the error itself.
+def _resolve_actions_agent(creds: dict, target: str | None) -> dict | None:
+    """Resolve the agent whose actions an `integrations ... actions` subcommand
+    operates on, printing the error itself.
 
-    With an explicit `target` (id / id-prefix / name) it must match an agent;
-    without one it falls back to the stored active agent. Returns the agent
-    dict, or None after emitting an `err(...)` so the caller can `return 1`.
+    Actions (formerly "tools") are configured per agent via /agents/{id}/tools,
+    so even though the command path is scoped by integration, we still need to
+    know which agent's action set to read or write. With an explicit `target`
+    (id / id-prefix / name) it must match an agent; without one it falls back to
+    the stored active agent. Returns the agent dict, or None after emitting an
+    `err(...)` so the caller can `return 1`.
     """
     agents = fetch_agents(creds)
     if not agents:
@@ -2482,54 +2487,135 @@ def _resolve_tools_agent(creds: dict, target: str | None) -> dict | None:
         return agent
     agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
     if not agent:
-        err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
+        err("No active agent. Run `eesel agents use` to pick one (or pass --agent).")
         return None
     return agent
 
 
-def cmd_tools(args) -> int:
-    """Manage an agent's tools/actions: list (default), enable, edit, disable.
+def _action_matches_integration(row: dict, integration: str) -> bool:
+    """Whether a flattened action row belongs to the named integration.
 
-    `enable` and `edit` both POST to /agents/{id}/tools/{tool_key} — the server
-    creates the tool row on first write, so enabling is just writing an empty
-    config and editing is writing a non-empty one. `disable` DELETEs the row.
+    `integration` is the positional from the command path (e.g. `zendesk`). It
+    matches an action by its integration key (the integration type, e.g.
+    `zendesk`) or by an exact / prefix match on its integration instance id, so
+    both `eesel integrations zendesk actions` and a specific instance id work.
+    """
+    key = row.get("integration_key") or ""
+    iid = row.get("integration_id") or ""
+    return integration == key or integration == iid or (iid != "—" and iid.startswith(integration))
+
+
+def _resolve_integration_id(creds: dict, agent_id: str, integration: str) -> str | None:
+    """Resolve the integration positional to a connected instance id, or None.
+
+    For write commands the server scopes a shared action to one connected
+    instance via `integration_id`. The positional may already be that id, or it
+    may be an integration type (e.g. `zendesk`) that we look up against the
+    workspace's connected integrations. Returns None when nothing matches; the
+    write still proceeds unscoped, which is correct for actions that aren't
+    tied to a specific instance (e.g. built-in `ai_actions`).
+    """
+    integrations = fetch_integrations(creds, agent_id=agent_id)
+    # Exact instance-id match first.
+    for it in integrations:
+        if it.get("id") and it.get("id") == integration:
+            return it["id"]
+    # Then by integration type, e.g. `zendesk` → its connected instance id.
+    for it in integrations:
+        if it.get("integrationType") == integration and it.get("id"):
+            return it["id"]
+    return None
+
+
+def cmd_integration_actions(args) -> int:
+    """`eesel integrations <integration> actions <list|show|enable|disable|edit>`.
+
+    Actions are the tools an integration exposes to an agent. The integration
+    positional scopes the command (per the namespace spec, the path carries the
+    scope rather than a flag); `--agent` selects whose action set is read or
+    written, since the backing endpoint is per agent. `enable`/`edit` both POST
+    to /agents/{id}/tools/{tool_key} (the server creates the row on first
+    write); `disable` DELETEs the row.
     """
     creds = require_creds()
-    sub = getattr(args, "tools_cmd", None) or "list"
+    sub = getattr(args, "actions_cmd", None) or "list"
+    if sub == "show":
+        return _actions_show(args, creds)
     if sub == "enable":
-        return _tools_enable(args, creds)
+        return _actions_enable(args, creds)
     if sub == "edit":
-        return _tools_edit(args, creds)
+        return _actions_edit(args, creds)
     if sub == "disable":
-        return _tools_disable(args, creds)
-    return _tools_list(args, creds)
+        return _actions_disable(args, creds)
+    return _actions_list(args, creds)
 
 
-def _tools_list(args, creds: dict) -> int:
-    """List an agent's tools/actions (read-only).
+def _actions_list(args, creds: dict) -> int:
+    """List the integration's actions for an agent (read-only).
 
-    Defaults to the active agent; pass an id / id-prefix / name to inspect a
-    different one. Columns: name, read/write, permission mode, integration.
+    Shows every action with its status as columns (read/write, permission
+    mode), never only the enabled ones. Scoped to the integration on the
+    command path. `--json` emits the raw payload (filtered to the integration).
     """
-    agent = _resolve_tools_agent(creds, getattr(args, "agent", None))
+    agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
     if not agent:
         return 1
-
     agent_id = agent["agent_id"]
+    integration = args.integration
+
     tools = fetch_tools(creds, agent_id)
+    scoped = [t for t in tools if _action_matches_integration(_tool_row(t), integration)]
     if getattr(args, "json", False):
-        print(json.dumps(tools, indent=2))
+        print(json.dumps(scoped, indent=2))
         return 0
-    if not tools:
-        info(f"(no tools/actions configured for {agent.get('name', agent_id)})")
+    if not scoped:
+        info(f"(no '{integration}' actions configured for {agent.get('name', agent_id)})")
         return 0
 
-    info(f"# {agent.get('name', '?')} ({agent_id[:12]}) — {len(tools)} tool{'s' if len(tools) != 1 else ''}")
-    rows = sorted((_tool_row(t) for t in tools), key=lambda r: (r["integration_key"], r["name"].lower()))
-    fmt = " {:<32}  {:<5}  {:<13}  {:<16}  {}"
-    info(fmt.format("name", "r/w", "permission", "integration", "integration_id"))
+    info(f"# {agent.get('name', '?')} ({agent_id[:12]}) / {integration} — {len(scoped)} action{'s' if len(scoped) != 1 else ''}")
+    rows = sorted((_tool_row(t) for t in scoped), key=lambda r: r["name"].lower())
+    fmt = " {:<32}  {:<5}  {:<13}  {}"
+    info(fmt.format("action", "r/w", "permission", "integration_id"))
     for r in rows:
-        print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_key"][:16], r["integration_id"][:12]))
+        print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_id"][:12]))
+    return 0
+
+
+def _actions_show(args, creds: dict) -> int:
+    """Show one action's detail (read-only).
+
+    Finds the action by its key within the integration scope and prints its
+    fields. `--json` emits the raw entry. Errors if the action isn't found.
+    """
+    agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
+    if not agent:
+        return 1
+    agent_id = agent["agent_id"]
+    integration = args.integration
+    action_key = args.action
+
+    tools = fetch_tools(creds, agent_id)
+    match = next(
+        (t for t in tools
+         if t.get("tool_key") == action_key and _action_matches_integration(_tool_row(t), integration)),
+        None,
+    )
+    if match is None:
+        err(f"No '{action_key}' action under '{integration}' for {agent.get('name', agent_id)}.")
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(_redact_secrets(match), indent=2))
+        return 0
+    r = _tool_row(match)
+    info(f"# {r['name']} ({r['tool_key']})")
+    print(f"  integration:    {r['integration_key']}")
+    print(f"  integration_id: {r['integration_id']}")
+    print(f"  access:         {r['action']}")
+    print(f"  permission:     {r['permission']}")
+    print(f"  connected:      {r['connected']}")
+    cfg = match.get("config")
+    if isinstance(cfg, dict) and cfg:
+        print(f"  config:         {json.dumps(_redact_secrets(cfg))}")
     return 0
 
 
@@ -2554,8 +2640,8 @@ def _configure_tool(creds: dict, agent_id: str, tool_key: str, config: dict, int
 
     This single endpoint backs both `enable` (empty config) and `edit`
     (caller-supplied config): the server creates the tool row on first write,
-    so writing config is what enables the tool for the agent. `integration_id`
-    scopes the write to one connected instance when the same tool_key is shared
+    so writing config is what enables the action for the agent. `integration_id`
+    scopes the write to one connected instance when the same action is shared
     by several (e.g. two Shopify stores); it's sent in the body when given.
     """
     body: dict = {"config": config}
@@ -2565,32 +2651,34 @@ def _configure_tool(creds: dict, agent_id: str, tool_key: str, config: dict, int
     return http_request("POST", url, token=creds["token"], body=body)
 
 
-def _tools_enable(args, creds: dict) -> int:
-    """Enable a tool for an agent by writing an empty config.
+def _actions_enable(args, creds: dict) -> int:
+    """Enable an action for an agent by writing an empty config.
 
     Enabling and editing hit the same POST endpoint; enabling just sends no
-    settings, leaving the tool at its default permission mode. Use `eesel tools
-    edit` to also set settings (e.g. a human-in-the-loop permission mode).
+    settings, leaving the action at its default permission mode. Use `edit` to
+    also set settings (e.g. a human-in-the-loop permission mode). The
+    integration on the path is resolved to a connected instance id to scope the
+    write when several instances share the action.
     """
-    agent = _resolve_tools_agent(creds, args.agent)
+    agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
     if not agent:
         return 1
     agent_id = agent["agent_id"]
-    integration_id = getattr(args, "integration", None)
-    _configure_tool(creds, agent_id, args.tool_key, {}, integration_id)
-    ok(f"Enabled '{args.tool_key}' for {agent.get('name', agent_id)}.")
-    info("Set its permission/settings with `eesel tools edit`.")
+    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    _configure_tool(creds, agent_id, args.action, {}, integration_id)
+    ok(f"Enabled '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
+    info("Set its permission/settings with `eesel integrations <integration> actions edit`.")
     return 0
 
 
-def _tools_edit(args, creds: dict) -> int:
-    """Configure a tool's settings (e.g. permission mode) via its config object.
+def _actions_edit(args, creds: dict) -> int:
+    """Configure an action's settings (e.g. permission mode) via its config.
 
-    Writes the given JSON config to the tool. The same POST also enables the
-    tool if it wasn't already, so editing a not-yet-enabled tool turns it on
+    Writes the given JSON config to the action. The same POST also enables the
+    action if it wasn't already, so editing a not-yet-enabled action turns it on
     with these settings in one step.
     """
-    agent = _resolve_tools_agent(creds, args.agent)
+    agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
     if not agent:
         return 1
     try:
@@ -2599,36 +2687,39 @@ def _tools_edit(args, creds: dict) -> int:
         err(str(e))
         return 1
     agent_id = agent["agent_id"]
-    integration_id = getattr(args, "integration", None)
-    result = _configure_tool(creds, agent_id, args.tool_key, config, integration_id)
-    ok(f"Updated '{args.tool_key}' for {agent.get('name', agent_id)}.")
+    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    result = _configure_tool(creds, agent_id, args.action, config, integration_id)
+    ok(f"Updated '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
     saved = result.get("config") if isinstance(result, dict) else None
     if saved is not None:
         info(f"  config: {json.dumps(_redact_secrets(saved))}")
     return 0
 
 
-def _tools_disable(args, creds: dict) -> int:
-    """Disable a tool for an agent by deleting its tool row.
+def _actions_disable(args, creds: dict) -> int:
+    """Disable an action for an agent by deleting its tool row.
 
     DELETE /agents/{agent_id}/tools/{tool_key} removes the agent's configuration
-    for the tool. `integration_id`, when given, scopes the delete to one
-    connected instance (passed as a query param, mirroring the server). Gated
-    behind a confirmation prompt unless `-y/--yes` is passed.
+    for the action. The integration on the path, when it resolves to a connected
+    instance, scopes the delete to that instance (passed as a query param,
+    mirroring the server). Gated behind a confirmation prompt unless `--force`
+    is passed.
     """
-    agent = _resolve_tools_agent(creds, args.agent)
+    agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
     if not agent:
         return 1
     agent_id = agent["agent_id"]
-    if not args.yes and not confirm(f"Disable '{args.tool_key}' for {agent.get('name', agent_id)}? [y/N] "):
+    if not args.force and not confirm(
+        f"Disable '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}? [y/N] "
+    ):
         info("Aborted.")
         return 1
-    integration_id = getattr(args, "integration", None)
-    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(args.tool_key, safe='')}"
+    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(args.action, safe='')}"
     if integration_id:
         url += f"?{urllib.parse.urlencode({'integration_id': integration_id})}"
     http_request("DELETE", url, token=creds["token"])
-    ok(f"Disabled '{args.tool_key}' for {agent.get('name', agent_id)}.")
+    ok(f"Disabled '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
     return 0
 
 
@@ -4816,19 +4907,29 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     _add_documents_parser(sub, "documents")
     _add_documents_parser(sub, "document", hidden=True)
 
-    sp = sub.add_parser("integrations", help="List, show, add, remove, and sync integrations")
+    # `eesel integrations` lists and manages the workspace's integrations
+    # (add/connect, remove/disconnect, sync). Actions an integration exposes are
+    # scoped under it:
+    # `eesel integrations <integration> actions <list|show|enable|disable|edit>`.
+    sp = sub.add_parser("integrations", help="List, show, add, remove, sync integrations, or manage an integration's actions")
     # --secrets / --json live on the parent too so bare `eesel integrations`
     # (which defaults to `list`) keeps accepting them.
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
-    i_sub = sp.add_subparsers(dest="integrations_cmd")
-    i_ls = i_sub.add_parser("list", help="List every connected integration with status columns (read-only)")
+    # Bare `eesel integrations [--json] [--secrets]` lists integrations.
+    # `eesel integrations <integration> actions ...` drops into the actions
+    # sub-namespace. main() normalizes the latter form into the `actions`
+    # subparser below before parsing, so the integration positional can't be
+    # mistaken for a subcommand name.
+    sp.set_defaults(func=cmd_integrations, integrations_cmd=None)
+    ig_sub = sp.add_subparsers(dest="integrations_cmd")
+    i_ls = ig_sub.add_parser("list", help="List every connected integration with status columns (read-only)")
     i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
-    i_show = i_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
+    i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with syncStatus)")
-    i_add = i_sub.add_parser(
+    i_add = ig_sub.add_parser(
         "add",
         aliases=["connect"],
         help="Connect a new integration of the given type",
@@ -4843,7 +4944,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_add.add_argument("--config", help="Setup payload as a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
     i_add.add_argument("--token", help="Access token to authorize the connector without a browser (headless/agent runs)")
     i_add.add_argument("--no-input", action="store_true", help="Never prompt or print a browser URL; fail if interactive OAuth is required")
-    i_sy = i_sub.add_parser(
+    i_sy = ig_sub.add_parser(
         "sync",
         help="Trigger a data sync for a connected integration (Zendesk only today)",
         description="Trigger a data sync. --type must be one of: help-center, macros, tickets.",
@@ -4855,46 +4956,50 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         choices=list(INTEGRATION_SYNC_TYPES),
         help="What to sync (default: help-center). One of: help-center, macros, tickets.",
     )
-    i_rm = i_sub.add_parser(
+    i_rm = ig_sub.add_parser(
         "remove",
         aliases=["disconnect"],
         help="Disconnect a connected integration (asks for confirmation; `disconnect` is an alias)",
     )
     i_rm.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_rm.add_argument("--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-    sp.set_defaults(func=cmd_integrations)
 
-    sp = sub.add_parser("tools", help="List, enable, edit, or disable an agent's tools/actions")
-    # Bare `eesel tools [<agent>]` keeps the original read-only listing. main()
-    # rewrites such argv to an explicit `list` subcommand before parsing (so the
-    # optional agent positional can't be mistaken for a subcommand name), which
-    # is why the parent itself carries no positional.
-    tl_sub = sp.add_subparsers(dest="tools_cmd")
+    ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or edit an integration's actions")
+    # The integration that scopes these actions (path positional, not a flag).
+    ig_act.add_argument("integration", help="Integration type or instance id (e.g. 'zendesk')")
+    act_sub = ig_act.add_subparsers(dest="actions_cmd")
 
-    tl_ls = tl_sub.add_parser("list", help="List the agent's tools/actions (read-only)")
-    tl_ls.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
-    tl_ls.add_argument("--json", action="store_true", help="Emit the raw tools payload")
+    # --agent (whose action set to read/write) lives on every verb so it can be
+    # passed after the verb, e.g. `... actions enable reply --agent Bot`.
+    def _agent_arg(p):
+        p.add_argument("--agent", help="Agent id, id-prefix, or name whose actions to read/write (default: active agent)")
+
+    a_ls = act_sub.add_parser("list", help="List the integration's actions for the agent (read-only)")
+    _agent_arg(a_ls)
+    a_ls.add_argument("--json", action="store_true", help="Emit the raw actions payload")
+
+    a_sh = act_sub.add_parser("show", help="Show one action's detail (read-only)")
+    a_sh.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
+    _agent_arg(a_sh)
+    a_sh.add_argument("--json", action="store_true", help="Emit the raw action entry")
 
     # enable and edit both POST /agents/{id}/tools/{tool_key}; enable sends an
-    # empty config (tool at its default settings), edit sends the given config.
-    tl_en = tl_sub.add_parser("enable", help="Enable a tool for the agent (POST with empty config)")
-    tl_en.add_argument("agent", help="Agent id, id-prefix, or name")
-    tl_en.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
-    tl_en.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
+    # empty config (action at its default settings), edit sends the given config.
+    a_en = act_sub.add_parser("enable", help="Enable an action for the agent (POST with empty config)")
+    a_en.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
+    _agent_arg(a_en)
 
-    tl_ed = tl_sub.add_parser("edit", help="Configure a tool's settings, e.g. permission mode (POST with config)")
-    tl_ed.add_argument("agent", help="Agent id, id-prefix, or name")
-    tl_ed.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
-    tl_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
-    tl_ed.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
+    a_ed = act_sub.add_parser("edit", help="Configure an action's settings, e.g. permission mode (POST with config)")
+    a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
+    a_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
+    _agent_arg(a_ed)
 
-    tl_di = tl_sub.add_parser("disable", help="Disable a tool for the agent (DELETE; asks for confirmation)")
-    tl_di.add_argument("agent", help="Agent id, id-prefix, or name")
-    tl_di.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
-    tl_di.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
-    tl_di.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
+    a_di.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
+    _agent_arg(a_di)
+    a_di.add_argument("--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
-    sp.set_defaults(func=cmd_tools, tools_cmd="list", agent=None, json=False, yes=False)
+    ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
@@ -5103,30 +5208,45 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     return p
 
 
-_TOOLS_SUBCOMMANDS = ("list", "enable", "edit", "disable")
+_ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "edit")
 
 
-def _normalize_tools_argv(argv: list[str]) -> list[str]:
-    """Insert an explicit `list` after `tools` when no subcommand follows.
+def _normalize_integrations_argv(argv: list[str]) -> list[str]:
+    """Reshape `integrations <integration> actions ...` into the argparse layout.
 
-    Keeps the original `eesel tools [<agent>] [--json]` working now that `tools`
-    uses subcommands: if the first non-flag token after `tools` isn't one of the
-    subcommand names, it's an agent id/name (or there's nothing), so the call is
-    a list and we rewrite it to `tools list ...`.
+    The user-facing path puts the integration before the `actions` keyword:
+    `eesel integrations zendesk actions enable reply`. argparse, however, sees
+    `actions` as the subcommand whose first positional is the integration, so it
+    wants `integrations actions zendesk enable reply`. This swaps the integration
+    and the `actions` keyword, and inserts an explicit `list` verb when none
+    follows (so `integrations zendesk actions` lists). Bare `eesel integrations`
+    (the integration listing) and `--help` are left untouched.
     """
     try:
-        i = argv.index("tools")
+        i = argv.index("integrations")
     except ValueError:
         return argv
     rest = argv[i + 1:]
-    # Let `eesel tools --help/-h` reach the parent parser so its help lists the
-    # subcommands, rather than being rewritten into `tools list --help`.
-    if rest and rest[0] in ("-h", "--help"):
+    if not rest or rest[0] in ("-h", "--help"):
         return argv
-    first_positional = next((tok for tok in rest if not tok.startswith("-")), None)
-    if first_positional in _TOOLS_SUBCOMMANDS:
-        return argv
-    return argv[: i + 1] + ["list"] + rest
+    # First positional after `integrations` is the integration name; `actions`
+    # must follow it for this to be the actions sub-namespace.
+    if rest[0].startswith("-"):
+        return argv  # flags only → integration listing
+    integration = rest[0]
+    after = rest[1:]
+    if not after or after[0] != "actions":
+        return argv  # not the actions path → leave for the integrations parser
+    # after == ["actions", <maybe verb>, <maybe action / flags>...]
+    tail = after[1:]
+    if tail and tail[0] in ("-h", "--help"):
+        # `integrations zendesk actions --help` → show the actions help.
+        return argv[: i + 1] + ["actions", integration] + tail
+    first_positional = next((tok for tok in tail if not tok.startswith("-")), None)
+    if first_positional not in _ACTIONS_SUBCOMMANDS:
+        # No explicit verb → default to `list`.
+        tail = ["list"] + tail
+    return argv[: i + 1] + ["actions", integration] + tail
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5138,7 +5258,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser(staff)
     if argv is None:
         argv = sys.argv[1:]
-    argv = _normalize_tools_argv(argv)
+    argv = _normalize_integrations_argv(argv)
     args = parser.parse_args(argv)
     return args.func(args)
 
