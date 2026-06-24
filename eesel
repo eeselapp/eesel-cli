@@ -775,6 +775,39 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
 
 
+def http_request_allow_error(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60) -> tuple[int, dict]:
+    """Like ``http_request`` but returns ``(status_code, parsed_json)`` instead
+    of exiting on an HTTP error response.
+
+    Used by flows that need to react to the server's error body rather than
+    just abort — e.g. connecting an integration, where a 400 carries setup
+    guidance (missing ``subdomain``, OAuth required) that the user must see.
+    On a non-HTTP failure (server unreachable) it still exits, since there's no
+    structured body to surface.
+    """
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            parsed = json.loads(raw) if raw else {}
+            return resp.status, (parsed if isinstance(parsed, dict) else {"result": parsed})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"error": raw.decode(errors="replace")}
+        if not isinstance(parsed, dict):
+            parsed = {"error": parsed}
+        return e.code, parsed
+    except urllib.error.URLError as e:
+        sys.exit(f"{method} {url} failed (server reachable?): {e}")
+
+
 def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
     """GET a URL with the workspace Bearer token and return the raw bytes.
 
@@ -1150,6 +1183,33 @@ def fetch_integrations(creds: dict, *, agent_id: str | None = None) -> list[dict
     if isinstance(data, list):
         return data
     return data.get("integrations") or data.get("items") or []
+
+
+def fetch_integration_definitions(creds: dict) -> tuple[list[dict], dict]:
+    """List the connectable integration types (the catalog of what *can* be
+    connected, as opposed to what already is).
+
+    Returns ``(definitions, categories)``. Each definition carries at least a
+    ``key`` (the connector identifier passed to ``eesel integrations create``),
+    plus ``title``, ``description``, ``category``, and ``requirements`` (a map
+    of required setup fields → human description, e.g. ``subdomain`` for
+    helpdesk connectors). ``categories`` maps category id → display metadata.
+    """
+    data = http_request("GET", f"{creds['api_url']}/integration-definitions", token=creds["token"])
+    if isinstance(data, list):
+        return data, {}
+    return (data.get("integrations") or data.get("items") or []), (data.get("categories") or {})
+
+
+def resolve_integration(integrations: list[dict], target: str) -> dict | None:
+    """Match `target` against connected integrations by exact id, then id
+    prefix, then exact integration type (e.g. ``zendesk``). Returns the
+    integration dict or None."""
+    return (
+        next((it for it in integrations if str(it.get("id")) == target), None)
+        or next((it for it in integrations if str(it.get("id") or "").startswith(target)), None)
+        or next((it for it in integrations if it.get("integrationType") == target), None)
+    )
 
 
 def fetch_tools(creds: dict, agent_id: str) -> list[dict]:
@@ -2139,13 +2199,34 @@ def _schedules_fire(creds: dict, target: str) -> int:
 
 
 def cmd_integrations(args) -> int:
-    """List the workspace's integrations (read-only).
+    """Dispatch the `eesel integrations` subcommands.
+
+    `list` (default) shows what's already connected; `available` shows what
+    *can* be connected; `create` connects a new one; `sync` / `sync-status`
+    drive a connected integration's data sync.
+    """
+    creds = require_creds()
+    sub = getattr(args, "integrations_cmd", None) or "list"
+    if sub == "list":
+        return _integrations_list(args, creds)
+    if sub == "available":
+        return _integrations_available(args, creds)
+    if sub == "create":
+        return _integrations_create(args, creds)
+    if sub == "sync":
+        return _integrations_sync(args, creds)
+    if sub == "sync-status":
+        return _integrations_sync_status(args, creds)
+    return 1
+
+
+def _integrations_list(args, creds: dict) -> int:
+    """List the workspace's connected integrations (read-only).
 
     Shows id, type, connection status and subdomain. Sensitive properties
     (access tokens, secrets) are hidden unless `--secrets` is passed *and* the
     caller is a sysadmin/impersonator — the same allowlist `eesel whoami` uses.
     """
-    creds = require_creds()
     integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
     if getattr(args, "json", False):
         print(json.dumps(integrations, indent=2))
@@ -2177,6 +2258,156 @@ def cmd_integrations(args) -> int:
                     print(_color(f"      {prop.get('key')} = {prop.get('value')}", "2;37"))
                 else:
                     print(_color(f"      {json.dumps(prop)}", "2;37"))
+    return 0
+
+
+def _integrations_available(args, creds: dict) -> int:
+    """List the connectable integration types (the catalog of what can be
+    connected). The `key` column is the value passed to
+    `eesel integrations create <key>`; `requires` lists the setup fields a
+    connector needs (e.g. `subdomain` for helpdesk connectors)."""
+    definitions, _categories = fetch_integration_definitions(creds)
+    if getattr(args, "json", False):
+        print(json.dumps(definitions, indent=2))
+        return 0
+    if not definitions:
+        info("(no connectable integrations)")
+        return 0
+
+    fmt = " {:<20}  {:<14}  {:<28}  {}"
+    info(fmt.format("key", "category", "title", "requires"))
+    for d in sorted(definitions, key=lambda x: (x.get("category") or "", x.get("key") or "")):
+        key = (d.get("key") or "?")[:20]
+        category = (d.get("category") or "—")[:14]
+        title = (d.get("title") or "")[:28]
+        requirements = d.get("requirements") or {}
+        requires = ", ".join(requirements.keys()) if requirements else "—"
+        print(fmt.format(key, category, title, requires))
+    return 0
+
+
+def _parse_config_arg(raw: str | None) -> dict:
+    """Parse the `--config` JSON string into a dict, exiting with a clear
+    message if it isn't a valid JSON object."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"--config is not valid JSON: {e}")
+    if not isinstance(parsed, dict):
+        sys.exit("--config must be a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
+    return parsed
+
+
+def _integrations_create(args, creds: dict) -> int:
+    """Connect a new integration of type `<key>`, POSTing the `--config` JSON
+    as the setup payload.
+
+    Helpdesk connectors (e.g. zendesk) need required setup fields (subdomain)
+    and/or an external OAuth round-trip. The server validates the payload and
+    returns a 400 with guidance when something's missing — that message is
+    surfaced verbatim. If the server returns an OAuth/setup redirect URL, it's
+    printed for the user to open. Completing an OAuth flow in the browser is
+    out of scope for the CLI.
+    """
+    key = args.key
+    config = _parse_config_arg(getattr(args, "config", None))
+    # Target the active agent when one is set, mirroring the dashboard, so the
+    # new integration's connection status is computed against it. The server
+    # extracts agent_id from the payload rather than persisting it as a property.
+    if creds.get("agent_id") and "agent_id" not in config and "agentId" not in config:
+        config["agent_id"] = creds["agent_id"]
+
+    status, result = http_request_allow_error(
+        "POST", f"{creds['api_url']}/integrations/{urllib.parse.quote(key)}", token=creds["token"], body=config
+    )
+
+    if status >= 400:
+        message = result.get("error") or result.get("message") or json.dumps(result)
+        err(f"Could not connect '{key}': {message}")
+        if result.get("details"):
+            info(str(result["details"]))
+        info("Helpdesk connectors need required setup fields (e.g. subdomain) and may require an OAuth step.")
+        info("Run `eesel integrations available` to see a connector's required fields, then pass them with --config.")
+        return 1
+
+    integration_id = result.get("integration_id") or result.get("id")
+    identifier = result.get("identifier")
+    ok(f"Connected '{key}'" + (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else ""))
+
+    redirect_url = result.get("redirect_url")
+    if redirect_url:
+        info("This connector needs an external authorization step to finish.")
+        info(f"Open this URL in your browser to complete setup:\n  {redirect_url}")
+        info("Completing the OAuth flow is out of scope for the CLI — finish it in the browser.")
+    return 0
+
+
+# Valid `sync_type` values accepted by POST /integrations/{id}/trigger-sync.
+# The server maps these UI keys to its internal sync subcategories; anything
+# else returns HTTP 400 "invalid sync_type". Only Zendesk integrations
+# currently support triggered syncs.
+INTEGRATION_SYNC_TYPES = ("help-center", "macros", "tickets")
+
+
+def _integrations_sync(args, creds: dict) -> int:
+    """Trigger a data sync for a connected integration.
+
+    POSTs ``{"sync_type": ...}`` to trigger-sync. `<id>` resolves from a full
+    id, id prefix, or integration type. Only Zendesk integrations support this
+    today; the server returns the valid `sync_type` guidance otherwise.
+    """
+    sync_type = args.type
+    if sync_type not in INTEGRATION_SYNC_TYPES:
+        err(f"Invalid --type '{sync_type}'. Valid values: {', '.join(INTEGRATION_SYNC_TYPES)}.")
+        return 1
+
+    integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+    if not integration:
+        err(f"No connected integration matches '{args.id}'. Run `eesel integrations list`.")
+        return 1
+    integration_id = integration["id"]
+
+    status, result = http_request_allow_error(
+        "POST",
+        f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}/trigger-sync",
+        token=creds["token"],
+        body={"sync_type": sync_type},
+    )
+    if status >= 400:
+        err(f"Could not trigger sync: {result.get('error') or result.get('message') or json.dumps(result)}")
+        return 1
+    if result.get("skipped"):
+        info(result.get("reason") or "A matching sync is already in progress.")
+        return 0
+    ok(result.get("message") or f"Triggered '{sync_type}' sync for {integration_id}.")
+    return 0
+
+
+def _integrations_sync_status(args, creds: dict) -> int:
+    """Show sync status for a connected integration via GET
+    /integrations/{id}/sync. `<id>` resolves from a full id, id prefix, or
+    integration type."""
+    integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+    if not integration:
+        err(f"No connected integration matches '{args.id}'. Run `eesel integrations list`.")
+        return 1
+    integration_id = integration["id"]
+
+    data = http_request(
+        "GET",
+        f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}/sync",
+        token=creds["token"],
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2))
+        return 0
+    # The endpoint returns a bare string (e.g. "Triggered Sync") on success.
+    if isinstance(data, dict) and not data:
+        print("(no sync status)")
+    else:
+        print(data if isinstance(data, str) else json.dumps(data))
     return 0
 
 
@@ -4406,9 +4637,44 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     _add_documents_parser(sub, "documents")
     _add_documents_parser(sub, "document", hidden=True)
 
-    sp = sub.add_parser("integrations", help="List the workspace's integrations (read-only)")
+    sp = sub.add_parser("integrations", help="List, browse, connect, and sync integrations")
+    # --secrets / --json live on the parent too so bare `eesel integrations`
+    # (which defaults to `list`) keeps accepting them.
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
+    i_sub = sp.add_subparsers(dest="integrations_cmd")
+    i_ls = i_sub.add_parser("list", help="List the workspace's connected integrations (read-only)")
+    i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
+    i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
+    i_av = i_sub.add_parser("available", help="List connectable integration types (what can be connected)")
+    i_av.add_argument("--json", action="store_true", help="Emit the raw integration-definitions payload")
+    i_cr = i_sub.add_parser(
+        "create",
+        help="Connect a new integration of the given type",
+        description="Connect a new integration. Helpdesk connectors (e.g. zendesk) "
+        "need required setup fields such as `subdomain` and may require an "
+        "external OAuth round-trip; pass setup fields with --config. Run "
+        "`eesel integrations available` to see a connector's required fields. "
+        "If the server returns an authorization URL, open it in your browser — "
+        "completing the OAuth flow is out of scope for the CLI.",
+    )
+    i_cr.add_argument("key", help="Integration type key to connect (e.g. zendesk, website, notion) — see `eesel integrations available`")
+    i_cr.add_argument("--config", help="Setup payload as a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
+    i_sy = i_sub.add_parser(
+        "sync",
+        help="Trigger a data sync for a connected integration (Zendesk only today)",
+        description="Trigger a data sync. --type must be one of: help-center, macros, tickets.",
+    )
+    i_sy.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
+    i_sy.add_argument(
+        "--type",
+        default="help-center",
+        choices=list(INTEGRATION_SYNC_TYPES),
+        help="What to sync (default: help-center). One of: help-center, macros, tickets.",
+    )
+    i_st = i_sub.add_parser("sync-status", help="Show sync status for a connected integration")
+    i_st.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
+    i_st.add_argument("--json", action="store_true", help="Emit the raw sync-status payload")
     sp.set_defaults(func=cmd_integrations)
 
     sp = sub.add_parser("tools", help="List an agent's tools/actions (read-only)")
