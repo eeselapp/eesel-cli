@@ -2298,11 +2298,11 @@ def doc_export_signed_url(creds: dict, *, document_id: str, document_key: str | 
 # These are third-party MCP servers (e.g. a company's own tool server) that the
 # workspace's agents load at runtime for extra tools. Distinct from `eesel`'s
 # own MCP endpoint that external clients connect *to*.
-#   GET    /workspaces/{ws}/mcp-servers
-#   POST   /workspaces/{ws}/mcp-servers
-#   PUT    /workspaces/{ws}/mcp-servers/{id}
-#   POST   /workspaces/{ws}/mcp-servers/{id}/toggle   body {"is_active": bool}
-#   DELETE /workspaces/{ws}/mcp-servers/{id}
+#   GET    /workspaces/{ws}/mcp-servers              (list / show)
+#   POST   /workspaces/{ws}/mcp-servers              (add)
+#   PUT    /workspaces/{ws}/mcp-servers/{id}         (edit)
+#   POST   /workspaces/{ws}/mcp-servers/{id}/toggle  (enable/disable) body {"is_active": bool}
+#   DELETE /workspaces/{ws}/mcp-servers/{id}         (remove)
 # The server stores the URL under `base_url` on the wire; the CLI exposes it as
 # the friendlier `--url`.
 # ──────────────────────────────────────────────────────────────────────────
@@ -2376,22 +2376,49 @@ def _resolve_one_mcp_server(creds: dict, target: str) -> dict | None:
 
 
 def cmd_mcp(args) -> int:
-    """Manage external MCP servers registered on the workspace."""
+    """Manage external MCP servers registered on the workspace.
+
+    `add`/`remove` bring a server in / take it out; `enable`/`disable` flip its
+    active field; `list`/`show` read the installed set. The underlying endpoints
+    are unchanged — only the command surface follows the shared verb set.
+    """
     creds = require_creds()
     sub = args.mcp_cmd or "list"
 
     if sub == "list":
         servers = fetch_mcp_servers(creds)
+        if getattr(args, "json", False):
+            print(json.dumps(servers, indent=2))
+            return 0
         if not servers:
             info("(no MCP servers)")
             return 0
+        fmt = " {:<12}  {:<24}  {:<8}  {}"
+        info(fmt.format("id", "name", "status", "url"))
         for s in servers:
-            state = "active" if s.get("is_active") else "inactive"
+            state = "on" if s.get("is_active") else "off"
             sid = (s.get("id") or "?")[:12]
-            print(f"{sid}  {s.get('name', '?')}  {s.get('base_url', '?')}  [{state}]")
+            name = (s.get("name") or "?")[:24]
+            print(fmt.format(sid, name, f"[{state}]", s.get("base_url", "?")))
         return 0
 
-    if sub == "create":
+    if sub == "show":
+        server = _resolve_one_mcp_server(creds, args.server)
+        if not server:
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(server, indent=2))
+            return 0
+        state = "on" if server.get("is_active") else "off"
+        info(f"{server.get('name', '?')}  [{state}]")
+        print(f"  id        {server.get('id', '?')}")
+        print(f"  url       {server.get('base_url', '?')}")
+        print(f"  auth      {server.get('auth_type', 'none')}"
+              + ("  (token set)" if server.get("has_auth_token") else ""))
+        print(f"  active    {bool(server.get('is_active'))}")
+        return 0
+
+    if sub == "add":
         config = None
         if args.config:
             try:
@@ -2411,14 +2438,14 @@ def cmd_mcp(args) -> int:
         )
         server_id = data.get("id") or (data.get("mcp_server") or {}).get("id")
         if server_id:
-            ok(f"Created MCP server '{args.name}' ({server_id})")
+            ok(f"Added MCP server '{args.name}' ({server_id})")
         else:
-            ok(f"Created MCP server '{args.name}'")
+            ok(f"Added MCP server '{args.name}'")
             info("(server returned no id; run `eesel mcp list` to confirm)")
         return 0
 
     if sub == "edit":
-        server = _resolve_one_mcp_server(creds, args.id)
+        server = _resolve_one_mcp_server(creds, args.server)
         if not server:
             return 1
         body = _mcp_update_body(name=args.name, url=args.url)
@@ -2430,7 +2457,7 @@ def cmd_mcp(args) -> int:
         return 0
 
     if sub in ("enable", "disable"):
-        server = _resolve_one_mcp_server(creds, args.id)
+        server = _resolve_one_mcp_server(creds, args.server)
         if not server:
             return 1
         is_active = sub == "enable"
@@ -2443,15 +2470,15 @@ def cmd_mcp(args) -> int:
         ok(f"{'Enabled' if is_active else 'Disabled'} {server.get('name')} ({server['id']}).")
         return 0
 
-    if sub == "delete":
-        server = _resolve_one_mcp_server(creds, args.id)
+    if sub == "remove":
+        server = _resolve_one_mcp_server(creds, args.server)
         if not server:
             return 1
-        if not args.yes and not confirm(f"Delete MCP server '{server.get('name')}' ({server['id']})? [y/N] "):
+        if not args.force and not confirm(f"Remove MCP server '{server.get('name')}' ({server['id']})? [y/N] "):
             info("Aborted.")
             return 1
         http_request("DELETE", _mcp_server_url(creds, server["id"]), token=creds["token"])
-        ok(f"Deleted {server.get('name')} ({server['id']}).")
+        ok(f"Removed {server.get('name')} ({server['id']}).")
         return 0
 
     err(f"Unknown mcp command: {sub}")
@@ -2709,26 +2736,31 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
-    m_sub.add_parser("list", help="List MCP servers registered on this workspace")
+    m_list = m_sub.add_parser("list", help="List MCP servers registered on this workspace (status shown as a column)")
+    m_list.add_argument("--json", action="store_true", help="Emit the raw MCP servers payload")
 
-    m_create = m_sub.add_parser("create", help="Register a new MCP server")
-    m_create.add_argument("--name", required=True, help="Display name for the MCP server")
-    m_create.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
-    m_create.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
+    m_show = m_sub.add_parser("show", help="Show one MCP server's details")
+    m_show.add_argument("server", help="Full id, id prefix, or exact name")
+    m_show.add_argument("--json", action="store_true", help="Emit the raw MCP server payload")
+
+    m_add = m_sub.add_parser("add", help="Register (bring in) a new MCP server")
+    m_add.add_argument("--name", required=True, help="Display name for the MCP server")
+    m_add.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
+    m_add.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
 
     m_edit = m_sub.add_parser("edit", help="Change an MCP server's name or URL (only the flags you pass)")
-    m_edit.add_argument("id", help="Full id, id prefix, or exact name")
+    m_edit.add_argument("server", help="Full id, id prefix, or exact name")
     m_edit.add_argument("--name", help="New display name")
     m_edit.add_argument("--url", help="New base URL")
 
     m_enable = m_sub.add_parser("enable", help="Activate an MCP server")
-    m_enable.add_argument("id", help="Full id, id prefix, or exact name")
+    m_enable.add_argument("server", help="Full id, id prefix, or exact name")
     m_disable = m_sub.add_parser("disable", help="Deactivate an MCP server")
-    m_disable.add_argument("id", help="Full id, id prefix, or exact name")
+    m_disable.add_argument("server", help="Full id, id prefix, or exact name")
 
-    m_delete = m_sub.add_parser("delete", help="Delete an MCP server (asks for confirmation)")
-    m_delete.add_argument("id", help="Full id, id prefix, or exact name")
-    m_delete.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    m_remove = m_sub.add_parser("remove", help="Remove (take out) an MCP server (asks for confirmation)")
+    m_remove.add_argument("server", help="Full id, id prefix, or exact name")
+    m_remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     sp.set_defaults(func=cmd_mcp, mcp_cmd="list")
 
