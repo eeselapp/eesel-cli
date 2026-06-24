@@ -1145,6 +1145,30 @@ def _parse(*argv):
     return eesel.build_parser(staff=False).parse_args(list(argv))
 
 
+class TestAgentsListCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot", "is_active": True},
+        {"agent_id": "agent-def456", "name": "Blog Writer", "is_active": False},
+    ]
+
+    def test_list_shows_status_column_for_every_agent(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `list` shows everything with its on/off state as a column; it never
+        # filters down to only the active ones.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "list"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "Blog Writer" in out
+        assert "[on]" in out and "[off]" in out
+
+    def test_list_json_emits_raw_records(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "list", "--json"))
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [a["agent_id"] for a in parsed] == ["agent-abc123", "agent-def456"]
+
+
 class TestAgentsCreateCommand:
     def test_missing_name_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = _capture_requests(monkeypatch)
@@ -1180,7 +1204,7 @@ class TestAgentsCreateCommand:
         assert "created-id-999" in capsys.readouterr().err  # ok() writes to stderr
 
 
-class TestAgentsUpdateCommand:
+class TestAgentsEditFieldsCommand:
     AGENTS = [
         {"agent_id": "agent-abc123", "name": "Support Bot"},
         {"agent_id": "agent-def456", "name": "Blog Writer"},
@@ -1190,7 +1214,7 @@ class TestAgentsUpdateCommand:
     def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--name", "Renamed"))
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
         assert rc == 0
         assert calls[0]["method"] == "PUT"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
@@ -1199,20 +1223,20 @@ class TestAgentsUpdateCommand:
     def test_instructions_only_sends_prompt(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--instructions", "new text"))
+        eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--instructions", "new text"))
         assert calls[-1]["body"] == {"prompt": "new text"}
 
-    def test_nothing_to_update_fails(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_nothing_to_change_fails(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123"))
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123"))
         assert rc == 1
         assert calls == []
 
     def test_ambiguous_target_refuses_without_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "update", "Blog Writer", "--name", "X"))
+        rc = eesel.cmd_agents(_parse("agents", "edit", "Blog Writer", "--name", "X"))
         assert rc == 1
         assert calls == []
         err = capsys.readouterr().err
@@ -1221,31 +1245,31 @@ class TestAgentsUpdateCommand:
     def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "update", "nope", "--name", "X"))
+        rc = eesel.cmd_agents(_parse("agents", "edit", "nope", "--name", "X"))
         assert rc == 1
         assert calls == []
 
 
-class TestAgentsDeleteCommand:
+class TestAgentsRemoveCommand:
     AGENTS = [
         {"agent_id": "agent-abc123", "name": "Support Bot"},
         {"agent_id": "agent-def456", "name": "Blog Writer"},
         {"agent_id": "agent-def789", "name": "Blog Writer"},
     ]
 
-    def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
+    def test_yes_flag_skips_prompt_and_removes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--yes"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
 
-    def test_affirmative_confirmation_deletes(self, tmp_config, fake_creds, monkeypatch):
+    def test_affirmative_confirmation_removes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
 
@@ -1253,54 +1277,29 @@ class TestAgentsDeleteCommand:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-abc123"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123"))
         assert rc == 1
         assert calls == []
 
-    def test_deleting_active_agent_clears_pointer(self, tmp_config, fake_creds, monkeypatch):
-        # fake_creds stores agent-test-456 as active; delete it and confirm the
+    def test_removing_active_agent_clears_pointer(self, tmp_config, fake_creds, monkeypatch):
+        # fake_creds stores agent-test-456 as active; remove it and confirm the
         # stored pointer is cleared.
         agents = [{"agent_id": "agent-test-456", "name": "Active One"}]
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
         _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "delete", "agent-test-456", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-test-456", "--yes"))
         assert rc == 0
         assert eesel.load_creds().get("agent_id") is None
 
     def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch, response={})
-        rc = eesel.cmd_agents(_parse("agents", "delete", "Blog Writer", "--yes"))
+        rc = eesel.cmd_agents(_parse("agents", "remove", "Blog Writer", "--yes"))
         assert rc == 1
         assert calls == []
 
 
-class TestAgentsEditCommand:
-    AGENTS = [
-        {"agent_id": "agent-abc123", "name": "Support Bot"},
-    ]
-
-    def test_edit_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
-        assert rc == 0
-        assert calls[0]["method"] == "PUT"
-        assert calls[0]["url"].endswith("/agents/agent-abc123")
-        assert calls[0]["body"] == {"name": "Renamed"}
-
-    def test_update_alias_still_works(self, tmp_config, fake_creds, monkeypatch):
-        # `update` was the original name before the rename to `edit`; it is kept
-        # as a hidden alias so existing scripts keep working.
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "update", "agent-abc123", "--name", "Renamed"))
-        assert rc == 0
-        assert calls[0]["method"] == "PUT"
-        assert calls[0]["body"] == {"name": "Renamed"}
-
-
-class TestAgentsGetCommand:
+class TestAgentsShowCommand:
     AGENTS = [
         {
             "agent_id": "agent-abc123",
@@ -1317,7 +1316,7 @@ class TestAgentsGetCommand:
     def test_prints_detail_from_listing_without_extra_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "get", "agent-abc123"))
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123"))
         assert rc == 0
         assert calls == []  # the listing already carries every field
         out = capsys.readouterr().out
@@ -1329,13 +1328,13 @@ class TestAgentsGetCommand:
     def test_json_outputs_raw_record(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "get", "agent-abc123", "--json"))
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123", "--json"))
         assert rc == 0
         assert json.loads(capsys.readouterr().out)["agent_id"] == "agent-abc123"
 
     def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        rc = eesel.cmd_agents(_parse("agents", "get", "Blog Writer"))
+        rc = eesel.cmd_agents(_parse("agents", "show", "Blog Writer"))
         assert rc == 1
 
 
@@ -1348,24 +1347,31 @@ def _agents_subparsers():
 
 class TestAgentsVerbNaming:
     """The agents subcommands follow the CLI's canonical verb set
-    (list/show/create/set/remove). The previous spellings (get/edit/update/
-    delete) keep working as hidden aliases so existing scripts don't break."""
+    (list/show/create/edit/remove). The old REST-shaped spellings
+    (get/update/delete) and the alternate `set` are removed outright — this is an
+    unreleased command surface, so there are no back-compat aliases for them."""
 
     AGENTS = [{"agent_id": "agent-abc123", "name": "Support Bot"}]
 
     def test_canonical_verbs_visible_in_help(self):
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
-        for verb in ("list", "show", "create", "set", "remove"):
+        for verb in ("list", "show", "create", "edit", "remove"):
             assert verb in visible
 
-    def test_deprecated_verbs_hidden_from_help(self):
+    def test_use_and_unset_hidden_from_help(self):
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
         metavar = _agents_subparsers().metavar or ""
-        for verb in ("use", "unset", "get", "edit", "update", "delete"):
+        for verb in ("use", "unset"):
             assert verb not in visible
             assert verb not in metavar
 
-    def test_show_routes_like_get(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_removed_verbs_are_not_accepted(self):
+        # The old spellings no longer exist as subcommands at all.
+        for verb in ("get", "update", "delete", "set"):
+            with pytest.raises(SystemExit):
+                _parse("agents", verb, "agent-abc123")
+
+    def test_show_renders_detail(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
         rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123"))
@@ -1373,29 +1379,21 @@ class TestAgentsVerbNaming:
         assert calls == []  # detail comes from the listing, no extra request
         assert "Support Bot" in capsys.readouterr().out
 
-    def test_set_routes_like_edit(self, tmp_config, fake_creds, monkeypatch):
+    def test_edit_updates_fields(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "set", "agent-abc123", "--name", "Renamed"))
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
         assert rc == 0
         assert calls[0]["method"] == "PUT"
         assert calls[0]["body"] == {"name": "Renamed"}
 
-    def test_remove_routes_like_delete(self, tmp_config, fake_creds, monkeypatch):
+    def test_remove_deletes(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
         rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--yes"))
         assert rc == 0
         assert calls[0]["method"] == "DELETE"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
-
-    def test_deprecated_aliases_still_dispatch(self, tmp_config, fake_creds, monkeypatch):
-        # get/edit/update/delete are hidden from help but must still parse and
-        # route to the same handlers as their canonical replacements.
-        for verb in ("get", "edit", "update", "delete"):
-            args = _parse("agents", verb, "agent-abc123")
-            assert args.agents_cmd == verb
-            assert args.func is eesel.cmd_agents
 
 
 class TestAgentEnvOverride:

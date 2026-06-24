@@ -987,7 +987,7 @@ def resolve_agent(agents: list[dict], target: str) -> dict | None:
 def resolve_agent_strict(agents: list[dict], target: str) -> tuple[dict | None, list[dict]]:
     """Resolve `target` to exactly one agent. Returns (agent, []) on a unique
     match, (None, candidates) when more than one matches, and (None, []) when
-    none do. Used by update/publish/delete, which must not act on an arbitrary
+    none do. Used by edit/remove, which must not act on an arbitrary
     first match when a prefix or name is ambiguous."""
     matches = match_agents(agents, target)
     if len(matches) == 1:
@@ -1443,13 +1443,22 @@ def cmd_agents(args) -> int:
     sub = args.agents_cmd or "list"
     if sub == "list":
         agents = fetch_agents(creds)
+        if getattr(args, "json", False):
+            print(json.dumps(agents, indent=2))
+            return 0
         if not agents:
             info("(no agents)")
             return 0
         active = creds.get("agent_id")
         for a in agents:
             mark = "*" if a.get("agent_id") == active else " "
-            print(f" {mark} {a.get('agent_id', '?')[:12]}  {a.get('name', '?')}" + (f"  [{a.get('agent_type')}]" if a.get("agent_type") else ""))
+            # Status is a column, not a filter: every agent is listed, each with
+            # its live/off state shown inline.
+            status = "[on] " if a.get("is_active") else "[off]"
+            print(
+                f" {mark} {a.get('agent_id', '?')[:12]}  {status}  {a.get('name', '?')}"
+                + (f"  [{a.get('agent_type')}]" if a.get("agent_type") else "")
+            )
         return 0
     if sub == "use":
         warn("`agents use` is deprecated: it stores a hidden active agent on disk. "
@@ -1492,16 +1501,13 @@ def cmd_agents(args) -> int:
         save_creds(creds)
         ok(f"Cleared active agent ({prev}). Commands that need one will prompt, or accept EESEL_AGENT / a --agent flag.")
         return 0
-    if sub in ("show", "get"):
-        # `get` is the previous name, kept as a hidden alias for `show`.
+    if sub == "show":
         return _agents_get(args, creds)
     if sub == "create":
         return _agents_create(args, creds)
-    if sub in ("set", "edit", "update"):
-        # `edit` (and the older `update`) are hidden aliases for `set`.
+    if sub == "edit":
         return _agents_update(args, creds)
-    if sub in ("remove", "delete"):
-        # `delete` is the previous name, kept as a hidden alias for `remove`.
+    if sub == "remove":
         return _agents_delete(args, creds)
     return 1
 
@@ -1543,10 +1549,10 @@ def _agents_update(args, creds: dict) -> int:
         return 1
     body = build_agent_update_body(name=args.name, instructions=args.instructions)
     if not body:
-        err("Nothing to update. Pass --name and/or --instructions.")
+        err("Nothing to change. Pass --name and/or --instructions.")
         return 1
     http_request("PUT", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"], body=body)
-    ok(f"Updated {agent.get('name')} ({agent['agent_id']}): {', '.join(body.keys())}")
+    ok(f"Edited {agent.get('name')} ({agent['agent_id']}): {', '.join(body.keys())}")
     return 0
 
 
@@ -1554,11 +1560,11 @@ def _agents_delete(args, creds: dict) -> int:
     agent = _resolve_one_agent(args.agent_id, creds)
     if not agent:
         return 1
-    if not args.yes and not confirm(f"Delete agent '{agent.get('name')}' ({agent['agent_id']})? [y/N] "):
+    if not args.yes and not confirm(f"Remove agent '{agent.get('name')}' ({agent['agent_id']})? [y/N] "):
         info("Aborted.")
         return 1
     http_request("DELETE", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"])
-    ok(f"Deleted {agent.get('name')} ({agent['agent_id']}).")
+    ok(f"Removed {agent.get('name')} ({agent['agent_id']}).")
     # If the deleted agent was the active one, drop the stored pointer so later
     # commands don't reference a dead id.
     if creds.get("agent_id") == agent["agent_id"]:
@@ -2782,7 +2788,8 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("agents", help="List, inspect, or manage agents")
     a_sub = sp.add_subparsers(dest="agents_cmd")
-    a_sub.add_parser("list", help="List agents in this workspace")
+    list_p = a_sub.add_parser("list", help="List agents in this workspace (each row shows its on/off status)")
+    list_p.add_argument("--json", action="store_true", help="Print the raw agent list as JSON")
 
     show = a_sub.add_parser("show", help="Show one agent's full detail (type, status, instructions)")
     show.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
@@ -2792,52 +2799,27 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     create.add_argument("--name", help="Agent name (required)")
     create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
 
-    set_p = a_sub.add_parser("set", help="Change an agent's name or instructions (only the flags you pass)")
-    set_p.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
-    set_p.add_argument("--name", help="New name")
-    set_p.add_argument("--instructions", help="New instructions / system prompt")
+    edit = a_sub.add_parser("edit", help="Change an agent's name or instructions (only the flags you pass)")
+    edit.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    edit.add_argument("--name", help="New name")
+    edit.add_argument("--instructions", help="New instructions / system prompt")
 
     remove = a_sub.add_parser("remove", help="Remove an agent (asks for confirmation)")
     remove.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     remove.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
-    # Deprecated / back-compat subcommands. Each still works so existing scripts
-    # and muscle memory don't break, but all are hidden from help and the usage
-    # line. Two groups:
-    #   - `use` / `unset` set or clear a persistent active agent stored on disk.
-    #     The preferred, stateless way to scope a command is now the EESEL_AGENT
-    #     environment variable or a per-command --agent flag (see
-    #     apply_agent_env_override), so a command's target is explicit rather
-    #     than depending on hidden saved state.
-    #   - `get`, `edit`/`update`, and `delete` are the previous spellings of
-    #     `show`, `set`, and `remove`; renamed to match the CLI's canonical verb
-    #     set (list/show/create/set/remove).
-    # Hiding uses the same trick as staff-only commands: help=SUPPRESS blanks the
-    # description, then the names are dropped from _choices_actions so they
-    # disappear from the subcommand list and the usage metavar.
+    # `use` / `unset` set or clear a persistent active agent stored on disk. The
+    # preferred, stateless way to scope a command is the EESEL_AGENT environment
+    # variable or a per-command --agent flag (see apply_agent_env_override), so a
+    # command's target is explicit rather than depending on hidden saved state.
+    # They stay available but are hidden from help and the usage line: help=
+    # SUPPRESS blanks the description, then the names are dropped from
+    # _choices_actions so they disappear from the subcommand list and metavar.
     use = a_sub.add_parser("use", help=argparse.SUPPRESS)
     use.add_argument("agent_id", nargs="?")
     a_sub.add_parser("unset", help=argparse.SUPPRESS)
 
-    get_p = a_sub.add_parser("get", help=argparse.SUPPRESS)
-    get_p.add_argument("agent_id")
-    get_p.add_argument("--json", action="store_true")
-
-    edit = a_sub.add_parser("edit", help=argparse.SUPPRESS)
-    edit.add_argument("agent_id")
-    edit.add_argument("--name")
-    edit.add_argument("--instructions")
-
-    update = a_sub.add_parser("update", help=argparse.SUPPRESS)
-    update.add_argument("agent_id")
-    update.add_argument("--name")
-    update.add_argument("--instructions")
-
-    delete = a_sub.add_parser("delete", help=argparse.SUPPRESS)
-    delete.add_argument("agent_id")
-    delete.add_argument("--yes", action="store_true")
-
-    _hidden_agents_cmds = {"use", "unset", "get", "edit", "update", "delete"}
+    _hidden_agents_cmds = {"use", "unset"}
     a_sub._choices_actions = [a for a in a_sub._choices_actions if a.dest not in _hidden_agents_cmds]
     a_sub.metavar = "{" + ",".join(ca.dest for ca in a_sub._choices_actions) + "}"
 
