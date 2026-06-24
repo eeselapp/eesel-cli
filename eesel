@@ -839,6 +839,16 @@ def resolve_agent(agents: list[dict], target: str) -> dict | None:
     )
 
 
+def confirm(prompt: str) -> bool:
+    """Prompt for a yes/no answer. Affirmative = `y` or `yes` (case-insensitive);
+    anything else, including a bare Enter or EOF, is treated as no."""
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def _agent_label(a: dict, active: str | None = None) -> str:
     """One-line display label for an agent, used in lists and pickers."""
     aid = a.get("agent_id", "?")
@@ -2405,6 +2415,112 @@ def cmd_document_export(args) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Skills — agent skills enable/disable + per-agent config
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def fetch_agent_skills(creds: dict, agent_id: str) -> list[dict]:
+    """List the skills enabled for one agent.
+
+    GET /agents/{agent_id}/skills defaults to ``filter=enabled`` server-side, so
+    this returns only the skills activated for the agent. The endpoint returns a
+    bare JSON array of skill dicts (id, name, description, icon, …).
+    """
+    data = http_request("GET", f"{creds['api_url']}/agents/{agent_id}/skills", token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("skills") or data.get("items") or []
+
+
+def _resolve_agent_or_error(creds: dict, target: str) -> dict | None:
+    """Resolve `target` to one agent, or print why it couldn't and return None.
+
+    Matches by exact id, id-prefix, then exact name (see `resolve_agent`).
+    """
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return None
+    agent = resolve_agent(agents, target)
+    if not agent:
+        err(f"No agent matches '{target}'.")
+        return None
+    return agent
+
+
+def cmd_skills(args) -> int:
+    """Manage the skills enabled for an agent.
+
+    `list` shows the agent's enabled skills; `enable`/`disable` activate or
+    deactivate a skill by id; `edit` replaces a skill's per-agent config with a
+    JSON object. Every subcommand resolves its `<agent>` argument by exact id,
+    id-prefix, or name.
+    """
+    creds = require_creds()
+    sub = args.skills_cmd
+    if sub is None:
+        err("Specify a skills subcommand: list, enable, disable, or edit.")
+        return 1
+
+    agent = _resolve_agent_or_error(creds, args.agent)
+    if not agent:
+        return 1
+    agent_id = agent["agent_id"]
+
+    if sub == "list":
+        skills = fetch_agent_skills(creds, agent_id)
+        if getattr(args, "json", False):
+            print(json.dumps(skills, indent=2))
+            return 0
+        if not skills:
+            info(f"(no skills enabled for {agent.get('name', agent_id)})")
+            info("Enable one with: eesel skills enable <agent> <skill_id>")
+            return 0
+        for s in skills:
+            sid = s.get("id") or "?"
+            name = s.get("name") or sid
+            desc = (s.get("description") or "").replace("\n", " ")
+            if len(desc) > 60:
+                desc = desc[:60] + "…"
+            print(f" {sid:<28}  {name:<24}  {desc}")
+        return 0
+
+    if sub == "enable":
+        url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}"
+        http_request("POST", url, token=creds["token"], body={})
+        ok(f"Enabled skill '{args.skill_id}' for {agent.get('name')} ({agent_id}).")
+        info(f"Confirm with: eesel skills list {args.agent}")
+        return 0
+
+    if sub == "disable":
+        if not args.yes and not confirm(
+            f"Disable skill '{args.skill_id}' for {agent.get('name')} ({agent_id})? [y/N] "
+        ):
+            info("Aborted.")
+            return 1
+        url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}"
+        http_request("DELETE", url, token=creds["token"])
+        ok(f"Disabled skill '{args.skill_id}' for {agent.get('name')} ({agent_id}).")
+        return 0
+
+    if sub == "edit":
+        try:
+            config = json.loads(args.config)
+        except json.JSONDecodeError as e:
+            err(f"--config is not valid JSON: {e}")
+            return 1
+        if not isinstance(config, dict):
+            err("--config must be a JSON object (e.g. '{\"key\": \"value\"}').")
+            return 1
+        url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
+        http_request("PUT", url, token=creds["token"], body=config)
+        ok(f"Updated config for skill '{args.skill_id}' on {agent.get('name')} ({agent_id}).")
+        return 0
+
+    return 1
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Argument parsing
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2543,6 +2659,24 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     fire = t_sub.add_parser("fire", help="Manually fire a scheduled trigger")
     fire.add_argument("trigger_id", help="Full id, id prefix, or substring of the trigger title (e.g. 'heartbeat')")
     sp.set_defaults(func=cmd_triggers)
+
+    sp = sub.add_parser("skills", help="List, enable, disable, or configure an agent's skills")
+    sk_sub = sp.add_subparsers(dest="skills_cmd")
+    sk_ls = sk_sub.add_parser("list", help="List the skills enabled for an agent")
+    sk_ls.add_argument("agent", help="Agent id, id-prefix, or name")
+    sk_ls.add_argument("--json", action="store_true", help="Emit the raw skills payload")
+    sk_en = sk_sub.add_parser("enable", help="Enable a skill for an agent")
+    sk_en.add_argument("agent", help="Agent id, id-prefix, or name")
+    sk_en.add_argument("skill_id", help="Skill id to enable")
+    sk_dis = sk_sub.add_parser("disable", help="Disable a skill for an agent (asks for confirmation)")
+    sk_dis.add_argument("agent", help="Agent id, id-prefix, or name")
+    sk_dis.add_argument("skill_id", help="Skill id to disable")
+    sk_dis.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    sk_ed = sk_sub.add_parser("edit", help="Replace a skill's per-agent config with a JSON object")
+    sk_ed.add_argument("agent", help="Agent id, id-prefix, or name")
+    sk_ed.add_argument("skill_id", help="Skill id to configure")
+    sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
+    sp.set_defaults(func=cmd_skills)
 
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
