@@ -1111,6 +1111,16 @@ def confirm(prompt: str) -> bool:
     return answer in ("y", "yes")
 
 
+def confirm(prompt: str) -> bool:
+    """Prompt for a yes/no answer. Affirmative = `y` or `yes` (case-insensitive);
+    anything else, including a bare Enter or EOF, is treated as no."""
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def _agent_label(a: dict, active: str | None = None) -> str:
     """One-line display label for an agent, used in lists and pickers."""
     aid = a.get("agent_id", "?")
@@ -2453,29 +2463,57 @@ def _integrations_remove(args, creds: dict) -> int:
     return 0
 
 
+def _resolve_tools_agent(creds: dict, target: str | None) -> dict | None:
+    """Resolve the agent a `tools` subcommand acts on, printing the error itself.
+
+    With an explicit `target` (id / id-prefix / name) it must match an agent;
+    without one it falls back to the stored active agent. Returns the agent
+    dict, or None after emitting an `err(...)` so the caller can `return 1`.
+    """
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return None
+    if target:
+        agent = resolve_agent(agents, target)
+        if not agent:
+            err(f"No agent matches '{target}'.")
+            return None
+        return agent
+    agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
+    if not agent:
+        err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
+        return None
+    return agent
+
+
 def cmd_tools(args) -> int:
+    """Manage an agent's tools/actions: list (default), enable, edit, disable.
+
+    `enable` and `edit` both POST to /agents/{id}/tools/{tool_key} — the server
+    creates the tool row on first write, so enabling is just writing an empty
+    config and editing is writing a non-empty one. `disable` DELETEs the row.
+    """
+    creds = require_creds()
+    sub = getattr(args, "tools_cmd", None) or "list"
+    if sub == "enable":
+        return _tools_enable(args, creds)
+    if sub == "edit":
+        return _tools_edit(args, creds)
+    if sub == "disable":
+        return _tools_disable(args, creds)
+    return _tools_list(args, creds)
+
+
+def _tools_list(args, creds: dict) -> int:
     """List an agent's tools/actions (read-only).
 
     Defaults to the active agent; pass an id / id-prefix / name to inspect a
     different one. Columns: name, read/write, permission mode, integration.
     """
-    creds = require_creds()
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
+    agent = _resolve_tools_agent(creds, getattr(args, "agent", None))
+    if not agent:
         return 1
-
-    target = getattr(args, "agent", None)
-    if target:
-        agent = resolve_agent(agents, target)
-        if not agent:
-            err(f"No agent matches '{target}'.")
-            return 1
-    else:
-        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
-        if not agent:
-            err("No agent selected. Pass an agent id/name, set EESEL_AGENT, or use a --agent flag.")
-            return 1
 
     agent_id = agent["agent_id"]
     tools = fetch_tools(creds, agent_id)
@@ -2492,6 +2530,105 @@ def cmd_tools(args) -> int:
     info(fmt.format("name", "r/w", "permission", "integration", "integration_id"))
     for r in rows:
         print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_key"][:16], r["integration_id"][:12]))
+    return 0
+
+
+def parse_tool_config(raw: str) -> dict:
+    """Parse the `--config` JSON string into the dict the server stores.
+
+    The value must be a JSON object (e.g. permission settings like
+    `{"permission_mode": "ask"}`). Raises ValueError on malformed JSON or a
+    non-object top level so the caller can surface a clear error.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"--config is not valid JSON: {e}")
+    if not isinstance(parsed, dict):
+        raise ValueError("--config must be a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
+    return parsed
+
+
+def _configure_tool(creds: dict, agent_id: str, tool_key: str, config: dict, integration_id: str | None) -> dict:
+    """POST /agents/{agent_id}/tools/{tool_key} with the {config} body.
+
+    This single endpoint backs both `enable` (empty config) and `edit`
+    (caller-supplied config): the server creates the tool row on first write,
+    so writing config is what enables the tool for the agent. `integration_id`
+    scopes the write to one connected instance when the same tool_key is shared
+    by several (e.g. two Shopify stores); it's sent in the body when given.
+    """
+    body: dict = {"config": config}
+    if integration_id:
+        body["integration_id"] = integration_id
+    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(tool_key, safe='')}"
+    return http_request("POST", url, token=creds["token"], body=body)
+
+
+def _tools_enable(args, creds: dict) -> int:
+    """Enable a tool for an agent by writing an empty config.
+
+    Enabling and editing hit the same POST endpoint; enabling just sends no
+    settings, leaving the tool at its default permission mode. Use `eesel tools
+    edit` to also set settings (e.g. a human-in-the-loop permission mode).
+    """
+    agent = _resolve_tools_agent(creds, args.agent)
+    if not agent:
+        return 1
+    agent_id = agent["agent_id"]
+    integration_id = getattr(args, "integration", None)
+    _configure_tool(creds, agent_id, args.tool_key, {}, integration_id)
+    ok(f"Enabled '{args.tool_key}' for {agent.get('name', agent_id)}.")
+    info("Set its permission/settings with `eesel tools edit`.")
+    return 0
+
+
+def _tools_edit(args, creds: dict) -> int:
+    """Configure a tool's settings (e.g. permission mode) via its config object.
+
+    Writes the given JSON config to the tool. The same POST also enables the
+    tool if it wasn't already, so editing a not-yet-enabled tool turns it on
+    with these settings in one step.
+    """
+    agent = _resolve_tools_agent(creds, args.agent)
+    if not agent:
+        return 1
+    try:
+        config = parse_tool_config(args.config)
+    except ValueError as e:
+        err(str(e))
+        return 1
+    agent_id = agent["agent_id"]
+    integration_id = getattr(args, "integration", None)
+    result = _configure_tool(creds, agent_id, args.tool_key, config, integration_id)
+    ok(f"Updated '{args.tool_key}' for {agent.get('name', agent_id)}.")
+    saved = result.get("config") if isinstance(result, dict) else None
+    if saved is not None:
+        info(f"  config: {json.dumps(_redact_secrets(saved))}")
+    return 0
+
+
+def _tools_disable(args, creds: dict) -> int:
+    """Disable a tool for an agent by deleting its tool row.
+
+    DELETE /agents/{agent_id}/tools/{tool_key} removes the agent's configuration
+    for the tool. `integration_id`, when given, scopes the delete to one
+    connected instance (passed as a query param, mirroring the server). Gated
+    behind a confirmation prompt unless `-y/--yes` is passed.
+    """
+    agent = _resolve_tools_agent(creds, args.agent)
+    if not agent:
+        return 1
+    agent_id = agent["agent_id"]
+    if not args.yes and not confirm(f"Disable '{args.tool_key}' for {agent.get('name', agent_id)}? [y/N] "):
+        info("Aborted.")
+        return 1
+    integration_id = getattr(args, "integration", None)
+    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(args.tool_key, safe='')}"
+    if integration_id:
+        url += f"?{urllib.parse.urlencode({'integration_id': integration_id})}"
+    http_request("DELETE", url, token=creds["token"])
+    ok(f"Disabled '{args.tool_key}' for {agent.get('name', agent_id)}.")
     return 0
 
 
@@ -4727,10 +4864,37 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_rm.add_argument("--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     sp.set_defaults(func=cmd_integrations)
 
-    sp = sub.add_parser("tools", help="List an agent's tools/actions (read-only)")
-    sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
-    sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
-    sp.set_defaults(func=cmd_tools)
+    sp = sub.add_parser("tools", help="List, enable, edit, or disable an agent's tools/actions")
+    # Bare `eesel tools [<agent>]` keeps the original read-only listing. main()
+    # rewrites such argv to an explicit `list` subcommand before parsing (so the
+    # optional agent positional can't be mistaken for a subcommand name), which
+    # is why the parent itself carries no positional.
+    tl_sub = sp.add_subparsers(dest="tools_cmd")
+
+    tl_ls = tl_sub.add_parser("list", help="List the agent's tools/actions (read-only)")
+    tl_ls.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    tl_ls.add_argument("--json", action="store_true", help="Emit the raw tools payload")
+
+    # enable and edit both POST /agents/{id}/tools/{tool_key}; enable sends an
+    # empty config (tool at its default settings), edit sends the given config.
+    tl_en = tl_sub.add_parser("enable", help="Enable a tool for the agent (POST with empty config)")
+    tl_en.add_argument("agent", help="Agent id, id-prefix, or name")
+    tl_en.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
+    tl_en.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
+
+    tl_ed = tl_sub.add_parser("edit", help="Configure a tool's settings, e.g. permission mode (POST with config)")
+    tl_ed.add_argument("agent", help="Agent id, id-prefix, or name")
+    tl_ed.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
+    tl_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
+    tl_ed.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
+
+    tl_di = tl_sub.add_parser("disable", help="Disable a tool for the agent (DELETE; asks for confirmation)")
+    tl_di.add_argument("agent", help="Agent id, id-prefix, or name")
+    tl_di.add_argument("tool_key", help="The tool's key (e.g. 'zendesk_leave_internal_note')")
+    tl_di.add_argument("--integration", help="Integration instance id, to scope a tool shared by several connected instances")
+    tl_di.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+
+    sp.set_defaults(func=cmd_tools, tools_cmd="list", agent=None, json=False, yes=False)
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
@@ -4939,6 +5103,32 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     return p
 
 
+_TOOLS_SUBCOMMANDS = ("list", "enable", "edit", "disable")
+
+
+def _normalize_tools_argv(argv: list[str]) -> list[str]:
+    """Insert an explicit `list` after `tools` when no subcommand follows.
+
+    Keeps the original `eesel tools [<agent>] [--json]` working now that `tools`
+    uses subcommands: if the first non-flag token after `tools` isn't one of the
+    subcommand names, it's an agent id/name (or there's nothing), so the call is
+    a list and we rewrite it to `tools list ...`.
+    """
+    try:
+        i = argv.index("tools")
+    except ValueError:
+        return argv
+    rest = argv[i + 1:]
+    # Let `eesel tools --help/-h` reach the parent parser so its help lists the
+    # subcommands, rather than being rewritten into `tools list --help`.
+    if rest and rest[0] in ("-h", "--help"):
+        return argv
+    first_positional = next((tok for tok in rest if not tok.startswith("-")), None)
+    if first_positional in _TOOLS_SUBCOMMANDS:
+        return argv
+    return argv[: i + 1] + ["list"] + rest
+
+
 def main(argv: list[str] | None = None) -> int:
     # Surface staff-only commands only for global impersonators. Read from the
     # cached creds flag (populated at login / refreshed by `whoami`) so this
@@ -4946,6 +5136,9 @@ def main(argv: list[str] | None = None) -> int:
     creds = load_creds()
     staff = bool(creds and creds.get("is_impersonator"))
     parser = build_parser(staff)
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = _normalize_tools_argv(argv)
     args = parser.parse_args(argv)
     return args.func(args)
 
