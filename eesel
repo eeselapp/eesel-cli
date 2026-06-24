@@ -42,6 +42,8 @@ API surface used:
                                        (eesel schedules fire)
   POST /workspace/tasks              list/count workspace tasks (agent activity)
   GET  /workspace/tasks/{id}/history full transcript of one task, grouped by run
+  POST /workspace/tasks/analytics    aggregated task analytics (resolution, CSAT)
+  POST /tasks/export                 start a CSV export of tasks (link emailed)
 """
 
 from __future__ import annotations
@@ -2522,6 +2524,52 @@ def count_tasks(creds: dict, *, agent_id: str | None = None) -> int:
     return int(data.get("totalCount") or 0)
 
 
+def fetch_task_analytics(
+    creds: dict, *, start_date: str | None = None, end_date: str | None = None, agent_id: str | None = None
+) -> dict:
+    """Aggregate analytics for the workspace's tasks over an optional date range.
+
+    Returns the raw analytics payload: total_tasks, resolution_counts
+    (resolved / escalated / pending), csat_distribution, tasks_by_agent,
+    tasks_by_channel, and time-series breakdowns. ``start_date`` / ``end_date``
+    are ISO date strings (``YYYY-MM-DD``); omitting both yields all-time totals.
+    ``agent_id`` scopes the numbers to a single agent.
+
+    Uses the workspace-authenticated endpoint, which takes the same auth as the
+    rest of the tasks commands.
+    """
+    body: dict = {}
+    if start_date:
+        body["start_date"] = start_date
+    if end_date:
+        body["end_date"] = end_date
+    if agent_id:
+        body["agent_ids"] = [agent_id]
+    return http_request("POST", f"{creds['api_url']}/workspace/tasks/analytics", token=creds["token"], body=body)
+
+
+def export_tasks(
+    creds: dict, *, start_date: str | None = None, end_date: str | None = None, agent_id: str | None = None
+) -> dict:
+    """Kick off a server-side CSV export of tasks; the link is emailed when ready.
+
+    The date range and agent filter are passed as query parameters (the server
+    reads them from the query string, not the JSON body). Returns the server's
+    response (``{"message": "Export started"}`` with a 202 status). The export
+    runs in the background on the server and emails a download link to the
+    workspace owner, so there is no inline file to return.
+    """
+    params: dict = {}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    if agent_id:
+        params["agent_id"] = agent_id
+    qs = f"?{urllib.parse.urlencode(params)}" if params else ""
+    return http_request("POST", f"{creds['api_url']}/tasks/export{qs}", token=creds["token"], body={"filters": {}})
+
+
 def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
     """Return one task's history as a list of runs: ``[{run_id, items:[...]}]``."""
     data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=workspace_token(creds))
@@ -2643,9 +2691,86 @@ def _print_task_cost(creds: dict, task_id: str, name: str | None = None) -> None
     print(format_cost_full(d, synthetic, label="task"))
 
 
+def render_task_analytics(data: dict) -> None:
+    """Print a human summary of the analytics payload: totals, resolution rate,
+    CSAT, and the per-agent / per-channel breakdowns."""
+    total = int(data.get("total_tasks") or 0)
+    print(f"total tasks: {total}")
+    if total == 0:
+        info("(no tasks in range)")
+        return
+
+    res = data.get("resolution_counts") or {}
+    resolved = int(res.get("resolved") or 0)
+    escalated = int(res.get("escalated") or 0)
+    pending = int(res.get("pending") or 0)
+    decided = resolved + escalated  # tasks with a known outcome
+    if decided:
+        rate = 100.0 * resolved / decided
+        print(f"resolution rate: {rate:.1f}%  (resolved {resolved} / escalated {escalated} / pending {pending})")
+    else:
+        print(f"resolution: resolved {resolved} / escalated {escalated} / pending {pending}")
+
+    csat = data.get("csat_distribution") or {}
+    if any(csat.values()):
+        parts = ", ".join(f"{k} {v}" for k, v in csat.items())
+        print(f"csat: {parts}")
+
+    by_agent = data.get("tasks_by_agent") or {}
+    if by_agent:
+        print("by agent:")
+        for entry in sorted(by_agent.values(), key=lambda e: e.get("count") or 0, reverse=True):
+            print(f"  {entry.get('count') or 0:>6}  {entry.get('name') or '?'}")
+
+    by_channel = data.get("tasks_by_channel") or {}
+    if by_channel:
+        print("by channel:")
+        for name, count in sorted(by_channel.items(), key=lambda kv: kv[1] or 0, reverse=True):
+            print(f"  {count or 0:>6}  {name}")
+
+
 def cmd_tasks(args) -> int:
     creds = require_creds()
     sub = getattr(args, "tasks_cmd", None) or "list"
+
+    if sub == "analytics":
+        agent_id = None
+        if getattr(args, "agent", None):
+            agent_id = resolve_agent_filter(creds, args.agent)
+            if not agent_id:
+                return 1
+        data = fetch_task_analytics(
+            creds,
+            start_date=getattr(args, "start_date", None),
+            end_date=getattr(args, "end_date", None),
+            agent_id=agent_id,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+            return 0
+        render_task_analytics(data)
+        return 0
+
+    if sub == "export":
+        agent_id = None
+        if getattr(args, "agent", None):
+            agent_id = resolve_agent_filter(creds, args.agent)
+            if not agent_id:
+                return 1
+        data = export_tasks(
+            creds,
+            start_date=getattr(args, "start_date", None),
+            end_date=getattr(args, "end_date", None),
+            agent_id=agent_id,
+        )
+        ok(data.get("message") or "Export started")
+        # The server builds the CSV in the background and emails a download link
+        # to the workspace owner — there is no inline file or URL to print here.
+        for key in ("url", "download_url", "reference", "job_id"):
+            if data.get(key):
+                print(f"{key}: {data[key]}")
+        info("A download link will be emailed to the workspace owner when the export is ready.")
+        return 0
 
     if sub == "count":
         agent_id = None
@@ -3763,6 +3888,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_sh.add_argument("--cost", action="store_true", help="Append a cost + token breakdown (dev mode only)")
     tk_co = tk_sub.add_parser("cost", help="Print cost + token usage for one task (includes sub-agents). Dev mode only.")
     tk_co.add_argument("task_id", help="Full task id or id-prefix")
+    tk_an = tk_sub.add_parser("analytics", help="Print aggregated task analytics (resolution rate, counts, CSAT)")
+    tk_an.add_argument("--agent", help="Scope analytics to one agent (full id, id-prefix, or name)")
+    tk_an.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: all time)")
+    tk_an.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
+    tk_an.add_argument("--json", action="store_true", help="Emit the raw analytics payload instead of a summary")
+    tk_ex = tk_sub.add_parser("export", help="Start a CSV export of tasks (download link is emailed when ready)")
+    tk_ex.add_argument("--agent", help="Export only one agent's tasks (full id, id-prefix, or name)")
+    tk_ex.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: last 7 days)")
+    tk_ex.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
     sp.set_defaults(func=cmd_tasks, tasks_cmd="list", limit=50, page=1, agent=None)
 
     # `documents` is the canonical (plural) noun. Singular `document` is kept as
