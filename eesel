@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import difflib
 import hashlib
 import hmac
 import http.server
@@ -2071,14 +2072,20 @@ def render_history_item(item: dict, *, full: bool = False) -> None:
             print(_color(f"[{typ}] {item['content']}", "2;37"))
 
 
-def _print_task_cost(creds: dict, task_id: str, name: str | None = None) -> None:
+def _print_task_cost(creds: dict, task_id: str, name: str | None = None, *, as_json: bool = False) -> None:
     # fetch_session_cost only needs a dict carrying `task_id` (+ id/name for the
     # header), so a synthetic session-like dict lets us reuse the exact same
     # cost path — including the recursive sub-agent task-tree breakdown.
     synthetic = {"id": task_id[:12], "name": name, "task_id": task_id}
     d = fetch_session_cost(creds, synthetic)
     if d is None:
-        info("cost data is dev-only right now — see /activity in the dashboard for prod")
+        if as_json:
+            print(json.dumps({"task_id": task_id, "cost": None}, indent=2))
+        else:
+            info("cost data is dev-only right now — see /activity in the dashboard for prod")
+        return
+    if as_json:
+        print(json.dumps(d, indent=2))
         return
     print(format_cost_full(d, synthetic, label="task"))
 
@@ -2171,6 +2178,9 @@ def cmd_tasks(args) -> int:
             if not agent_id:
                 return 1
         n = count_tasks(creds, agent_id=agent_id)
+        if getattr(args, "json", False):
+            print(json.dumps({"count": n, "agent_id": agent_id}, indent=2))
+            return 0
         suffix = " for this agent" if agent_id else ""
         print(f"{n} task{'s' if n != 1 else ''}{suffix}")
         return 0
@@ -2182,6 +2192,9 @@ def cmd_tasks(args) -> int:
             if not agent_id:
                 return 1
         rows, has_next, next_page = fetch_tasks(creds, limit=args.limit, page=args.page, agent_id=agent_id)
+        if getattr(args, "json", False):
+            print(json.dumps({"tasks": rows, "has_next": has_next, "next_page": next_page}, indent=2))
+            return 0
         if not rows:
             info("(no tasks)")
             return 0
@@ -2221,9 +2234,10 @@ def cmd_tasks(args) -> int:
         if not task_id:
             return 1
         row = find_task_row(creds, task_id)
-        _print_task_cost(creds, task_id, name=row.get("name") if row else None)
+        _print_task_cost(creds, task_id, name=row.get("name") if row else None, as_json=getattr(args, "json", False))
         return 0
 
+    err(f"Unknown tasks subcommand: {sub!r}. Try one of: list, show, count, cost, analytics, export.")
     return 1
 
 
@@ -2534,6 +2548,27 @@ def cmd_document_export(args) -> int:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _suggest_subcommand(parser: argparse.ArgumentParser, choices: list[str]) -> None:
+    """Make an unknown subcommand on ``parser`` suggest the closest valid one.
+
+    By default argparse fails an unknown subcommand with a bare "invalid choice".
+    This replaces the parser's error handler so that, when the failure is about
+    an unrecognized subcommand, it appends a "did you mean X?" hint pointing at
+    the nearest match. All other parse errors fall through to the default.
+    """
+    original_error = parser.error
+
+    def error(message: str) -> None:
+        if "invalid choice" in message:
+            bad = message.split("invalid choice: ", 1)[1].split(" ", 1)[0].strip("'\"")
+            near = difflib.get_close_matches(bad, choices, n=1)
+            hint = f" Did you mean {near[0]!r}?" if near else f" Choose from: {', '.join(choices)}."
+            message = message + hint
+        original_error(message)
+
+    parser.error = error  # type: ignore[method-assign]
+
+
 def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     """Build the CLI parser.
 
@@ -2616,8 +2651,10 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_ls.add_argument("--limit", type=int, default=50, help="Tasks per page")
     tk_ls.add_argument("--page", type=int, default=1, help="Page number (1-based)")
     tk_ls.add_argument("--agent", help="Filter to one agent (full id, id-prefix, or name)")
+    tk_ls.add_argument("--json", action="store_true", help="Emit the raw task rows as JSON instead of a table")
     tk_ct = tk_sub.add_parser("count", help="Print the total number of tasks")
     tk_ct.add_argument("--agent", help="Count only one agent's tasks (full id, id-prefix, or name)")
+    tk_ct.add_argument("--json", action="store_true", help="Emit the count as JSON instead of a sentence")
     tk_sh = tk_sub.add_parser("show", help="Print one task's full transcript")
     tk_sh.add_argument("task_id", help="Full task id or id-prefix")
     tk_sh.add_argument("--json", action="store_true", help="Emit the raw history payload instead of a rendered transcript")
@@ -2625,6 +2662,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_sh.add_argument("--cost", action="store_true", help="Append a cost + token breakdown (dev mode only)")
     tk_co = tk_sub.add_parser("cost", help="Print cost + token usage for one task (includes sub-agents). Dev mode only.")
     tk_co.add_argument("task_id", help="Full task id or id-prefix")
+    tk_co.add_argument("--json", action="store_true", help="Emit the raw cost breakdown as JSON instead of a summary")
     tk_an = tk_sub.add_parser("analytics", help="Print aggregated task analytics (resolution rate, counts, CSAT)")
     tk_an.add_argument("--agent", help="Scope analytics to one agent (full id, id-prefix, or name)")
     tk_an.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: all time)")
@@ -2635,6 +2673,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_ex.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: last 7 days)")
     tk_ex.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
     sp.set_defaults(func=cmd_tasks, tasks_cmd="list", limit=50, page=1, agent=None)
+    _suggest_subcommand(sp, ["list", "count", "show", "cost", "analytics", "export"])
 
     sp = sub.add_parser("document", help="List, read, or export documents")
     d_sub = sp.add_subparsers(dest="document_cmd")

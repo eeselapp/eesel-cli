@@ -1161,6 +1161,23 @@ class TestArgParser:
         assert args.start_date == "2026-05-01"
         assert args.func is eesel.cmd_tasks
 
+    def test_tasks_read_commands_accept_json(self):
+        # Every read command must expose --json for scripts and agent self-QA.
+        parser = eesel.build_parser()
+        for sub in ("list", "count", "analytics", "show", "cost"):
+            argv = ["tasks", sub]
+            if sub in ("show", "cost"):
+                argv.append("284a6a43-afa7-43f3-88e6-25d1a92cf7d7")
+            argv.append("--json")
+            args = parser.parse_args(argv)
+            assert args.json is True, sub
+
+    def test_tasks_unknown_subcommand_suggests_closest(self, capsys):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["tasks", "lst"])
+        assert "Did you mean 'list'?" in capsys.readouterr().err
+
     def test_instructions_subcommand_parses(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["instructions"])
@@ -1628,6 +1645,34 @@ class TestTasksList:
         assert seen["filters"] == {"agent": ["agent-test-456"]}
         assert "for this agent" in capsys.readouterr().out
 
+    def test_list_json_emits_raw_rows(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"tasks": [_make_task("7f3a9c21-1234-0000-0000-000000000000")], "hasNextPage": True, "nextPage": 2},
+        )
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["tasks"][0]["task_id"] == "7f3a9c21-1234-0000-0000-000000000000"
+        assert payload["has_next"] is True
+        assert payload["next_page"] == 2
+
+    def test_list_json_empty_is_valid_json(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "hasNextPage": False})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["tasks"] == []
+
+    def test_count_json_emits_count(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "totalCount": 7})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="count", agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["count"] == 7
+        assert payload["agent_id"] is None
+
 
 class TestTasksShow:
     HISTORY = {
@@ -1697,6 +1742,15 @@ class TestTasksShow:
         rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7"))
         assert rc == 0
         assert "dev-only" in capsys.readouterr().err
+
+    def test_cost_json_emits_breakdown(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: "284a6a43-afa7-43f3-88e6-25d1a92cf7d7||refund chat|0.5|10000|500|0|0|3")
+        rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["total_cost"] == 0.5
+        assert len(payload["by_task"]) == 1
 
 
 _ANALYTICS = {
