@@ -1940,43 +1940,32 @@ class TestArgParser:
         with pytest.raises(SystemExit):
             parser.parse_args(["triggers", "add", "Support Bot"])  # missing --key
 
-    def test_triggers_remove_parses_yes_flag(self):
+    def test_triggers_show_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "remove", "trg-1", "-y"])
+        args = parser.parse_args(["triggers", "show", "trg-1"])
+        assert args.triggers_cmd == "show"
+        assert args.trigger_id == "trg-1"
+        assert args.func is eesel.cmd_triggers
+
+    def test_triggers_remove_parses_force_flag(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "remove", "trg-1", "--force"])
         assert args.triggers_cmd == "remove"
         assert args.trigger_id == "trg-1"
-        assert args.yes is True
+        assert args.force is True
 
-    def test_triggers_fire_alias_still_parses(self):
-        # `fire` on triggers is a deprecated alias that forwards to
-        # `eesel schedules fire`; it must still parse for old scripts.
+    def test_triggers_removed_verbs_no_longer_parse(self):
+        # The REST-derived verbs (`create`/`delete`) and the misplaced `fire`/`run`
+        # were renamed outright to the canonical set — they must not parse.
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "fire", "heartbeat"])
-        assert args.triggers_cmd == "fire"
-        assert args.trigger_id == "heartbeat"
-
-    def test_triggers_create_alias_still_parses(self):
-        # `create` is a hidden alias for `add`; it must still parse for old scripts.
-        parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "create", "Support Bot", "--key", "zendesk_ticket_created"])
-        assert args.triggers_cmd == "create"
-        assert args.agent == "Support Bot"
-        assert args.key == "zendesk_ticket_created"
-
-    def test_triggers_delete_alias_still_parses(self):
-        # `delete` is a hidden alias for `remove`; it must still parse for old scripts.
-        parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "delete", "trg-1", "-y"])
-        assert args.triggers_cmd == "delete"
-        assert args.trigger_id == "trg-1"
-        assert args.yes is True
-
-    def test_triggers_run_alias_still_parses(self):
-        # `run` is a hidden alias that forwards to `eesel schedules fire`.
-        parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "run", "heartbeat"])
-        assert args.triggers_cmd == "run"
-        assert args.trigger_id == "heartbeat"
+        for argv in (
+            ["triggers", "create", "Support Bot", "--key", "k"],
+            ["triggers", "delete", "trg-1"],
+            ["triggers", "fire", "heartbeat"],
+            ["triggers", "run", "heartbeat"],
+        ):
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
 
     def test_schedules_list_parses(self):
         parser = eesel.build_parser()
@@ -3089,21 +3078,6 @@ class TestTriggersAdd:
         # Server rejects a null config, so an omitted --config must become {}.
         assert captured["body"] == {"trigger_key": "public_chat", "config": {}}
 
-    def test_create_alias_still_adds(self, fake_creds, monkeypatch):
-        # `create` is a backward-compat alias for `add` and must route the same way.
-        captured = {}
-
-        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
-            captured["method"], captured["url"], captured["body"] = method, url, body
-            return {"trigger": {"id": "trg-new-3"}}
-
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
-        monkeypatch.setattr(eesel, "http_request", fake)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="create", agent="Support Bot", key="zendesk_ticket_created", config=None))
-        assert rc == 0
-        assert captured["method"] == "POST"
-        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
-
     def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
@@ -3129,8 +3103,50 @@ class TestTriggersAdd:
         assert sent["called"] is False
 
 
+class TestTriggersShow:
+    def test_show_finds_trigger_by_id(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "zd-1" in out
+        assert "zendesk_ticket_created" in out
+        assert "WEBHOOK" in out
+
+    def test_show_resolves_by_id_prefix(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="ic", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "intercom_conversation_replied" in out
+
+    def test_show_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=True))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] == "zd-1"
+
+    def test_show_redacts_secrets(self, fake_creds, monkeypatch, capsys):
+        triggers = [{
+            "id": "zd-1", "type": "WEBHOOK", "trigger_key": "zendesk_ticket_created",
+            "config": {"access_token": "tok-LEAK", "app_id": "abc"},
+            "integration_id": None, "agent_id": "a1", "agent_name": "Bot",
+        }]
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: triggers)
+        eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=False))
+        out = capsys.readouterr().out
+        assert "tok-LEAK" not in out and '"access_token": "***"' in out
+
+    def test_show_unknown_id_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="nope", json=False))
+        assert rc == 1
+        assert "No event/webhook trigger matches" in capsys.readouterr().err
+
+
 class TestTriggersRemove:
-    def test_remove_with_yes_skips_confirm(self, fake_creds, monkeypatch, capsys):
+    def test_remove_with_force_skips_confirm(self, fake_creds, monkeypatch, capsys):
         captured = {}
 
         def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
@@ -3138,8 +3154,8 @@ class TestTriggersRemove:
             return {"message": "Trigger removed"}
 
         monkeypatch.setattr(eesel, "http_request", fake)
-        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--yes must skip confirm"))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-1", yes=True))
+        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--force must skip confirm"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-1", force=True))
         assert rc == 0
         assert captured["method"] == "DELETE"
         assert captured["url"] == "http://localhost:8080/triggers/trg-1"
@@ -3149,7 +3165,7 @@ class TestTriggersRemove:
         captured = {}
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-2", yes=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-2", force=False))
         assert rc == 0
         assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/trg-2"}
 
@@ -3157,17 +3173,9 @@ class TestTriggersRemove:
         sent = {"called": False}
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-3", yes=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-3", force=False))
         assert rc == 1
         assert sent["called"] is False
-
-    def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
-        # `delete` is a backward-compat alias for `remove` and must route the same way.
-        captured = {}
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_triggers(_args(triggers_cmd="delete", trigger_id="trg-4", yes=True))
-        assert rc == 0
-        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/trg-4"}
 
 
 class TestSchedulesFire:
@@ -3204,15 +3212,6 @@ class TestSchedulesFire:
         rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="nope"))
         assert rc == 1
         assert sent["called"] is False
-
-    def test_triggers_fire_forwards_to_schedules(self, fake_creds, monkeypatch, capsys):
-        # `eesel triggers fire` is a deprecated alias that forwards to the
-        # scheduled-job fire path so older scripts keep working.
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
-        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
-        rc = eesel.cmd_triggers(_args(triggers_cmd="fire", trigger_id="heartbeat"))
-        assert rc == 0
-        assert "Fired 'Heartbeat'" in capsys.readouterr().err
 
 
 class TestSchedulesAdd:

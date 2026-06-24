@@ -1781,24 +1781,17 @@ def cmd_triggers(args) -> int:
     if sub == "list":
         return _triggers_list_events(creds, as_json=getattr(args, "json", False))
 
+    if sub == "show":
+        return _triggers_show(creds, args.trigger_id, as_json=getattr(args, "json", False))
+
     if sub == "registry":
         return _triggers_registry(creds, as_json=getattr(args, "json", False))
 
-    # `add` is the canonical verb; `create` is kept as a hidden alias so older
-    # scripts that call `eesel triggers create ...` keep working.
-    if sub in ("add", "create"):
+    if sub == "add":
         return _triggers_add(creds, args)
 
-    # `remove` is the canonical verb; `delete` is kept as a hidden alias.
-    if sub in ("remove", "delete"):
+    if sub == "remove":
         return _triggers_remove(creds, args)
-
-    # Firing is a scheduled-job operation — event triggers fire themselves.
-    # `eesel triggers fire/run` is kept as a hidden alias that forwards to
-    # `eesel schedules fire` so older scripts keep working.
-    if sub in ("fire", "run"):
-        warn("`eesel triggers fire` has moved to `eesel schedules fire`. Forwarding…")
-        return _schedules_fire(creds, args.trigger_id)
 
     return 1
 
@@ -1871,13 +1864,13 @@ def _triggers_add(creds: dict, args) -> int:
 
 
 def _triggers_remove(creds: dict, args) -> int:
-    """`eesel triggers remove <id> [-y]`: DELETE /triggers/{id}.
+    """`eesel triggers remove <id> [--force]`: DELETE /triggers/{id}.
 
-    Prompts for confirmation unless --yes/-y is passed. The id is the trigger's
+    Prompts for confirmation unless --force is passed. The id is the trigger's
     own id (the first column of `eesel triggers list`), not the trigger key.
     """
     trigger_id = args.trigger_id
-    if not getattr(args, "yes", False):
+    if not getattr(args, "force", False):
         if not confirm(f"Remove trigger {trigger_id}? This cannot be undone. [y/N] "):
             info("Cancelled.")
             return 1
@@ -1885,6 +1878,51 @@ def _triggers_remove(creds: dict, args) -> int:
     http_request("DELETE", f"{creds['api_url']}/triggers/{trigger_id}", token=creds["token"])
     ok(f"Removed trigger {trigger_id}.")
     return 0
+
+
+def _triggers_show(creds: dict, trigger_id: str, *, as_json: bool = False) -> int:
+    """`eesel triggers show <id>`: full detail for one event/webhook trigger.
+
+    There is no single-trigger endpoint, so the trigger is located within the
+    workspace-wide list (GET /agents/{id}/triggers across agents) by exact id or
+    id prefix. Secrets in the config are masked in the human view; --json emits
+    the raw payload."""
+    rows = fetch_all_event_triggers(creds)
+    match = next((t for t in rows if t.get("id") == trigger_id), None)
+    if match is None:
+        match = next((t for t in rows if (t.get("id") or "").startswith(trigger_id)), None)
+    if match is None:
+        err(f"No event/webhook trigger matches '{trigger_id}'.")
+        info("Run `eesel triggers list` to see triggers (the first column is the id).")
+        return 1
+
+    if as_json:
+        print(json.dumps(match, indent=2))
+        return 0
+
+    enabled = _trigger_enabled(match)
+    print(f"{match.get('id')}  [{'on' if enabled else 'off'}]")
+    print(f"  key:         {match.get('trigger_key') or '?'}")
+    print(f"  type:        {match.get('type') or '?'}")
+    print(f"  agent:       {match.get('agent_name') or match.get('agent_id') or '?'}")
+    print(f"  integration: {match.get('integration_id') or '—'}")
+    print(f"  last fired:  {_fmt_task_ts(match.get('last_executed_at'))}")
+    cfg = match.get("config")
+    if cfg:
+        print("  config:")
+        for line in json.dumps(_redact_secrets(cfg), indent=2).splitlines():
+            print(f"    {line}")
+    return 0
+
+
+def _trigger_enabled(t: dict) -> bool:
+    """Best-effort on/off state for a trigger row. The backend may carry the
+    state under any of a few field names; a trigger with none of them present is
+    treated as enabled (the default for a configured trigger)."""
+    for field in ("enabled", "is_enabled", "is_active", "active"):
+        if field in t and t[field] is not None:
+            return bool(t[field])
+    return True
 
 
 def _triggers_list_events(creds: dict, *, as_json: bool = False) -> int:
@@ -1930,9 +1968,10 @@ def _triggers_list_events(creds: dict, *, as_json: bool = False) -> int:
             tid = (t.get("id") or "?")[:12]
             tkey = t.get("trigger_key") or "?"
             ttype = t.get("type") or "?"
+            status = "[on] " if _trigger_enabled(t) else "[off]"
             last = _fmt_task_ts(t.get("last_executed_at"))
             iid = (t.get("integration_id") or "")[:12] or "—"
-            print(f"  {tid}  {tkey:<30}  {ttype:<8}  last={last:<16}  int={iid}  agent={t['agent_name']}")
+            print(f"  {tid}  {status}  {tkey:<30}  {ttype:<8}  last={last:<16}  int={iid}  agent={t['agent_name']}")
             cfg = t.get("config")
             if cfg:
                 blob = json.dumps(_redact_secrets(cfg))
@@ -3189,13 +3228,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     # `eesel triggers` covers event/webhook triggers only. Scheduled jobs (cron)
     # have their own command group below: `eesel schedules`.
-    sp = sub.add_parser("triggers", help="List, add, or remove event/webhook triggers")
+    sp = sub.add_parser("triggers", help="List, show, add, or remove event/webhook triggers")
     sp.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
     t_sub = sp.add_subparsers(dest="triggers_cmd")
-    t_ls = t_sub.add_parser("list", help="List event/webhook triggers, grouped by integration")
+    t_ls = t_sub.add_parser("list", help="List all event/webhook triggers (status shown as a column)")
     t_ls.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
 
-    t_reg = t_sub.add_parser("registry", help="List the available trigger types (keys for `add`)")
+    t_show = t_sub.add_parser("show", help="Show one trigger's full detail by id")
+    t_show.add_argument("trigger_id", help="The trigger's id or id-prefix (first column of `eesel triggers list`)")
+    t_show.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
+
+    t_reg = t_sub.add_parser("registry", help="List the trigger-type catalog (keys for `add`)")
     t_reg.add_argument("--json", action="store_true", help="Emit the raw registry payload")
 
     t_add = t_sub.add_parser("add", help="Add a trigger to an agent")
@@ -3205,29 +3248,8 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     t_rm = t_sub.add_parser("remove", help="Remove a trigger by id")
     t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
-    t_rm.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
+    t_rm.add_argument("--force", action="store_true", help="Skip the confirmation prompt")
 
-    # Hidden backward-compat aliases. `create`→`add` and `delete`→`remove` are
-    # the old REST-derived verbs. `fire`/`run` used to live here but firing is a
-    # scheduled-job operation; they forward to `eesel schedules fire`. Kept so
-    # existing scripts keep working. `help=SUPPRESS` only blanks the
-    # description — the name still shows in the choices list — so we also drop
-    # the pseudo-actions to hide them fully.
-    t_create = t_sub.add_parser("create", help=argparse.SUPPRESS)
-    t_create.add_argument("agent")
-    t_create.add_argument("--key", required=True)
-    t_create.add_argument("--config")
-
-    t_del = t_sub.add_parser("delete", help=argparse.SUPPRESS)
-    t_del.add_argument("trigger_id")
-    t_del.add_argument("-y", "--yes", action="store_true")
-
-    for _alias in ("fire", "run"):
-        _p = t_sub.add_parser(_alias, help=argparse.SUPPRESS)
-        _p.add_argument("trigger_id")
-
-    _hidden_trigger_aliases = {"create", "delete", "fire", "run"}
-    t_sub._choices_actions = [a for a in t_sub._choices_actions if a.dest not in _hidden_trigger_aliases]
     sp.set_defaults(func=cmd_triggers)
 
     # `eesel schedules` — scheduled jobs (cron-driven agent runs). Split out from
