@@ -1463,10 +1463,17 @@ def cmd_agents(args) -> int:
         save_creds(creds)
         ok(f"Cleared active agent ({prev}). Commands that need one will prompt or accept --agent.")
         return 0
+    if sub == "get":
+        return _agents_get(args, creds)
     if sub == "create":
         return _agents_create(args, creds)
-    if sub == "update":
+    if sub in ("edit", "update"):
+        # `update` is the original name, kept as a hidden alias for `edit`.
         return _agents_update(args, creds)
+    if sub == "enable":
+        return _agents_set_active(args, creds, active=True)
+    if sub == "disable":
+        return _agents_set_active(args, creds, active=False)
     if sub == "delete":
         return _agents_delete(args, creds)
     return 1
@@ -1531,6 +1538,55 @@ def _agents_delete(args, creds: dict) -> int:
         creds.pop("agent_id", None)
         save_creds(creds)
         info("Cleared the active-agent pointer (it referenced the deleted agent).")
+    return 0
+
+
+def _agents_get(args, creds: dict) -> int:
+    """Print one agent's full record: id, type, live/off status, description, and
+    instructions. The agent listing already carries every field, so this resolves
+    the target from that list rather than making a second call."""
+    agent = _resolve_one_agent(args.agent_id, creds)
+    if not agent:
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(agent, indent=2))
+        return 0
+    print(f"{agent.get('name', '?')}  ({agent.get('agent_id', '')})")
+    if agent.get("agent_type"):
+        print(f"  type:    {agent['agent_type']}")
+    print(f"  status:  {'live' if agent.get('is_active') else 'off'}")
+    if agent.get("description"):
+        print(f"  summary: {agent['description']}")
+    prompt = (agent.get("prompt") or "").strip()
+    if not prompt:
+        print("  instructions: (none)")
+        return 0
+    print("  instructions:")
+    print()
+    print(prompt)
+    return 0
+
+
+def _agents_set_active(args, creds: dict, *, active: bool) -> int:
+    """Bring an agent live (`enable`) or take it offline (`disable`) via the
+    `is_active` flag on `PUT /agents/{id}`. Disabling stops the agent responding
+    on its channels until re-enabled, so it confirms first unless `--yes`."""
+    agent = _resolve_one_agent(args.agent_id, creds)
+    if not agent:
+        return 1
+    if not active and not args.yes and not confirm(
+        f"Disable agent '{agent.get('name')}' ({agent['agent_id']})? "
+        "It stops responding until re-enabled. [y/N] "
+    ):
+        info("Aborted.")
+        return 1
+    http_request(
+        "PUT",
+        f"{creds['api_url']}/agents/{agent['agent_id']}",
+        token=creds["token"],
+        body={"is_active": active},
+    )
+    ok(f"{'Enabled' if active else 'Disabled'} {agent.get('name')} ({agent['agent_id']}) — now {'live' if active else 'off'}.")
     return 0
 
 
@@ -2750,18 +2806,43 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     use.add_argument("agent_id", nargs="?", help="Full id, id prefix, or agent name (omit to pick from an arrow-key menu)")
     a_sub.add_parser("unset", help="Clear the active agent (next command that needs one prompts again)")
 
+    get_p = a_sub.add_parser("get", help="Show one agent's full detail (type, status, instructions)")
+    get_p.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    get_p.add_argument("--json", action="store_true", help="Print the raw agent record as JSON")
+
     create = a_sub.add_parser("create", help="Create a new agent")
     create.add_argument("--name", help="Agent name (required)")
     create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
 
-    update = a_sub.add_parser("update", help="Change an agent's name or instructions (only the flags you pass)")
-    update.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
-    update.add_argument("--name", help="New name")
-    update.add_argument("--instructions", help="New instructions / system prompt")
+    edit = a_sub.add_parser("edit", help="Change an agent's name or instructions (only the flags you pass)")
+    edit.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    edit.add_argument("--name", help="New name")
+    edit.add_argument("--instructions", help="New instructions / system prompt")
+
+    # Backward-compatible hidden alias: this command first shipped as `update`,
+    # then was renamed to `edit`. The old spelling keeps working for existing
+    # scripts but is dropped from help and the usage line (see below).
+    update = a_sub.add_parser("update", help=argparse.SUPPRESS)
+    update.add_argument("agent_id")
+    update.add_argument("--name")
+    update.add_argument("--instructions")
+
+    enable = a_sub.add_parser("enable", help="Bring an agent live (it starts responding on its channels)")
+    enable.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+
+    disable = a_sub.add_parser("disable", help="Take an agent offline (it stops responding until re-enabled)")
+    disable.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+    disable.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     delete = a_sub.add_parser("delete", help="Delete an agent (asks for confirmation)")
     delete.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     delete.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+
+    # Hide the `update` alias from the agents subcommand list and the usage
+    # metavar, the same way staff-only commands are hidden elsewhere: `help=
+    # SUPPRESS` only blanks the description, leaving the name in the choices.
+    a_sub._choices_actions = [a for a in a_sub._choices_actions if a.dest != "update"]
+    a_sub.metavar = "{" + ",".join(ca.dest for ca in a_sub._choices_actions) + "}"
 
     sp.set_defaults(func=cmd_agents)
 
