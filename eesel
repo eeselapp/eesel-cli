@@ -2202,8 +2202,8 @@ def cmd_integrations(args) -> int:
     """Dispatch the `eesel integrations` subcommands.
 
     `list` (default) shows what's already connected; `available` shows what
-    *can* be connected; `create` connects a new one; `sync` / `sync-status`
-    drive a connected integration's data sync.
+    *can* be connected; `create` connects a new one; `delete` disconnects one;
+    `sync` / `sync-status` drive a connected integration's data sync.
     """
     creds = require_creds()
     sub = getattr(args, "integrations_cmd", None) or "list"
@@ -2213,6 +2213,8 @@ def cmd_integrations(args) -> int:
         return _integrations_available(args, creds)
     if sub == "create":
         return _integrations_create(args, creds)
+    if sub == "delete":
+        return _integrations_delete(args, creds)
     if sub == "sync":
         return _integrations_sync(args, creds)
     if sub == "sync-status":
@@ -2408,6 +2410,39 @@ def _integrations_sync_status(args, creds: dict) -> int:
         print("(no sync status)")
     else:
         print(data if isinstance(data, str) else json.dumps(data))
+    return 0
+
+
+def _integrations_delete(args, creds: dict) -> int:
+    """Disconnect a connected integration via DELETE /integrations/{id}.
+
+    `<id>` resolves from a full id, id prefix, or integration type. Asks for
+    confirmation unless `-y/--yes` is passed, since disconnecting removes the
+    integration and its synced knowledge from the workspace.
+    """
+    integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+    if not integration:
+        err(f"No connected integration matches '{args.id}'. Run `eesel integrations list`.")
+        return 1
+    integration_id = integration["id"]
+    label = integration.get("integrationType") or integration_id
+    identifier = integration.get("identifier")
+    desc = f"{label}" + (f" ({identifier})" if identifier else "") + f" [{integration_id}]"
+    if not args.yes:
+        # Affirmative = y/yes (case-insensitive); bare Enter or EOF aborts.
+        try:
+            answer = input(f"Disconnect integration {desc}? This cannot be undone. [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            info("Aborted.")
+            return 1
+    http_request(
+        "DELETE",
+        f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}",
+        token=creds["token"],
+    )
+    ok(f"Disconnected integration {desc}.")
     return 0
 
 
@@ -4675,6 +4710,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_st = i_sub.add_parser("sync-status", help="Show sync status for a connected integration")
     i_st.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_st.add_argument("--json", action="store_true", help="Emit the raw sync-status payload")
+    i_del = i_sub.add_parser("delete", help="Disconnect a connected integration (asks for confirmation)")
+    i_del.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
+    i_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     sp.set_defaults(func=cmd_integrations)
 
     sp = sub.add_parser("tools", help="List an agent's tools/actions (read-only)")

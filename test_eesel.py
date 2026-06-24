@@ -3564,6 +3564,39 @@ class TestIntegrationsSyncStatus:
         assert json.loads(capsys.readouterr().out) == {"status": "running"}
 
 
+class TestIntegrationsDelete:
+    def test_deletes_resolved_integration_with_yes(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            return {}
+
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", fake_request)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="delete", id="zendesk", yes=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
+        assert "Disconnected" in capsys.readouterr().err
+
+    def test_prompts_and_aborts_on_no(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE when aborted"))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+        rc = eesel.cmd_integrations(_args(integrations_cmd="delete", id="int-zendesk-1", yes=False))
+        assert rc == 1
+        assert "Aborted" in capsys.readouterr().err
+
+    def test_unresolvable_id_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an unknown id"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="delete", id="nope", yes=True))
+        assert rc == 1
+        assert "No connected integration matches" in capsys.readouterr().err
+
+
 class TestResolveIntegration:
     def test_matches_by_exact_id_then_prefix_then_type(self):
         rows = [
