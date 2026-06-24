@@ -115,6 +115,8 @@ eesel tasks show <id> --json        # raw history payload
 eesel tasks show <id> --full        # don't truncate tool args/outputs
 eesel tasks show <id> --cost        # append a cost breakdown (dev only)
 eesel tasks cost <id>               # cost breakdown for any task (dev only)
+eesel tasks analytics               # resolution rate, counts, CSAT (optionally --agent / --start-date / --end-date / --json)
+eesel tasks export                  # start a CSV export; download link is emailed (optionally --agent / --start-date / --end-date)
 ```
 
 Backed by the same workspace token the chat stream already uses

@@ -1142,6 +1142,25 @@ class TestArgParser:
         assert args.agents_cmd == "unset"
         assert args.func is eesel.cmd_agents
 
+    def test_tasks_analytics_parses_dates_and_agent(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tasks", "analytics", "--agent", "Bot", "--start-date", "2026-05-01", "--end-date", "2026-05-31"])
+        assert args.cmd == "tasks"
+        assert args.tasks_cmd == "analytics"
+        assert args.agent == "Bot"
+        assert args.start_date == "2026-05-01"
+        assert args.end_date == "2026-05-31"
+        assert args.func is eesel.cmd_tasks
+
+    def test_tasks_export_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tasks", "export", "--agent", "Bot", "--start-date", "2026-05-01"])
+        assert args.cmd == "tasks"
+        assert args.tasks_cmd == "export"
+        assert args.agent == "Bot"
+        assert args.start_date == "2026-05-01"
+        assert args.func is eesel.cmd_tasks
+
     def test_instructions_subcommand_parses(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["instructions"])
@@ -1678,6 +1697,150 @@ class TestTasksShow:
         rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7"))
         assert rc == 0
         assert "dev-only" in capsys.readouterr().err
+
+
+_ANALYTICS = {
+    "total_tasks": 10,
+    "tasks_by_status": {"completed": 10},
+    "tasks_by_agent": {"agent-test-456": {"name": "Support Bot", "count": 7}, "agent-other": {"name": "Sales Bot", "count": 3}},
+    "tasks_by_channel": {"helpdesk": 6, "chat": 4},
+    "resolution_counts": {"resolved": 6, "escalated": 2, "pending": 2},
+    "csat_distribution": {"great": 4, "good": 3, "fair": 1, "poor": 0},
+}
+
+
+class TestTaskAnalyticsFetch:
+    def test_posts_to_workspace_analytics_with_dates_and_agent(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds, start_date="2026-05-01", end_date="2026-05-31", agent_id="agent-test-456")
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/workspace/tasks/analytics"
+        assert captured["body"]["start_date"] == "2026-05-01"
+        assert captured["body"]["end_date"] == "2026-05-31"
+        # Server filters on a list of agent ids, not a single id.
+        assert captured["body"]["agent_ids"] == ["agent-test-456"]
+
+    def test_omits_empty_filters(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds)
+        # No date range and no agent → an empty body, yielding all-time totals.
+        assert captured["body"] == {}
+
+
+class TestTaskAnalyticsCommand:
+    def test_summary_prints_resolution_rate_and_breakdowns(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: _ANALYTICS)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "total tasks: 10" in out
+        # 6 resolved out of 8 with a known outcome (resolved + escalated) = 75.0%.
+        assert "resolution rate: 75.0%" in out
+        assert "Support Bot" in out and "Sales Bot" in out
+        assert "helpdesk" in out
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: _ANALYTICS)
+        eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["total_tasks"] == 10
+        assert payload["resolution_counts"]["resolved"] == 6
+
+    def test_empty_range_reports_no_tasks(self, fake_creds, monkeypatch, capsys):
+        empty = {"total_tasks": 0, "resolution_counts": {"resolved": 0, "escalated": 0, "pending": 0}}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: empty)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=False))
+        assert rc == 0
+        assert "(no tasks in range)" in capsys.readouterr().err
+
+    def test_agent_filter_resolves_before_request(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if "/agents" in url:
+                return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+            captured["body"] = body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        # A bare name resolves to its agent id before the analytics request.
+        eesel.cmd_tasks(_args(tasks_cmd="analytics", agent="Support Bot", start_date=None, end_date=None, json=False))
+        assert captured["body"]["agent_ids"] == ["agent-test-456"]
+
+    def test_unknown_agent_returns_error(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: [] if "/agents" in url else _ANALYTICS)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent="nope", start_date=None, end_date=None, json=False))
+        assert rc == 1
+        assert "No agent matches" in capsys.readouterr().err
+
+
+class TestTaskExport:
+    def test_export_posts_filters_to_query_params(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.export_tasks(fake_creds, start_date="2026-05-01", end_date="2026-05-31", agent_id="agent-test-456")
+        assert captured["method"] == "POST"
+        # The server reads the date range and agent from the query string.
+        assert captured["url"].startswith("http://localhost:8080/tasks/export?")
+        assert "start_date=2026-05-01" in captured["url"]
+        assert "end_date=2026-05-31" in captured["url"]
+        assert "agent_id=agent-test-456" in captured["url"]
+        # Additional filters travel in the JSON body.
+        assert captured["body"] == {"filters": {}}
+
+    def test_export_no_filters_has_no_query_string(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.export_tasks(fake_creds)
+        assert captured["url"] == "http://localhost:8080/tasks/export"
+
+    def test_command_reports_export_started(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"message": "Export started"})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="export", agent=None, start_date=None, end_date=None))
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Export started" in captured.out + captured.err
+        assert "emailed" in captured.err
+
+    def test_command_prints_returned_reference(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"message": "Export started", "job_id": "job-123"})
+        eesel.cmd_tasks(_args(tasks_cmd="export", agent=None, start_date=None, end_date=None))
+        assert "job-123" in capsys.readouterr().out
+
+    def test_command_resolves_agent_filter(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if "/agents" in url:
+                return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+            captured["url"] = url
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.cmd_tasks(_args(tasks_cmd="export", agent="Support Bot", start_date=None, end_date=None))
+        assert "agent_id=agent-test-456" in captured["url"]
 
 
 # ──────────────────────────────────────────────────────────────────────────
