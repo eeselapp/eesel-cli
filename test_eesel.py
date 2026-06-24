@@ -2019,3 +2019,27 @@ class TestTriggersAll:
         assert "tok-LEAK" not in out
         assert '"access_token": "***"' in out
         assert "abc" in out  # non-secret config still shown
+
+
+class TestChatAgentFlag:
+    def test_parser_accepts_agent(self):
+        args = eesel.build_parser().parse_args(["chat", "hi", "--agent", "Bot"])
+        assert args.agent == "Bot"
+        assert args.func is eesel.cmd_chat
+
+    def test_unmatched_agent_errors_before_chatting(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: pytest.fail("must not chat on an unmatched --agent"))
+        rc = eesel.cmd_chat(_args(agent="nope", message="hi", cost=False, task=None, trigger=None))
+        assert rc == 1
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
+    def test_agent_flag_does_not_persist_active_agent(self, fake_creds, monkeypatch):
+        # --agent is a stateless, per-command scope: it resolves in memory and
+        # must never rewrite the saved active agent on disk.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "other-agent", "name": "Other"}])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--agent must not persist the active agent"))
+        # Stop after agent resolution so we don't exercise the sandbox/streaming path.
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: (_ for _ in ()).throw(SystemExit("stop")))
+        with pytest.raises(SystemExit):
+            eesel.cmd_chat(_args(agent="Other", message="hi", cost=False, task=None, trigger=None))

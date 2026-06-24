@@ -1703,6 +1703,17 @@ def _current_run_count(creds: dict, sess: dict) -> int:
 
 def cmd_chat(args) -> int:
     creds = require_creds()
+    # `--agent` scopes this one chat to a specific agent (id, id-prefix, or
+    # name), like the EESEL_AGENT env var but per-command. It is resolved in
+    # memory and not persisted, so it never changes the saved active agent.
+    if getattr(args, "agent", None):
+        match = resolve_agent(fetch_agents(creds), args.agent)
+        if not match:
+            err(f"No agent matches '{args.agent}'.")
+            info("Run `eesel agents list` to see available agents.")
+            return 1
+        creds = dict(creds)
+        creds["agent_id"] = match["agent_id"]
     pick_agent(creds, prompt=False)  # only prompt in REPL if needed
 
     # --trigger always opens a fresh session pinned to that trigger. Reusing an
@@ -2464,6 +2475,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
     sp.add_argument("message", nargs="?", help="Message to send (omit for REPL)")
+    sp.add_argument("--agent", help="Agent id, id-prefix, or name to chat with (default: active agent, or $EESEL_AGENT). Explicit, stateless scope — does not change the saved active agent")
     sp.add_argument("--cost", action="store_true", help="After each reply, print a one-line cost + token summary for the whole session (incl. sub-agents)")
     sp.add_argument(
         "--trigger",
