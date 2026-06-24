@@ -38,7 +38,7 @@ eesel agents list
 eesel agents show <id-or-name>      # full detail (type, status, instructions)
 eesel agents create --name "QA Bot" --instructions "..."
 eesel agents edit <id-or-name> --name "..."  # change name and/or instructions
-eesel agents remove <id-or-name>    # delete an agent (asks to confirm; --yes to skip)
+eesel agents remove <id-or-name>    # delete an agent (asks to confirm; --force to skip)
 
 # Scope a command to an agent explicitly — no hidden saved state:
 EESEL_AGENT=<id-or-name> eesel ...  # per-invocation, applies to any command
