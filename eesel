@@ -4970,7 +4970,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         help="Disconnect a connected integration (asks for confirmation; `disconnect` is an alias)",
     )
     i_rm.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
-    i_rm.add_argument("--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    i_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or edit an integration's actions")
     # The integration that scopes these actions (path positional, not a flag).
