@@ -1339,6 +1339,112 @@ class TestAgentsGetCommand:
         assert rc == 1
 
 
+def _agents_subparsers():
+    """The `agents` sub-subparsers action, for inspecting which agent
+    subcommands are visible in help vs. hidden."""
+    agents = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"]
+    return _subparsers_action(agents)
+
+
+class TestAgentsVerbNaming:
+    """The agents subcommands follow the CLI's canonical verb set
+    (list/show/create/set/remove). The previous spellings (get/edit/update/
+    delete) keep working as hidden aliases so existing scripts don't break."""
+
+    AGENTS = [{"agent_id": "agent-abc123", "name": "Support Bot"}]
+
+    def test_canonical_verbs_visible_in_help(self):
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        for verb in ("list", "show", "create", "set", "remove"):
+            assert verb in visible
+
+    def test_deprecated_verbs_hidden_from_help(self):
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        metavar = _agents_subparsers().metavar or ""
+        for verb in ("use", "unset", "get", "edit", "update", "delete"):
+            assert verb not in visible
+            assert verb not in metavar
+
+    def test_show_routes_like_get(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123"))
+        assert rc == 0
+        assert calls == []  # detail comes from the listing, no extra request
+        assert "Support Bot" in capsys.readouterr().out
+
+    def test_set_routes_like_edit(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "set", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_remove_routes_like_delete(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--yes"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+
+    def test_deprecated_aliases_still_dispatch(self, tmp_config, fake_creds, monkeypatch):
+        # get/edit/update/delete are hidden from help but must still parse and
+        # route to the same handlers as their canonical replacements.
+        for verb in ("get", "edit", "update", "delete"):
+            args = _parse("agents", verb, "agent-abc123")
+            assert args.agents_cmd == verb
+            assert args.func is eesel.cmd_agents
+
+
+class TestAgentEnvOverride:
+    """EESEL_AGENT scopes a single command to one agent without writing to
+    disk. It overrides the stored active agent; a --agent flag still wins
+    because each command applies it after require_creds returns."""
+
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_unset_env_leaves_creds_untouched(self, fake_creds, monkeypatch):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        creds = {"agent_id": "stored-agent", "token": "t"}
+        assert eesel.apply_agent_env_override(creds) is creds
+
+    def test_env_id_overrides_stored_active_agent(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "agent-def456")
+        creds = {"agent_id": "agent-abc123", "token": "t"}
+        out = eesel.apply_agent_env_override(creds)
+        assert out["agent_id"] == "agent-def456"
+        # The override is per-invocation only — the input dict is never mutated.
+        assert creds["agent_id"] == "agent-abc123"
+
+    def test_env_resolves_by_name(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "Blog Writer")
+        out = eesel.apply_agent_env_override({"agent_id": None, "token": "t"})
+        assert out["agent_id"] == "agent-def456"
+
+    def test_unresolvable_env_exits(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "ghost")
+        with pytest.raises(SystemExit):
+            eesel.apply_agent_env_override({"token": "t"})
+        assert "EESEL_AGENT" in capsys.readouterr().err
+
+    def test_env_does_not_persist_to_disk(self, tmp_config, fake_creds, monkeypatch):
+        # require_creds applies the override in memory; nothing is saved, so the
+        # stored active agent is unchanged for the next command.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "agent-def456")
+        out = eesel.require_creds()
+        assert out["agent_id"] == "agent-def456"
+        assert eesel.load_creds()["agent_id"] == fake_creds["agent_id"]
+
+
 class TestAgentLabel:
     def test_includes_name_and_short_id(self):
         label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
@@ -2635,7 +2741,7 @@ class TestToolsCommand:
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: pytest.fail("should not fetch"))
         rc = eesel.cmd_tools(_args(agent=None, json=False))
         assert rc == 1
-        assert "No active agent" in capsys.readouterr().err
+        assert "No agent selected" in capsys.readouterr().err
 
     def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())

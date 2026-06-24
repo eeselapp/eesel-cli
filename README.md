@@ -35,11 +35,16 @@ EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/ee
 eesel login                         # opens dashboard.eesel.ai, signs in as you (Auth0)
 eesel whoami
 eesel agents list
-eesel agents use <id-or-name>       # set the active agent
-eesel agents use                    # ...or pick from an arrow-key menu (↑/↓, Enter)
-eesel agents unset                  # clear the active agent (next command prompts again)
+eesel agents show <id-or-name>      # full detail (type, status, instructions)
+eesel agents create --name "QA Bot" --instructions "..."
+eesel agents set <id-or-name> --name "..."   # change name and/or instructions
+eesel agents remove <id-or-name>    # delete an agent (asks to confirm; --yes to skip)
 
-eesel instructions                  # print the active agent's instructions (system prompt)
+# Scope a command to an agent explicitly — no hidden saved state:
+EESEL_AGENT=<id-or-name> eesel ...  # per-invocation, applies to any command
+eesel <cmd> --agent <id-or-name>    # per-command flag (wins over EESEL_AGENT)
+
+eesel instructions                  # print the scoped agent's instructions (system prompt)
 eesel instructions <id-or-name>     # ...for a specific agent
 eesel instructions > prompt.md      # stdout is just the prompt, so redirect/pipe freely
 
@@ -89,11 +94,10 @@ eesel document export --document-id <id-or-prefix> --format html -o post.html
 `--format` accepts `md` or `html`. For `export`, `-o` is optional; without
 it the file lands in the current directory using the document's filename.
 `read` prints the body to stdout (the header goes to stderr, so redirects
-capture just the content) and, with no id, opens an arrow-key picker like
-`eesel agents use`.
+capture just the content) and, with no id, opens an arrow-key picker.
 
-Documents are scoped to the currently-active agent (`eesel agents use`) —
-its `files/…` and `outputs/skills/…` keys — so set the right agent first.
+Documents are scoped to one agent — its `files/…` and `outputs/skills/…`
+keys — so scope the command with `EESEL_AGENT` or `--agent` first.
 `--prefix` filters within that scope (e.g. `files/`, `outputs/`).
 
 ## Tasks (workspace activity)
@@ -133,7 +137,7 @@ eesel integrations                  # id, type, connection status, subdomain
 eesel integrations --json           # raw payload
 eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
 
-eesel tools                         # the active agent's tools/actions
+eesel tools                         # the scoped agent's tools/actions
 eesel tools <id-or-name>            # ...for a specific agent
 eesel tools --json                  # raw payload
 
