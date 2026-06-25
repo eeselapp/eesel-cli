@@ -2799,13 +2799,10 @@ def cmd_settings(args) -> int:
         err("Usage: eesel settings notifications show|enable|disable|set <agent>")
         return 1
 
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
-        return 1
-    agent = resolve_agent(agents, args.agent)
+    # enable/disable/set write the agent's notification config, so refuse an
+    # ambiguous name rather than configuring an arbitrary first match.
+    agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
-        err(f"No agent matches '{args.agent}'.")
         return 1
     agent_id = agent["agent_id"]
     url = f"{creds['api_url']}/agents/{agent_id}/notification-settings"
