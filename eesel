@@ -121,6 +121,23 @@ def ok(msg: str) -> None:
     print(_color(f"✓ {msg}", "32"), file=sys.stderr)
 
 
+def confirm(prompt: str) -> bool:
+    """Ask a yes/no question on stderr and return True only on an explicit yes.
+
+    The prompt is written to stderr (not stdout) so that piping a command's
+    output to a file — e.g. `eesel ... > out.txt` — never captures the prompt
+    text. Anything other than "y" or "yes" (case-insensitive), including an
+    empty line or EOF on a non-interactive stdin, counts as "no", so
+    destructive operations default to not happening.
+    """
+    print(_color(prompt, "33"), end="", file=sys.stderr, flush=True)
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Interactive selection (arrow-key menu)
 # ──────────────────────────────────────────────────────────────────────────
@@ -646,7 +663,18 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
             raw = resp.read()
             if not raw:
                 return {}
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                # A 2xx with a non-JSON body usually means a proxy/gateway or
+                # login page answered instead of the API (e.g. an HTML error
+                # page served with status 200). Surface a clean message rather
+                # than letting the JSONDecodeError traceback escape.
+                snippet = raw[:200].decode(errors="replace").strip()
+                sys.exit(
+                    f"{method} {url} → {resp.status} but the response was not JSON "
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                )
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         sys.exit(f"{method} {url} → {e.code}: {body_text}")
@@ -673,6 +701,27 @@ def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
 
 def http_download(url: str, *, token: str, output_path: Path) -> None:
     output_path.write_bytes(http_fetch(url, token=token))
+
+
+def parse_config_object(raw: str, *, example: str = '{"key": "value"}') -> dict:
+    """Parse a ``--config`` JSON string into a dict, or exit with code 2 and a
+    uniform error message.
+
+    Every command that takes a ``--config`` JSON argument routes through this
+    so malformed input behaves identically across the whole surface (the same
+    message and the same exit code), rather than each command inventing its own
+    error contract. ``example`` tailors the "must be a JSON object" hint to the
+    calling command.
+    """
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        err(f"--config is not valid JSON: {e}")
+        sys.exit(2)
+    if not isinstance(obj, dict):
+        err(f"--config must be a JSON object (e.g. '{example}').")
+        sys.exit(2)
+    return obj
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -830,14 +879,76 @@ def fetch_agents(creds: dict) -> list[dict]:
     return items
 
 
+def match_agents(agents: list[dict], target: str) -> list[dict]:
+    """All agents matching `target`, in resolution-priority order: an exact id
+    first, then id-prefix matches, then exact-name matches.
+
+    An exact id is unique, so it short-circuits to a single result. The same
+    agent never appears twice (a prefix match isn't re-listed as a name match),
+    so callers can count the result to detect ambiguity.
+    """
+    exact_id = [a for a in agents if a.get("agent_id") == target]
+    if exact_id:
+        return exact_id
+    prefix = [a for a in agents if (a.get("agent_id") or "").startswith(target)]
+    name = [a for a in agents if a.get("name") == target and a not in prefix]
+    return prefix + name
+
+
 def resolve_agent(agents: list[dict], target: str) -> dict | None:
-    """Match `target` against agents by exact id, then id-prefix, then exact
-    name. Returns the agent dict or None."""
-    return (
-        next((a for a in agents if a.get("agent_id") == target), None)
-        or next((a for a in agents if (a.get("agent_id") or "").startswith(target)), None)
-        or next((a for a in agents if a.get("name") == target), None)
-    )
+    """First agent matching `target` by exact id, id-prefix, then exact name,
+    or None. First-match (used by the active-agent selectors like `agents use`
+    and `chat`); see `resolve_agent_strict` for the write/destructive commands
+    that must refuse ambiguity instead of acting on an arbitrary match."""
+    matches = match_agents(agents, target)
+    return matches[0] if matches else None
+
+
+def resolve_agent_strict(agents: list[dict], target: str) -> tuple[dict | None, list[dict]]:
+    """Resolve `target` to exactly one agent. Returns (agent, []) on a unique
+    match, (None, candidates) when more than one matches, and (None, []) when
+    none do. Used by write/destructive commands, which must not act on an
+    arbitrary first match when a prefix or name is ambiguous."""
+    matches = match_agents(agents, target)
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
+    """Resolve `target` to exactly one agent for a write/destructive command,
+    or print why it could not and return None.
+
+    `target` falls back to the EESEL_AGENT environment variable. Unlike the
+    first-match `resolve_agent`, this refuses an ambiguous name: it lists the
+    candidates and returns None so the caller aborts rather than mutating an
+    arbitrary agent. Use this for every command that changes server state
+    (acl set, triggers/schedules add, actions disable, skills remove,
+    notifications, instructions set, …); reads that select an "active" agent
+    may keep using `resolve_agent`.
+    """
+    target = target or os.environ.get("EESEL_AGENT")
+    if not target:
+        err("No agent given. Pass one (e.g. `eesel skills add <agent> <skill>`) or set EESEL_AGENT.")
+        return None
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one with `eesel agents create` first.")
+        return None
+    agent, candidates = resolve_agent_strict(agents, target)
+    if agent:
+        return agent
+    if candidates:
+        err(f"'{target}' is ambiguous — it matches {len(candidates)} agents:")
+        for a in candidates:
+            # Show the full agent_id (not the 8-char display label) so the
+            # listed candidates are usable verbatim to disambiguate, even when
+            # they share a short id prefix.
+            err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+        err("Re-run with a full agent id to disambiguate.")
+    else:
+        err(f"No agent matches '{target}'.")
+    return None
 
 
 def confirm(prompt: str) -> bool:
