@@ -4499,6 +4499,23 @@ class TestSkillsRemove:
 
 
 class TestSkillsEdit:
+    def test_set_puts_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `set` is canonical; verify it does the config PUT.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(
+            _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3}')
+        )
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["body"] == {"threshold": 3}
+
+    def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
+        parser = eesel.build_parser()
+        sk_sub = _subparsers_action(_subparsers_action(parser).choices["skills"])
+        visible = [a.dest for a in sk_sub._choices_actions]
+        assert "set" in visible and "edit" not in visible
+
     def test_edit_puts_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)

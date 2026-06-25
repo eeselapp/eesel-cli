@@ -4264,7 +4264,8 @@ def cmd_skills(args) -> int:
         ok(f"Removed skill '{args.skill_id}' from {agent.get('name')} ({agent_id}).")
         return 0
 
-    if sub == "edit":
+    if sub in ("set", "edit"):
+        # `edit` is the prior name, kept as a hidden alias for `set`.
         config = parse_config_object(args.config)
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
         http_request("PUT", url, token=creds["token"], body=config)
@@ -5247,10 +5248,20 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_rm.add_argument("agent", help=_AGENT_HELP)
     sk_rm.add_argument("skill_id", help="Skill id to uninstall")
     sk_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-    sk_ed = sk_sub.add_parser("edit", help="Replace a skill's per-agent config with a JSON object")
-    sk_ed.add_argument("agent", help=_AGENT_HELP)
-    sk_ed.add_argument("skill_id", help="Skill id to configure")
-    sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
+    # `set` replaces a skill's per-agent config; `edit` is the prior name, kept
+    # as a hidden alias.
+    for _verb in ("set", "edit"):
+        sk_ed = sk_sub.add_parser(
+            _verb,
+            help="Replace a skill's per-agent config with a JSON object"
+            if _verb == "set" else argparse.SUPPRESS,
+        )
+        sk_ed.add_argument("agent", help=_AGENT_HELP)
+        sk_ed.add_argument("skill_id", help="Skill id to configure")
+        sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
+    # Hide the `edit` alias from `skills --help` and the metavar (canonical is `set`).
+    sk_sub._choices_actions = [a for a in sk_sub._choices_actions if a.dest != "edit"]
+    sk_sub.metavar = "{" + ",".join(ca.dest for ca in sk_sub._choices_actions) + "}"
     sp.set_defaults(func=cmd_skills)
 
     # All workspace commands act on the active workspace (creds["workspace_id"]);
