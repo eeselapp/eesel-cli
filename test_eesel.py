@@ -2287,6 +2287,42 @@ def _visible_commands(parser):
     return [a.dest for a in _subparsers_action(parser)._choices_actions]
 
 
+def _all_subparser_actions(parser):
+    """Every subparsers action in the parser tree (root + nested groups)."""
+    import argparse
+
+    out = []
+
+    def walk(p):
+        action = next((a for a in p._actions if isinstance(a, argparse._SubParsersAction)), None)
+        if action is None:
+            return
+        out.append(action)
+        for child in action.choices.values():
+            walk(child)
+
+    walk(parser)
+    return out
+
+
+def test_no_group_leaks_hidden_aliases_into_its_metavar():
+    # A hidden back-compat alias (help=SUPPRESS) must be dropped from BOTH the
+    # visible choice list and the usage-line metavar. argparse builds the metavar
+    # from every registered subparser unless it is pinned, so a group that pins
+    # the choice list but forgets the metavar leaks the alias into `--help` — as
+    # `schedules` once leaked `delete`/`run`. hide_subcommands() does both steps;
+    # this guards every group (and the root) at once so the leak can't return.
+    for action in _all_subparser_actions(eesel.build_parser(staff=False)):
+        metavar = action.metavar or ""
+        if not metavar:
+            continue
+        assert "SUPPRESS" not in metavar
+        inner = metavar.strip("{}")
+        listed = set(inner.split(",")) if inner else set()
+        visible = {a.dest for a in action._choices_actions}
+        assert listed == visible, f"metavar {metavar!r} != visible {sorted(visible)}"
+
+
 def _dev_flag_help(parser):
     login = _subparsers_action(parser).choices["login"]
     return next(a for a in login._actions if a.dest == "dev").help
@@ -4093,6 +4129,21 @@ class TestIntegrationsRemove:
         assert rc == 1
         assert "No connected integration matches" in capsys.readouterr().err
 
+    def test_ambiguous_type_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two integrations of the same type: `remove zendesk` must refuse and
+        # list candidates rather than disconnect an arbitrary one.
+        rows = [
+            {"id": "int-zd-1", "integrationType": "zendesk", "identifier": "acme"},
+            {"id": "int-zd-2", "integrationType": "zendesk", "identifier": "beta"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: rows)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous integration"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "int-zd-1" in out and "int-zd-2" in out
+
 
 class TestResolveIntegration:
     def test_matches_by_exact_id_then_prefix_then_type(self):
@@ -4104,6 +4155,25 @@ class TestResolveIntegration:
         assert eesel.resolve_integration(rows, "int-def")["integrationType"] == "intercom"
         assert eesel.resolve_integration(rows, "zendesk")["id"] == "int-abc-123"
         assert eesel.resolve_integration(rows, "nope") is None
+
+    def test_strict_refuses_ambiguous_type_and_lists_candidates(self, capsys):
+        # Two integrations of the same type: the strict (destructive) resolver
+        # must refuse rather than disconnect an arbitrary one.
+        rows = [
+            {"id": "int-zd-1", "integrationType": "zendesk", "identifier": "acme"},
+            {"id": "int-zd-2", "integrationType": "zendesk", "identifier": "beta"},
+        ]
+        assert eesel.resolve_integration_strict(rows, "zendesk") is None
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "int-zd-1" in out and "int-zd-2" in out
+
+    def test_strict_returns_unique_match(self):
+        rows = [
+            {"id": "int-abc-123", "integrationType": "zendesk"},
+            {"id": "int-def-456", "integrationType": "intercom"},
+        ]
+        assert eesel.resolve_integration_strict(rows, "zendesk")["id"] == "int-abc-123"
 
 
 class TestHttpRequestAllowError:
@@ -4510,7 +4580,7 @@ class TestSchedulesFire:
             captured["method"], captured["url"] = method, url
             return {"scheduled_at": "2026-06-24T09:00:00+00:00", "external_reference": "schedule_sch-1_x"}
 
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: self._match())
         monkeypatch.setattr(eesel, "http_request", fake)
         rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="heartbeat"))
         assert rc == 0
@@ -4520,19 +4590,34 @@ class TestSchedulesFire:
 
     def test_run_alias_still_fires(self, fake_creds, monkeypatch, capsys):
         # `run` is a backward-compat alias for `fire`.
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: self._match())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
         rc = eesel.cmd_schedules(_args(schedules_cmd="run", job="heartbeat"))
         assert rc == 0
         assert "Fired 'Heartbeat'" in capsys.readouterr().err
 
     def test_fire_no_match_errors(self, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: None)
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: None)
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
         rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="nope"))
         assert rc == 1
         assert sent["called"] is False
+
+    def test_fire_ambiguous_job_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # A title substring matching two jobs must refuse and list candidates
+        # rather than fire an arbitrary first match.
+        jobs = [
+            {"id": "sch-aa", "config": {"title": "Daily report"}, "agent_name": "Bot"},
+            {"id": "sch-bb", "config": {"title": "Weekly report"}, "agent_name": "Bot"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: jobs)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not fire an ambiguous job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="report"))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "sch-aa" in out and "sch-bb" in out
 
 
 class TestSchedulesAdd:
@@ -4605,7 +4690,7 @@ class TestSchedulesAdd:
 class TestSchedulesRemove:
     def test_remove_with_force_skips_confirm(self, fake_creds, monkeypatch, capsys):
         captured = {}
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-1", "config": {"title": "Daily"}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-1", "config": {"title": "Daily"}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
         monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--force must skip confirm"))
         rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-1", force=True))
@@ -4615,7 +4700,7 @@ class TestSchedulesRemove:
 
     def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
         sent = {"called": False}
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-2", "config": {}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-2", "config": {}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
         rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-2", force=False))
@@ -4624,7 +4709,7 @@ class TestSchedulesRemove:
 
     def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
         captured = {}
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "sch-3", "config": {}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-3", "config": {}, "agent_name": "Bot"})
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
         rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", force=True))
         assert rc == 0
@@ -4634,11 +4719,26 @@ class TestSchedulesRemove:
         # A non-matching value (e.g. a title with a space) must NOT be sent to the
         # server verbatim — it is resolved first, so an unmatched job is a clean
         # error, never an unhandled URL-construction exception.
-        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: None)
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: [])
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not call the server on an unmatched job"))
         rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="No Such Job", force=True))
         assert rc == 1
         assert "No scheduled job matches 'No Such Job'" in capsys.readouterr().err
+
+    def test_remove_ambiguous_job_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two jobs whose titles both contain the target: removing must refuse and
+        # list the candidates rather than delete an arbitrary first match.
+        jobs = [
+            {"id": "sch-aa", "config": {"title": "Daily report"}, "agent_name": "Bot"},
+            {"id": "sch-bb", "config": {"title": "Weekly report"}, "agent_name": "Bot"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: jobs)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="report", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "sch-aa" in out and "sch-bb" in out
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -5009,6 +5109,19 @@ class TestResolveMcpServer:
 
     def test_no_match_returns_none(self):
         assert eesel.resolve_mcp_server(self.SERVERS, "nope") is None
+
+    def test_strict_resolver_refuses_ambiguous_prefix(self, fake_creds, monkeypatch, capsys):
+        # Two servers sharing an id prefix: the write/destructive resolver must
+        # refuse and list candidates rather than act on an arbitrary one.
+        servers = [
+            {"id": "srv-shared-1", "name": "One"},
+            {"id": "srv-shared-2", "name": "Two"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        assert eesel._resolve_one_mcp_server(fake_creds, "srv-shared") is None
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "srv-shared-1" in out and "srv-shared-2" in out
 
 
 class TestMcpListCommand:

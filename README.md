@@ -140,6 +140,12 @@ trigger** (`zendesk_ticket_created`, etc.) fires the agent when something happen
 in an integration. A **scheduled job** runs the agent on a cron and can also be
 fired manually.
 
+> **Moved:** `eesel triggers` / `eesel triggers list` used to list scheduled
+> (cron) jobs as well. They now list **only event/webhook triggers** — scheduled
+> jobs are under `eesel schedules`. If you scripted `eesel triggers` to read cron
+> jobs, switch that call to `eesel schedules`. (The old `eesel triggers --all`
+> flag is gone; use the two groups.)
+
 ```bash
 eesel integrations                  # id, type, connection status, subdomain
 eesel integrations --json           # raw payload

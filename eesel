@@ -1201,15 +1201,47 @@ def fetch_integrations(creds: dict, *, agent_id: str | None = None) -> list[dict
     return data.get("integrations") or data.get("items") or []
 
 
+def match_integrations(integrations: list[dict], target: str) -> list[dict]:
+    """All connected integrations matching `target`, in resolution-priority
+    order: an exact id first, then id-prefix matches, then exact integration
+    type (e.g. ``zendesk``). The same integration never appears twice, so
+    callers can count the result to detect ambiguity."""
+    exact = [it for it in integrations if str(it.get("id")) == target]
+    if exact:
+        return exact
+    prefix = [it for it in integrations if str(it.get("id") or "").startswith(target)]
+    by_type = [it for it in integrations if it.get("integrationType") == target and it not in prefix]
+    return prefix + by_type
+
+
 def resolve_integration(integrations: list[dict], target: str) -> dict | None:
-    """Match `target` against connected integrations by exact id, then id
-    prefix, then exact integration type (e.g. ``zendesk``). Returns the
-    integration dict or None."""
-    return (
-        next((it for it in integrations if str(it.get("id")) == target), None)
-        or next((it for it in integrations if str(it.get("id") or "").startswith(target)), None)
-        or next((it for it in integrations if it.get("integrationType") == target), None)
-    )
+    """First integration matching `target` by exact id, id-prefix, then type, or
+    None. First-match — used by the read view (`integrations show`). The
+    destructive disconnect path uses `resolve_integration_strict`, which refuses
+    an ambiguous value rather than acting on an arbitrary match."""
+    matches = match_integrations(integrations, target)
+    return matches[0] if matches else None
+
+
+def resolve_integration_strict(integrations: list[dict], target: str) -> dict | None:
+    """Resolve `target` to exactly one integration for a destructive command, or
+    print why it could not (no match, or ambiguous with the candidates listed)
+    and return None. Disconnecting removes the integration and its synced
+    knowledge, so it must not act on an arbitrary first match."""
+    matches = match_integrations(integrations, target)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        err(f"No connected integration matches '{target}'. Run `eesel integrations list`.")
+        return None
+    err(f"'{target}' is ambiguous — it matches {len(matches)} integrations:")
+    for it in matches:
+        line = f"  {it.get('id', '?')}  {it.get('integrationType', '?')}"
+        if it.get("identifier"):
+            line += f"  {it['identifier']}"
+        err(line)
+    err("Re-run with a full integration id to disambiguate.")
+    return None
 
 
 def fetch_tools(creds: dict, agent_id: str) -> list[dict]:
@@ -1292,25 +1324,51 @@ def _trigger_integration_label(t: dict, id_to_type: dict) -> str:
     return key or "other"
 
 
-def resolve_scheduled_job(creds: dict, target: str) -> dict | None:
-    """Match `target` against scheduled jobs in the workspace.
-
-    Resolution order: exact id, id prefix, then case-insensitive substring of
-    config.title. Returns the augmented trigger dict, or None if nothing
-    matches.
-    """
-    rows = fetch_all_scheduled_jobs(creds)
-    match = next((t for t in rows if t.get("id") == target), None)
-    if match:
-        return match
-    match = next((t for t in rows if (t.get("id") or "").startswith(target)), None)
-    if match:
-        return match
+def match_scheduled_jobs(rows: list[dict], target: str) -> list[dict]:
+    """All scheduled jobs matching `target`, in resolution-priority order: an
+    exact id first, then id-prefix matches, then a case-insensitive substring of
+    config.title. The same job never appears twice, so callers can count the
+    result to detect ambiguity."""
+    exact = [t for t in rows if t.get("id") == target]
+    if exact:
+        return exact
+    prefix = [t for t in rows if (t.get("id") or "").startswith(target)]
     needle = target.lower()
-    return next(
-        (t for t in rows if needle in ((t.get("config") or {}).get("title") or "").lower()),
-        None,
-    )
+    by_title = [
+        t for t in rows
+        if needle in ((t.get("config") or {}).get("title") or "").lower() and t not in prefix
+    ]
+    return prefix + by_title
+
+
+def resolve_scheduled_job(creds: dict, target: str) -> dict | None:
+    """First scheduled job matching `target` by exact id, id-prefix, then title
+    substring, or None. First-match — used by the preview binds (`chat
+    --schedule`, `new --schedule`). The `fire`/`remove` paths use
+    `resolve_scheduled_job_strict`, which refuses an ambiguous value rather than
+    acting on an arbitrary match."""
+    matches = match_scheduled_jobs(fetch_all_scheduled_jobs(creds), target)
+    return matches[0] if matches else None
+
+
+def resolve_scheduled_job_strict(creds: dict, target: str) -> dict | None:
+    """Resolve `target` to exactly one scheduled job for `fire`/`remove`, or
+    print why it could not (no match, or ambiguous with the candidates listed)
+    and return None. A title substring can match several jobs, so firing or
+    deleting must not act on an arbitrary first match."""
+    matches = match_scheduled_jobs(fetch_all_scheduled_jobs(creds), target)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        err(f"No scheduled job matches '{target}'.")
+        info("Run `eesel schedules list` to see available jobs.")
+        return None
+    err(f"'{target}' is ambiguous — it matches {len(matches)} scheduled jobs:")
+    for t in matches:
+        title = (t.get("config") or {}).get("title") or "(untitled)"
+        err(f"  {t.get('id', '?')}  {title}")
+    err("Re-run with a full job id to disambiguate.")
+    return None
 
 
 def pick_agent(creds: dict, *, prompt: bool = True) -> str:
@@ -2245,10 +2303,8 @@ def _schedules_remove(creds: dict, args) -> int:
     error instead of being sent to the server verbatim. Prompts for
     confirmation unless --force is passed.
     """
-    match = resolve_scheduled_job(creds, args.job)
+    match = resolve_scheduled_job_strict(creds, args.job)
     if not match:
-        err(f"No scheduled job matches '{args.job}'.")
-        info("Run `eesel schedules list` to see available jobs.")
         return 1
 
     title = (match.get("config") or {}).get("title") or "(untitled)"
@@ -2266,10 +2322,8 @@ def _schedules_fire(creds: dict, target: str) -> int:
     """`eesel schedules fire <id|title>`: manually run a scheduled job once via
     POST /triggers/{id}/fire. `target` is resolved by id, id-prefix, or title
     substring."""
-    match = resolve_scheduled_job(creds, target)
+    match = resolve_scheduled_job_strict(creds, target)
     if not match:
-        err(f"No scheduled job matches '{target}'.")
-        info("Run `eesel schedules list` to see available jobs.")
         return 1
 
     url = f"{creds['api_url']}/triggers/{match['id']}/fire"
@@ -2535,9 +2589,8 @@ def _integrations_remove(args, creds: dict) -> int:
     confirmation unless `--force` is passed, since disconnecting removes the
     integration and its synced knowledge from the workspace.
     """
-    integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+    integration = resolve_integration_strict(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
     if not integration:
-        err(f"No connected integration matches '{args.id}'. Run `eesel integrations list`.")
         return 1
     integration_id = integration["id"]
     label = integration.get("integrationType") or integration_id
@@ -3730,16 +3783,24 @@ def fetch_mcp_servers(creds: dict, *, include_inactive: bool = True) -> list[dic
     return data.get("mcp_servers") or data.get("servers") or data.get("items") or []
 
 
-def resolve_mcp_server(servers: list[dict], target: str) -> dict | None:
-    """Match `target` against MCP servers by exact id, id prefix, then exact
-    name, returning the first match or None. Mirrors the agent resolver."""
-    exact = next((s for s in servers if s.get("id") == target), None)
+def match_mcp_servers(servers: list[dict], target: str) -> list[dict]:
+    """All MCP servers matching `target`, in resolution-priority order: an exact
+    id first, then id-prefix matches, then exact-name matches. The same server
+    never appears twice, so callers can count the result to detect ambiguity."""
+    exact = [s for s in servers if s.get("id") == target]
     if exact:
         return exact
-    prefix = next((s for s in servers if (s.get("id") or "").startswith(target)), None)
-    if prefix:
-        return prefix
-    return next((s for s in servers if s.get("name") == target), None)
+    prefix = [s for s in servers if (s.get("id") or "").startswith(target)]
+    by_name = [s for s in servers if s.get("name") == target and s not in prefix]
+    return prefix + by_name
+
+
+def resolve_mcp_server(servers: list[dict], target: str) -> dict | None:
+    """First MCP server matching `target` by exact id, id-prefix, then exact
+    name, or None. First-match; the write/destructive commands go through
+    `_resolve_one_mcp_server`, which refuses an ambiguous value."""
+    matches = match_mcp_servers(servers, target)
+    return matches[0] if matches else None
 
 
 def _mcp_create_body(name: str, url: str, config: dict | None = None) -> dict:
@@ -3773,11 +3834,20 @@ def _mcp_server_url(creds: dict, server_id: str, suffix: str = "") -> str:
 
 def _resolve_one_mcp_server(creds: dict, target: str) -> dict | None:
     """Resolve `target` to a single MCP server for a write/destructive command,
-    or print why it couldn't and return None."""
-    server = resolve_mcp_server(fetch_mcp_servers(creds), target)
-    if not server:
+    or print why it couldn't (no match, or ambiguous with the candidates listed)
+    and return None — so an ambiguous value can't change or delete an arbitrary
+    server."""
+    matches = match_mcp_servers(fetch_mcp_servers(creds), target)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
         err(f"No MCP server matches '{target}'.")
-    return server
+        return None
+    err(f"'{target}' is ambiguous — it matches {len(matches)} MCP servers:")
+    for s in matches:
+        err(f"  {s.get('id', '?')}  {s.get('name', '?')}")
+    err("Re-run with a full server id to disambiguate.")
+    return None
 
 
 def cmd_mcp(args) -> int:
@@ -4854,6 +4924,22 @@ def cmd_settings(args) -> int:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def hide_subcommands(sub_action, *names: str) -> None:
+    """Hide already-registered subparsers (back-compat aliases) from a group's
+    `--help`: drop them from the visible choice list AND rebuild the usage-line
+    metavar so neither the listed subcommands nor the `{...}` usage shows them.
+
+    argparse has no public API for a hidden alias: `help=argparse.SUPPRESS` only
+    blanks the description, so the choice still leaks into the metavar unless the
+    metavar is rebuilt from the trimmed list. Both steps live here so every group
+    hides aliases identically — a per-group copy of this once forgot the metavar
+    rebuild and leaked `delete`/`run` into `eesel schedules --help`.
+    """
+    hidden = set(names)
+    sub_action._choices_actions = [a for a in sub_action._choices_actions if a.dest not in hidden]
+    sub_action.metavar = "{" + ",".join(ca.dest for ca in sub_action._choices_actions) + "}"
+
+
 def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     """Register the documents command tree under `name`.
 
@@ -4888,10 +4974,6 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         rd.add_argument("--prefix", help="Filter the menu/list to keys under this prefix (e.g. files/, outputs/)")
         rd.add_argument("--format", default="md", choices=["md", "html"], help="Content format (default: md)")
         rd.add_argument("--json", action="store_true", help="Emit the document as a JSON object (id, key, content)")
-        if hide:
-            # Drop the alias from the listed choices so `--help` doesn't show a
-            # bare `==SUPPRESS==` row; it stays parseable.
-            d_sub._choices_actions = [a for a in d_sub._choices_actions if a.dest != verb]
 
     exp = d_sub.add_parser("export", help="Download a document as markdown or HTML")
     target = exp.add_mutually_exclusive_group(required=True)
@@ -4929,9 +5011,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         help="A key prefix to grant (repeatable). REPLACES the agent's current prefixes",
     )
 
-    # Rebuild the choices metavar from only the visible subcommands so the
-    # hidden `read` alias doesn't leak into the `{...}` usage line.
-    d_sub.metavar = "{" + ",".join(ca.dest for ca in d_sub._choices_actions) + "}"
+    hide_subcommands(d_sub, "read")  # `read` is the hidden alias for `show`
 
     sp.set_defaults(func=cmd_document, document_cmd="list", prefix=None, search=None, limit=100, offset=0)
     if hidden:
@@ -5050,9 +5130,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     use.add_argument("agent_id", nargs="?")
     a_sub.add_parser("unset", help=argparse.SUPPRESS)
 
-    _hidden_agents_cmds = {"use", "unset", "add", "edit"}
-    a_sub._choices_actions = [a for a in a_sub._choices_actions if a.dest not in _hidden_agents_cmds]
-    a_sub.metavar = "{" + ",".join(ca.dest for ca in a_sub._choices_actions) + "}"
+    hide_subcommands(a_sub, "use", "unset", "add", "edit")
 
     sp.set_defaults(func=cmd_agents)
 
@@ -5079,9 +5157,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     de.add_argument("session_id")
     show = s_sub.add_parser("show", help="Print session history")
     show.add_argument("session_id", nargs="?", help="(default: active session)")
-    # Drop the hidden `delete` alias from the help list and metavar (canonical is `remove`).
-    s_sub._choices_actions = [a for a in s_sub._choices_actions if a.dest != "delete"]
-    s_sub.metavar = "{" + ",".join(ca.dest for ca in s_sub._choices_actions) + "}"
+    hide_subcommands(s_sub, "delete")  # `delete` is the hidden alias for `remove`
     sp.set_defaults(func=cmd_sessions)
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
@@ -5153,9 +5229,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp_tools.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
     sp_tools.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp_tools.set_defaults(func=cmd_tools)
-    # SUPPRESS only blanks the description; drop the action from the choices
-    # list (same idiom as `impersonate` below) so the alias stays fully hidden.
-    # The metavar is rebuilt from _choices_actions at the end of this function.
+    # `tools` is the hidden top-level alias for `integrations <int> actions`.
+    # Only drop it from the choice list here; the root metavar is rebuilt once at
+    # the end of this function, after every top-level command has been added
+    # (unlike a group subparser, the root `sub` is still being populated below,
+    # so `hide_subcommands` — which pins the metavar immediately — can't be used).
     sub._choices_actions = [a for a in sub._choices_actions if a.dest != "tools"]
 
     # `eesel integrations` lists and manages the workspace's integrations
@@ -5260,9 +5338,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     a_di.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
-    # Hide the `edit` alias from `actions --help` and the metavar (canonical is `set`).
-    act_sub._choices_actions = [a for a in act_sub._choices_actions if a.dest != "edit"]
-    act_sub.metavar = "{" + ",".join(ca.dest for ca in act_sub._choices_actions) + "}"
+    hide_subcommands(act_sub, "edit")  # `edit` is the hidden alias for `set`
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
@@ -5304,14 +5380,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # its Authorization header (Auth0 logins no longer store one in credentials).
     m_sub.add_parser("token", help="Print a workspace token for the MCP client's Authorization header")
 
-    # Hide the `edit` alias from `mcp --help` and the metavar (canonical is `set`).
-    m_sub._choices_actions = [a for a in m_sub._choices_actions if a.dest != "edit"]
-    m_sub.metavar = "{" + ",".join(ca.dest for ca in m_sub._choices_actions) + "}"
+    hide_subcommands(m_sub, "edit")  # `edit` is the hidden alias for `set`
     sp.set_defaults(func=cmd_mcp, mcp_cmd="list")
 
     # `eesel triggers` covers event/webhook triggers only. Scheduled jobs (cron)
     # have their own command group below: `eesel schedules`.
-    sp = sub.add_parser("triggers", help="List, show, add, or remove event/webhook triggers")
+    sp = sub.add_parser(
+        "triggers",
+        help="List, show, add, or remove event/webhook triggers",
+        epilog="Lists event/webhook triggers only. Scheduled (cron) jobs moved to "
+        "`eesel schedules` — if you scripted `eesel triggers` to read cron jobs, "
+        "switch that call to `eesel schedules`.",
+    )
     sp.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
     sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>trigger_key<TAB>agent` row per trigger")
     t_sub = sp.add_subparsers(dest="triggers_cmd")
@@ -5368,8 +5448,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_run = sc_sub.add_parser("run", help=argparse.SUPPRESS)
     sc_run.add_argument("job")
 
-    _hidden_schedule_aliases = {"delete", "run"}
-    sc_sub._choices_actions = [a for a in sc_sub._choices_actions if a.dest not in _hidden_schedule_aliases]
+    hide_subcommands(sc_sub, "delete", "run")  # hidden aliases for `remove`/`fire`
     sp.set_defaults(func=cmd_schedules)
 
     sp = sub.add_parser("skills", help="List, show, add, remove, or configure an agent's skills")
@@ -5405,9 +5484,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         sk_ed.add_argument("agent", help=_AGENT_HELP)
         sk_ed.add_argument("skill_id", help="Skill id to configure")
         sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
-    # Hide the `edit` alias from `skills --help` and the metavar (canonical is `set`).
-    sk_sub._choices_actions = [a for a in sk_sub._choices_actions if a.dest != "edit"]
-    sk_sub.metavar = "{" + ",".join(ca.dest for ca in sk_sub._choices_actions) + "}"
+    hide_subcommands(sk_sub, "edit")  # `edit` is the hidden alias for `set`
     sp.set_defaults(func=cmd_skills)
 
     # All workspace commands act on the active workspace (creds["workspace_id"]);
@@ -5489,10 +5566,10 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=cmd_impersonate)
 
-    # Pin the `{...}` choices metavar to only the *visible* commands. argparse
-    # would otherwise build it from every registered subparser, leaking
-    # `impersonate` into the usage line even after we drop it from the
-    # descriptive list above.
+    # Pin the root `{...}` choices metavar to only the *visible* commands, now
+    # that every top-level subparser has been added. argparse would otherwise
+    # rebuild it from every registered subparser, leaking the hidden `tools` and
+    # `impersonate` aliases into the usage line.
     sub.metavar = "{" + ",".join(ca.dest for ca in sub._choices_actions) + "}"
 
     # Wire "did you mean?" suggestions across every subcommand level at once.
