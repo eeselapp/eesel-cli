@@ -4485,18 +4485,22 @@ class TestSkillsEdit:
         assert calls[0]["body"] == {"threshold": 3, "label": "urgent"}
 
     def test_edit_rejects_invalid_json_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Malformed --config exits with the shared parse_config_object contract
+        # (code 2) before any request is sent.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
-        rc = eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "{not json"))
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "{not json"))
+        assert exc.value.code == 2
         assert calls == []
         assert "not valid JSON" in capsys.readouterr().err
 
     def test_edit_rejects_non_object_json(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
-        rc = eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
+        assert exc.value.code == 2
         assert calls == []
         assert "must be a JSON object" in capsys.readouterr().err
 

@@ -4176,6 +4176,13 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     return None
 
 
+def _resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
+    """Back-compat wrapper around `resolve_agent_or_error`; delegates to the
+    shared resolver, which refuses an ambiguous name (skills add/remove/edit are
+    writes) rather than acting on an arbitrary first match."""
+    return resolve_agent_or_error(creds, target)
+
+
 def cmd_skills(args) -> int:
     """Manage the skills installed on an agent.
 
@@ -4254,14 +4261,7 @@ def cmd_skills(args) -> int:
         return 0
 
     if sub == "edit":
-        try:
-            config = json.loads(args.config)
-        except json.JSONDecodeError as e:
-            err(f"--config is not valid JSON: {e}")
-            return 1
-        if not isinstance(config, dict):
-            err("--config must be a JSON object (e.g. '{\"key\": \"value\"}').")
-            return 1
+        config = parse_config_object(args.config)
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
         http_request("PUT", url, token=creds["token"], body=config)
         ok(f"Updated config for skill '{args.skill_id}' on {agent.get('name')} ({agent_id}).")
