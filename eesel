@@ -2601,7 +2601,8 @@ def cmd_integration_actions(args) -> int:
         return _actions_show(args, creds)
     if sub == "enable":
         return _actions_enable(args, creds)
-    if sub == "edit":
+    if sub in ("set", "edit"):
+        # `edit` is the prior name, kept as a hidden alias for `set`.
         return _actions_edit(args, creds)
     if sub == "disable":
         return _actions_disable(args, creds)
@@ -5099,10 +5100,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     a_en.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_en)
 
-    a_ed = act_sub.add_parser("edit", help="Configure an action's settings, e.g. permission mode (POST with config)")
-    a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
-    a_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
-    _agent_arg(a_ed)
+    # `set` configures an action's settings; `edit` is the prior name, kept as
+    # a hidden alias.
+    for _verb in ("set", "edit"):
+        a_ed = act_sub.add_parser(
+            _verb,
+            help="Configure an action's settings, e.g. permission mode (POST with config)"
+            if _verb == "set" else argparse.SUPPRESS,
+        )
+        a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
+        a_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
+        _agent_arg(a_ed)
 
     a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
     a_di.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
@@ -5110,6 +5118,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     a_di.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
+    # Hide the `edit` alias from `actions --help` and the metavar (canonical is `set`).
+    act_sub._choices_actions = [a for a in act_sub._choices_actions if a.dest != "edit"]
+    act_sub.metavar = "{" + ",".join(ca.dest for ca in act_sub._choices_actions) + "}"
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
@@ -5330,7 +5341,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     return p
 
 
-_ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "edit")
+_ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "set", "edit")
 
 
 def _normalize_integrations_argv(argv: list[str]) -> list[str]:
