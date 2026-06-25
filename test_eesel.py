@@ -4774,6 +4774,16 @@ class TestMcpEditCommand:
         assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
         assert calls[0]["body"] == {"name": "Renamed"}
 
+    def test_set_is_canonical_edit_hidden_alias(self, tmp_config, fake_creds, monkeypatch):
+        # `set` is canonical and does the same PUT; `edit` is a hidden alias.
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123", "--name", "Renamed"))
+        assert rc == 0 and calls[0]["body"] == {"name": "Renamed"}
+        m_sub = _subparsers_action(_subparsers_action(eesel.build_parser()).choices["mcp"])
+        visible = [a.dest for a in m_sub._choices_actions]
+        assert "set" in visible and "edit" not in visible
+
     def test_url_only_sends_base_url(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
