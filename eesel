@@ -2536,7 +2536,8 @@ def cmd_mcp(args) -> int:
             info("(server returned no id; run `eesel mcp list` to confirm)")
         return 0
 
-    if sub == "edit":
+    if sub in ("set", "edit"):
+        # `edit` is the prior name, kept as a hidden alias for `set`.
         server = _resolve_one_mcp_server(creds, args.server)
         if not server:
             return 1
@@ -2840,10 +2841,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     m_add.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
     m_add.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
 
-    m_edit = m_sub.add_parser("edit", help="Change an MCP server's name or URL (only the flags you pass)")
-    m_edit.add_argument("server", help="Full id, id prefix, or exact name")
-    m_edit.add_argument("--name", help="New display name")
-    m_edit.add_argument("--url", help="New base URL")
+    # `set` changes an MCP server's fields; `edit` is the prior name, kept as a
+    # hidden alias.
+    for _verb in ("set", "edit"):
+        m_edit = m_sub.add_parser(
+            _verb,
+            help="Change an MCP server's name or URL (only the flags you pass)"
+            if _verb == "set" else argparse.SUPPRESS,
+        )
+        m_edit.add_argument("server", help="Full id, id prefix, or exact name")
+        m_edit.add_argument("--name", help="New display name")
+        m_edit.add_argument("--url", help="New base URL")
 
     m_enable = m_sub.add_parser("enable", help="Activate an MCP server")
     m_enable.add_argument("server", help="Full id, id prefix, or exact name")
@@ -2854,6 +2862,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     m_remove.add_argument("server", help="Full id, id prefix, or exact name")
     m_remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
+    # Hide the `edit` alias from `mcp --help` and the metavar (canonical is `set`).
+    m_sub._choices_actions = [a for a in m_sub._choices_actions if a.dest != "edit"]
+    m_sub.metavar = "{" + ",".join(ca.dest for ca in m_sub._choices_actions) + "}"
     sp.set_defaults(func=cmd_mcp, mcp_cmd="list")
 
     sp = sub.add_parser("triggers", help="List or fire triggers")
