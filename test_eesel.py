@@ -2313,9 +2313,22 @@ class TestNormalizeIntegrationsArgv:
             "integrations", "actions", "zendesk", "enable", "reply"]
 
     def test_actions_explicit_verbs_preserved(self):
-        for verb in ("list", "show", "enable", "disable", "edit"):
+        for verb in ("list", "show", "enable", "disable", "set", "edit"):
             argv = ["integrations", "zendesk", "actions", verb, "reply"]
             assert eesel._normalize_integrations_argv(argv) == ["integrations", "actions", "zendesk", verb, "reply"]
+
+    def test_actions_set_canonical_edit_hidden_alias(self):
+        # `set` is the canonical config verb; `edit` is a hidden alias.
+        parser = eesel.build_parser()
+        for verb in ("set", "edit"):
+            args = parser.parse_args(
+                eesel._normalize_integrations_argv(
+                    ["integrations", "zendesk", "actions", verb, "reply", "--config", "{}"]))
+            assert args.actions_cmd == verb
+        integrations = _subparsers_action(parser).choices["integrations"]
+        act_sub = _subparsers_action(integrations).choices["actions"]
+        visible = [a.dest for a in _subparsers_action(act_sub)._choices_actions]
+        assert "set" in visible and "edit" not in visible
 
     def test_flags_after_verb_kept_in_order(self):
         assert eesel._normalize_integrations_argv(
