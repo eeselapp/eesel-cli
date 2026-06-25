@@ -740,6 +740,173 @@ class TestResolveAgent:
         assert eesel.resolve_agent(agents, "ag")["name"] == "Short"
 
 
+class TestMatchAgents:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_exact_id_short_circuits_to_one(self):
+        assert eesel.match_agents(self.AGENTS, "agent-abc123") == [self.AGENTS[0]]
+
+    def test_ambiguous_prefix_returns_all(self):
+        # "agent-abc" prefixes two agents; both come back so callers can refuse.
+        matches = eesel.match_agents(self.AGENTS, "agent-abc")
+        assert len(matches) == 2
+
+    def test_ambiguous_name_returns_all(self):
+        assert len(eesel.match_agents(self.AGENTS, "Support Bot")) == 2
+
+    def test_no_double_listing_prefix_and_name(self):
+        # An agent matched by prefix is not also re-listed under the name pass.
+        agents = [{"agent_id": "abc", "name": "abc"}]
+        assert eesel.match_agents(agents, "abc") == agents
+
+
+class TestResolveAgentStrict:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_unique_match_returns_agent_no_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-def456")
+        assert agent["name"] == "Blog Writer"
+        assert candidates == []
+
+    def test_ambiguous_returns_none_with_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc")
+        assert agent is None
+        assert len(candidates) == 2
+
+    def test_no_match_returns_none_empty(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "nope")
+        assert agent is None
+        assert candidates == []
+
+
+class TestResolveAgentOrError:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+    ]
+
+    def test_unique_match_returns_agent(self, monkeypatch):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, "agent-abc123")["name"] == "Support Bot"
+
+    def test_ambiguous_lists_candidates_and_returns_none(self, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, "agent-abc") is None
+        errout = capsys.readouterr().err
+        assert "ambiguous" in errout
+        assert "agent-abc123" in errout and "agent-abc999" in errout
+
+    def test_no_target_errors(self, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        assert eesel.resolve_agent_or_error({}, None) is None
+        assert "No agent given" in capsys.readouterr().err
+
+    def test_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("EESEL_AGENT", "agent-abc123")
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, None)["agent_id"] == "agent-abc123"
+
+
+class TestConfirm:
+    def test_prompt_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
+        # The prompt must not land on stdout, or it would be captured by
+        # `eesel ... > out.txt`.
+        monkeypatch.setattr("builtins.input", lambda: "y")
+        eesel.confirm("Delete everything? [y/N] ")
+        captured = capsys.readouterr()
+        assert "Delete everything?" in captured.err
+        assert captured.out == ""
+
+    def test_yes_variants(self, monkeypatch):
+        for ans in ("y", "yes", "  YES  ", "Y"):
+            monkeypatch.setattr("builtins.input", lambda ans=ans: ans)
+            assert eesel.confirm("?") is True
+
+    def test_anything_else_is_no(self, monkeypatch):
+        for ans in ("", "n", "no", "maybe"):
+            monkeypatch.setattr("builtins.input", lambda ans=ans: ans)
+            assert eesel.confirm("?") is False
+
+    def test_eof_is_no(self, monkeypatch):
+        def boom():
+            raise EOFError
+        monkeypatch.setattr("builtins.input", boom)
+        assert eesel.confirm("?") is False
+
+
+class TestHttpRequestNonJson:
+    class _FakeResp:
+        def __init__(self, body: bytes, status: int = 200):
+            self._body = body
+            self.status = status
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_non_json_200_exits_cleanly(self, monkeypatch):
+        # A proxy/login HTML page served with status 200 must not raise a raw
+        # JSONDecodeError traceback.
+        html = b"<html><body>Gateway timeout</body></html>"
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
+        )
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://proxy/agents")
+        msg = str(exc.value)
+        assert "not JSON" in msg
+        assert "JSONDecodeError" not in msg
+
+    def test_empty_body_returns_empty_dict(self, monkeypatch):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(b"")
+        )
+        assert eesel.http_request("GET", "http://x/y") == {}
+
+    def test_valid_json_still_parsed(self, monkeypatch):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(b'{"ok": true}')
+        )
+        assert eesel.http_request("GET", "http://x/y") == {"ok": True}
+
+
+class TestParseConfigObject:
+    def test_valid_object(self):
+        assert eesel.parse_config_object('{"cron": "0 9 * * *"}') == {"cron": "0 9 * * *"}
+
+    def test_invalid_json_exits_2(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            eesel.parse_config_object("{not json}")
+        assert exc.value.code == 2
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_non_object_exits_2(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            eesel.parse_config_object('["a", "b"]')
+        assert exc.value.code == 2
+        assert "must be a JSON object" in capsys.readouterr().err
+
+    def test_example_in_message_is_customizable(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.parse_config_object("42", example='{"enabled": true}')
+        assert '{"enabled": true}' in capsys.readouterr().err
+
+
 class TestAgentLabel:
     def test_includes_name_and_short_id(self):
         label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
@@ -1207,17 +1374,29 @@ class TestArgParser:
         assert args.force is True
 
     def test_triggers_removed_verbs_no_longer_parse(self):
-        # The REST-derived verbs (`create`/`delete`) and the misplaced `fire`/`run`
-        # were renamed outright to the canonical set — they must not parse.
+        # The REST-derived verbs (`create`/`delete`) were renamed outright to the
+        # canonical set and must not parse.
         parser = eesel.build_parser()
         for argv in (
             ["triggers", "create", "Support Bot", "--key", "k"],
             ["triggers", "delete", "trg-1"],
-            ["triggers", "fire", "heartbeat"],
-            ["triggers", "run", "heartbeat"],
         ):
             with pytest.raises(SystemExit):
                 parser.parse_args(argv)
+
+    def test_triggers_fire_run_are_hidden_backcompat_aliases(self):
+        # `eesel triggers fire <job>` (and `run`) moved to `eesel schedules fire`,
+        # but are kept as hidden aliases so existing scripts still work.
+        parser = eesel.build_parser()
+        for verb in ("fire", "run"):
+            args = parser.parse_args(["triggers", verb, "heartbeat"])
+            assert args.triggers_cmd == verb
+            assert args.job == "heartbeat"
+
+    def test_triggers_all_flag_is_hidden_backcompat(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "--all"])
+        assert args.all is True
 
     def test_schedules_list_parses(self):
         parser = eesel.build_parser()
@@ -2247,19 +2426,23 @@ class TestTriggersAdd:
         assert sent["called"] is False
 
     def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
+        # Malformed --config exits with the shared parse_config_object contract
+        # (code 2) before any request is sent.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config="{not json"))
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config="{not json"))
+        assert exc.value.code == 2
         assert sent["called"] is False
 
     def test_add_non_object_config_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='["a", "b"]'))
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='["a", "b"]'))
+        assert exc.value.code == 2
         assert sent["called"] is False
 
 
@@ -2433,11 +2616,14 @@ class TestSchedulesAdd:
         assert sent["called"] is False
 
     def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
+        # Malformed --config exits with the shared parse_config_object contract
+        # (code 2) before any request is sent.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         sent = {"called": False}
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
-        rc = eesel.cmd_schedules(_args(schedules_cmd="add", agent="Support Bot", cron="0 9 * * *", title=None, timezone=None, config="{not json"))
-        assert rc == 1
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_schedules(_args(schedules_cmd="add", agent="Support Bot", cron="0 9 * * *", title=None, timezone=None, config="{not json"))
+        assert exc.value.code == 2
         assert sent["called"] is False
 
 
