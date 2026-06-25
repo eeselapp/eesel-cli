@@ -847,11 +847,13 @@ def parse_config_object(raw: str, *, example: str = '{"key": "value"}') -> dict:
     """Parse a ``--config`` JSON string into a dict, or exit with code 2 and a
     uniform error message.
 
-    Every command that takes a ``--config`` JSON argument routes through this
-    so malformed input behaves identically across the whole surface (the same
-    message and the same exit code), rather than each command inventing its own
+    The shared parser for plain ``--config`` JSON-object arguments (triggers
+    add, schedules add, skills edit, mcp add): malformed input gives the same
+    message and the same exit code, rather than each command inventing its own
     error contract. ``example`` tailors the "must be a JSON object" hint to the
-    calling command.
+    calling command. (Two commands keep bespoke parsers because their config
+    carries extra handling: ``integrations add`` and ``integrations actions
+    edit``.)
     """
     try:
         obj = json.loads(raw)
