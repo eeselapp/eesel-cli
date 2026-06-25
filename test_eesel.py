@@ -1587,8 +1587,18 @@ class TestAgentsVerbNaming:
 
     def test_canonical_verbs_visible_in_help(self):
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
-        for verb in ("list", "show", "create", "edit", "remove"):
+        for verb in ("list", "show", "create", "set", "remove"):
             assert verb in visible
+
+    def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
+        # `set` is canonical; `edit` keeps working as a hidden alias.
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        assert "edit" not in visible
+        calls = _capture_requests(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Z"))
+        assert rc == 0
+        assert calls[0]["body"] == {"name": "Z"}
 
     def test_use_and_unset_hidden_from_help(self):
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
@@ -1598,8 +1608,9 @@ class TestAgentsVerbNaming:
             assert verb not in metavar
 
     def test_removed_verbs_are_not_accepted(self):
-        # The old spellings no longer exist as subcommands at all.
-        for verb in ("get", "update", "delete", "set"):
+        # The old spellings no longer exist as subcommands at all. (`set` is now
+        # the canonical field-change verb, replacing `edit` — see the alias test.)
+        for verb in ("get", "update", "delete"):
             with pytest.raises(SystemExit):
                 _parse("agents", verb, "agent-abc123")
 

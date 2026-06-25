@@ -1622,7 +1622,8 @@ def cmd_agents(args) -> int:
         return _agents_get(args, creds)
     if sub == "create":
         return _agents_create(args, creds)
-    if sub == "edit":
+    if sub in ("set", "edit"):
+        # `edit` is the prior name, kept as a hidden alias for `set`.
         return _agents_update(args, creds)
     if sub == "remove":
         return _agents_delete(args, creds)
@@ -4881,10 +4882,23 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     create.add_argument("--name", help="Agent name (required)")
     create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
 
-    edit = a_sub.add_parser("edit", help="Change an agent's name or instructions (only the flags you pass)")
-    edit.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
-    edit.add_argument("--name", help="New name")
-    edit.add_argument("--instructions", help="New instructions / system prompt")
+    # Hidden alias: `agents add` behaves identically to `agents create` so the
+    # `add` verb (used to bring in every other noun) also works for agents.
+    add = a_sub.add_parser("add", help=argparse.SUPPRESS)
+    add.add_argument("--name", help="Agent name (required)")
+    add.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
+
+    # `set` changes an existing agent's fields; `edit` is the prior name, kept
+    # as a hidden alias.
+    for _verb in ("set", "edit"):
+        _p = a_sub.add_parser(
+            _verb,
+            help="Change an agent's name or instructions (only the flags you pass)"
+            if _verb == "set" else argparse.SUPPRESS,
+        )
+        _p.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
+        _p.add_argument("--name", help="New name")
+        _p.add_argument("--instructions", help="New instructions / system prompt")
 
     remove = a_sub.add_parser("remove", help="Remove an agent (asks for confirmation)")
     remove.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
@@ -4901,7 +4915,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     use.add_argument("agent_id", nargs="?")
     a_sub.add_parser("unset", help=argparse.SUPPRESS)
 
-    _hidden_agents_cmds = {"use", "unset"}
+    _hidden_agents_cmds = {"use", "unset", "add", "edit"}
     a_sub._choices_actions = [a for a in a_sub._choices_actions if a.dest not in _hidden_agents_cmds]
     a_sub.metavar = "{" + ",".join(ca.dest for ca in a_sub._choices_actions) + "}"
 
