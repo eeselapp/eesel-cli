@@ -848,29 +848,34 @@ class TestDocumentsAcl:
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == ["files/agent-test-456", "outputs/skills/agent-test-456"]
 
-    def test_set_replaces_prefixes_via_put_and_prints_readback(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_set_prints_server_readback_not_put_echo(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # The PUT response echoes the request (plus an auto-injected own-files
+        # prefix), but the server normalizes on store: a bare `files` is dropped
+        # and duplicates collapsed. `set` must report the GET readback, not the
+        # PUT echo, or it would overstate the access actually granted.
         calls = []
 
         def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
             calls.append((method, url, body))
-            # The server always re-adds the agent's own files/ prefix.
-            return {"key_prefixes": body["key_prefixes"] + ["files/agent-test-456"]}
+            if method == "PUT":
+                # Echo: request prefixes verbatim + the auto-injected own prefix.
+                return {"key_prefixes": body["key_prefixes"] + ["files/agent-test-456"]}
+            # GET readback: the normalized stored set — bare `files` dropped.
+            return {"key_prefixes": ["files/shared", "files/agent-test-456"]}
 
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_document(self._set_args("agent-test-456", ["outputs/skills/agent-test-456", "files/shared"]))
+        # User asks for a broad bare `files` plus a specific prefix.
+        rc = eesel.cmd_document(self._set_args("agent-test-456", ["files", "files/shared"]))
         assert rc == 0
-        assert calls == [
-            (
-                "PUT",
-                "http://localhost:8080/agents/agent-test-456/knowledge-acl",
-                {"key_prefixes": ["outputs/skills/agent-test-456", "files/shared"]},
-            )
-        ]
-        out = capsys.readouterr().out
-        assert "outputs/skills/agent-test-456" in out
-        assert "files/shared" in out
-        assert "files/agent-test-456" in out  # server-added, shown in readback
+        # PUT to write, then GET to read back what the server actually stored.
+        assert [c[0] for c in calls] == ["PUT", "GET"]
+        assert calls[0][2] == {"key_prefixes": ["files", "files/shared"]}
+        out_lines = capsys.readouterr().out.split()
+        # The normalized readback is printed; the dropped bare `files` is not.
+        assert "files/shared" in out_lines
+        assert "files/agent-test-456" in out_lines
+        assert "files" not in out_lines
 
     def test_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)

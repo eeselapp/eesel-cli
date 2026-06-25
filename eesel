@@ -950,16 +950,6 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     return None
 
 
-def confirm(prompt: str) -> bool:
-    """Prompt for a yes/no answer. Affirmative = `y` or `yes` (case-insensitive);
-    anything else, including a bare Enter or EOF, is treated as no."""
-    try:
-        answer = input(prompt).strip().lower()
-    except EOFError:
-        return False
-    return answer in ("y", "yes")
-
-
 def _agent_label(a: dict, active: str | None = None) -> str:
     """One-line display label for an agent, used in lists and pickers."""
     aid = a.get("agent_id", "?")
@@ -2517,10 +2507,10 @@ def _documents_acl(args) -> int:
     knowledge-ACL key prefixes (GET/PUT /agents/{agent_id}/knowledge-acl)."""
     creds = require_creds()
     sub = args.acl_cmd or "show"
-    agents = fetch_agents(creds)
-    agent = resolve_agent(agents, args.agent)
+    # `set` replaces the entire ACL, so refuse an ambiguous agent rather than
+    # rewriting the wrong agent's knowledge access on a first match.
+    agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
-        err(f"No agent matches '{args.agent}'.")
         return 1
     agent_id = agent["agent_id"]
     url = f"{creds['api_url']}/agents/{agent_id}/knowledge-acl"
@@ -2542,8 +2532,13 @@ def _documents_acl(args) -> int:
         # PUT replaces the entire prefix set (it does not append). The server
         # always re-adds the agent's own `files/{agent_id}` prefix, so it can't
         # be removed even if omitted here.
-        data = http_request("PUT", url, token=creds["token"], body={"key_prefixes": args.prefix})
-        prefixes = data.get("key_prefixes") or []
+        http_request("PUT", url, token=creds["token"], body={"key_prefixes": args.prefix})
+        # The PUT response echoes the request; the server normalizes on store
+        # (drops a bare `files`, dedupes, re-adds files/{agent_id}). Read the
+        # state back with a GET so we report what was actually granted, not what
+        # we asked for — otherwise an agent could believe it granted broader
+        # access than the server kept.
+        prefixes = http_request("GET", url, token=creds["token"]).get("key_prefixes") or []
         ok(f"Set {len(prefixes)} key prefix(es) for {agent.get('name')} ({agent_id}).")
         for prefix in prefixes:
             print(prefix)
