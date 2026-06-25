@@ -2054,6 +2054,50 @@ def _triggers_list_events(creds: dict, *, as_json: bool = False) -> int:
     return 0
 
 
+def cmd_tools(args) -> int:
+    """Hidden back-compat alias for the removed `eesel tools` command.
+
+    The action surface moved under `eesel integrations <integration> actions`,
+    which lists one integration at a time. This alias preserves the old
+    behavior — a read-only list of an agent's actions across all integrations —
+    so existing scripts that call `eesel tools [agent]` keep working.
+    Defaults to the active agent; pass an id / id-prefix / name for another.
+    """
+    creds = require_creds()
+    agents = fetch_agents(creds)
+    if not agents:
+        err("No agents in workspace. Create one in the dashboard first.")
+        return 1
+    target = getattr(args, "agent", None)
+    if target:
+        agent = resolve_agent(agents, target)
+        if not agent:
+            err(f"No agent matches '{target}'.")
+            return 1
+    else:
+        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
+        if not agent:
+            err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
+            return 1
+
+    agent_id = agent["agent_id"]
+    tools = fetch_tools(creds, agent_id)
+    if getattr(args, "json", False):
+        print(json.dumps(tools, indent=2))
+        return 0
+    if not tools:
+        info(f"(no tools/actions configured for {agent.get('name', agent_id)})")
+        return 0
+
+    info(f"# {agent.get('name', '?')} ({agent_id[:12]}) — {len(tools)} tool{'s' if len(tools) != 1 else ''}")
+    rows = sorted((_tool_row(t) for t in tools), key=lambda r: (r["integration_key"], r["name"].lower()))
+    fmt = " {:<32}  {:<5}  {:<13}  {:<16}  {}"
+    info(fmt.format("name", "r/w", "permission", "integration", "integration_id"))
+    for r in rows:
+        print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_key"][:16], r["integration_id"][:12]))
+    return 0
+
+
 def cmd_schedules(args) -> int:
     """`eesel schedules`: scheduled jobs — cron-driven agent runs. These are
     triggers whose key is the scheduled-job sentinel; the CLI gives them their
@@ -2483,11 +2527,19 @@ def _resolve_actions_agent(creds: dict, target: str | None) -> dict | None:
         err("No agents in workspace. Create one in the dashboard first.")
         return None
     if target:
-        agent = resolve_agent(agents, target)
-        if not agent:
+        # Actions subcommands include destructive writes (disable/edit), so an
+        # ambiguous name is refused rather than resolved to an arbitrary match.
+        agent, candidates = resolve_agent_strict(agents, target)
+        if agent:
+            return agent
+        if candidates:
+            err(f"'{target}' is ambiguous — it matches {len(candidates)} agents:")
+            for a in candidates:
+                err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+            err("Re-run with a full agent id to disambiguate.")
+        else:
             err(f"No agent matches '{target}'.")
-            return None
-        return agent
+        return None
     agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
     if not agent:
         err("No active agent. Run `eesel agents use` to pick one (or pass --agent).")
@@ -4940,6 +4992,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     _add_documents_parser(sub, "documents")
     _add_documents_parser(sub, "document", hidden=True)
 
+    # Hidden back-compat alias: the read-only `eesel tools [agent]` command was
+    # restructured into `eesel integrations <integration> actions`. Keep `tools`
+    # working (suppressed from help) so existing scripts don't break.
+    sp_tools = sub.add_parser("tools", help=argparse.SUPPRESS)
+    sp_tools.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    sp_tools.add_argument("--json", action="store_true", help="Emit the raw tools payload")
+    sp_tools.set_defaults(func=cmd_tools)
+    # SUPPRESS only blanks the description; drop the action from the choices
+    # list (same idiom as `impersonate` below) so the alias stays fully hidden.
+    # The metavar is rebuilt from _choices_actions at the end of this function.
+    sub._choices_actions = [a for a in sub._choices_actions if a.dest != "tools"]
+
     # `eesel integrations` lists and manages the workspace's integrations
     # (add/connect, remove/disconnect, sync). Actions an integration exposes are
     # scoped under it:
@@ -5030,7 +5094,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
     a_di.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_di)
-    a_di.add_argument("--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    a_di.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
 

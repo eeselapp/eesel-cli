@@ -5380,6 +5380,25 @@ class TestIntegrationActionsWrite:
         assert "Aborted" in capsys.readouterr().err
 
 
+class TestToolsBackCompatAndForce:
+    def test_tools_is_hidden_backcompat_alias(self):
+        # `eesel tools [agent]` was restructured to `integrations ... actions`,
+        # but the read-only alias is kept (suppressed) for existing scripts.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tools", "Support Bot"])
+        assert args.func is eesel.cmd_tools
+        assert args.agent == "Support Bot"
+
+    def test_tools_hidden_from_help(self):
+        assert "tools" not in _visible_commands(eesel.build_parser())
+
+    def test_actions_disable_accepts_short_force_flag(self):
+        parser = eesel.build_parser()
+        argv = ["integrations", "actions", "zendesk", "disable", "zendesk_tag_ticket", "-f"]
+        args = parser.parse_args(eesel._normalize_integrations_argv(argv))
+        assert args.force is True
+
+
 class TestNormalizeIntegrationsArgv:
     def test_bare_integrations_untouched(self):
         # The integration listing path is left alone.
