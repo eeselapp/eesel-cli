@@ -4827,25 +4827,39 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         sub._choices_actions = [a for a in sub._choices_actions if a.dest != name]
 
 
-def _suggest_subcommand(parser: argparse.ArgumentParser, choices: list[str]) -> None:
-    """Make an unknown subcommand on ``parser`` suggest the closest valid one.
+def _install_suggestions(parser: argparse.ArgumentParser) -> None:
+    """Make every subcommand level suggest the closest valid name on a typo.
 
-    By default argparse fails an unknown subcommand with a bare "invalid choice".
-    This replaces the parser's error handler so that, when the failure is about
-    an unrecognized subcommand, it appends a "did you mean X?" hint pointing at
-    the nearest match. All other parse errors fall through to the default.
+    By default argparse fails an unknown subcommand with a bare "invalid
+    choice", which dead-ends the user (or an agent). For each parser that has
+    subcommands, this replaces the error handler so an unrecognized subcommand
+    gets a "Did you mean X?" hint (nearest match by edit distance), then
+    recurses into the child parsers so nested levels behave the same. Other
+    parse errors fall through unchanged. Called once on the root after the whole
+    tree is built, so it covers every noun automatically.
     """
+    sub_action = next(
+        (a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None
+    )
+    if sub_action is None:
+        return
+    # Suggest only visible subcommands (hidden back-compat aliases are dropped
+    # from _choices_actions), falling back to all choices if none are visible.
+    visible = [a.dest for a in sub_action._choices_actions]
+    choices = visible or list(sub_action.choices)
     original_error = parser.error
 
-    def error(message: str) -> None:
+    def error(message: str, _orig=original_error, _choices=choices) -> None:
         if "invalid choice" in message:
             bad = message.split("invalid choice: ", 1)[1].split(" ", 1)[0].strip("'\"")
-            near = difflib.get_close_matches(bad, choices, n=1)
-            hint = f" Did you mean {near[0]!r}?" if near else f" Choose from: {', '.join(choices)}."
+            near = difflib.get_close_matches(bad, _choices, n=1)
+            hint = f" Did you mean {near[0]!r}?" if near else f" Choose from: {', '.join(_choices)}."
             message = message + hint
-        original_error(message)
+        _orig(message)
 
     parser.error = error  # type: ignore[method-assign]
+    for child in sub_action.choices.values():
+        _install_suggestions(child)
 
 
 def build_parser(staff: bool = False) -> argparse.ArgumentParser:
@@ -5001,7 +5015,6 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_ex.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: last 7 days)")
     tk_ex.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
     sp.set_defaults(func=cmd_tasks, tasks_cmd="list", limit=50, page=1, agent=None)
-    _suggest_subcommand(sp, ["list", "count", "show", "cost", "analytics", "export"])
 
     # `documents` is the canonical (plural) noun. Singular `document` is kept as
     # a hidden alias (registered below) so existing scripts keep working.
@@ -5360,6 +5373,8 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # descriptive list above.
     sub.metavar = "{" + ",".join(ca.dest for ca in sub._choices_actions) + "}"
 
+    # Wire "did you mean?" suggestions across every subcommand level at once.
+    _install_suggestions(p)
     return p
 
 

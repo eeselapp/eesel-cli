@@ -2196,6 +2196,29 @@ class TestMainStaffGating:
         assert self._run_capturing_staff(monkeypatch) is False
 
 
+class TestSubcommandSuggestions:
+    def test_top_level_typo_suggests_nearest(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["agentss"])
+        assert "Did you mean 'agents'?" in capsys.readouterr().err
+
+    def test_nested_typo_suggests_nearest(self, capsys):
+        # Suggestions are installed at every level, not just one noun.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["sessions", "lst"])
+        assert "Did you mean 'list'?" in capsys.readouterr().err
+
+    def test_no_close_match_lists_choices(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["zzzzzz"])
+        assert "Choose from:" in capsys.readouterr().err
+
+    def test_valid_subcommand_unaffected(self):
+        # The error override must not interfere with successful parses.
+        args = eesel.build_parser().parse_args(["sessions", "list"])
+        assert args.sessions_cmd == "list"
+
+
 class TestArgParser:
     def test_parser_builds(self):
         # Smoke test: argparse construction shouldn't blow up.
