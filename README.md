@@ -144,9 +144,12 @@ eesel integrations                  # id, type, connection status, subdomain
 eesel integrations --json           # raw payload
 eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
 
-eesel tools                         # the scoped agent's tools/actions
-eesel tools <id-or-name>            # ...for a specific agent
-eesel tools --json                  # raw payload
+# Actions (formerly `tools`) are scoped under their integration
+eesel integrations <integration> actions list <agent>      # the agent's actions for one integration
+eesel integrations <integration> actions show <agent> <action>
+eesel integrations <integration> actions enable <agent> <action>
+eesel integrations <integration> actions disable <agent> <action>   # -f to skip the prompt
+eesel integrations <integration> actions edit <agent> <action> --config '{...}'
 
 # Event/webhook triggers
 eesel triggers                      # every event trigger, grouped by integration
@@ -162,13 +165,31 @@ eesel schedules fire <id-or-title>  # run one manually, now
 eesel schedules remove <id>
 ```
 
-`eesel tools` lists each tool's name, read/write action, permission mode, and
-integration. `eesel triggers` shows each event trigger's type, config, last-run
-time, and integration. `eesel schedules` shows each job's title, cron, and
-timezone. Secret-looking values in trigger config (access tokens, signing
-secrets) are masked in the human view; use `--json` for the raw payload.
-`eesel integrations --secrets` reveals integration credentials and is gated to
-sysadmin/impersonator accounts.
+`eesel integrations <integration> actions list <agent>` lists each action's
+name, read/write kind, permission mode, and integration. `eesel triggers` shows
+each event trigger's type, config, last-run time, and integration. `eesel
+schedules` shows each job's title, cron, and timezone. Secret-looking values in
+trigger config (access tokens, signing secrets) are masked in the human view;
+use `--json` for the raw payload. `eesel integrations --secrets` reveals
+integration credentials and is gated to sysadmin/impersonator accounts.
+
+### `edit` vs `set`
+
+Two write verbs that look similar but mean different things:
+
+- **`edit`** replaces a free-form object — a skill's or action's `--config`
+  JSON, or an agent's name/instructions. You pass the whole value.
+- **`set`** writes a single named field. `eesel workspace set <field> <value>`
+  and `eesel documents acl set <agent> --prefix …` write one specific thing.
+
+Rule of thumb: if the command takes a `--config` JSON blob it's `edit`; if it
+writes one named field it's `set`.
+
+Some renamed commands keep **hidden back-compat aliases** so existing scripts
+don't break: `eesel tools [agent]` still works (now `eesel integrations <x>
+actions`), `eesel triggers fire <id>` maps to `eesel schedules fire`, `eesel
+triggers --all` lists every trigger, and `eesel agents add` aliases `eesel
+agents create`. They're hidden from `--help`; prefer the canonical spellings.
 
 ## Cost
 
