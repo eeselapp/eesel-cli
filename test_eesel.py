@@ -1392,6 +1392,13 @@ class TestArgParser:
             args = parser.parse_args(["triggers", verb, "heartbeat"])
             assert args.triggers_cmd == verb
             assert args.job == "heartbeat"
+        # ...and they must be hidden from `triggers --help`: absent from both the
+        # subcommand choices list and the metavar (no `==SUPPRESS==` leak).
+        triggers_sub = _subparsers_action(parser).choices["triggers"]
+        visible = [a.dest for a in _subparsers_action(triggers_sub)._choices_actions]
+        assert "fire" not in visible and "run" not in visible
+        metavar = _subparsers_action(triggers_sub).metavar or ""
+        assert "fire" not in metavar and "run" not in metavar
 
     def test_triggers_all_flag_is_hidden_backcompat(self):
         parser = eesel.build_parser()
