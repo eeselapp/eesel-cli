@@ -5335,18 +5335,6 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel triggers list`)")
     t_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
-    # Hidden back-compat aliases: `eesel triggers fire <id>` (and `run`) used to
-    # manually run a scheduled job before that moved to `eesel schedules fire`.
-    for _alias in ("fire", "run"):
-        t_fire = t_sub.add_parser(_alias, help=argparse.SUPPRESS)
-        t_fire.add_argument("job", help="Full id, id prefix, or substring of the job title")
-    # SUPPRESS only blanks the description; drop the aliases from the choices
-    # list and rebuild the metavar (same idiom as `agents add` / `tools`) so
-    # `==SUPPRESS==` doesn't leak into `eesel triggers --help`.
-    _hidden_trigger_cmds = {"fire", "run"}
-    t_sub._choices_actions = [a for a in t_sub._choices_actions if a.dest not in _hidden_trigger_cmds]
-    t_sub.metavar = "{" + ",".join(ca.dest for ca in t_sub._choices_actions) + "}"
-
     sp.set_defaults(func=cmd_triggers)
 
     # `eesel schedules` — scheduled jobs (cron-driven agent runs). Split out from

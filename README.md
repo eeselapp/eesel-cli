@@ -189,9 +189,9 @@ writes one named field it's `set`.
 
 Some renamed commands keep **hidden back-compat aliases** so existing scripts
 don't break: `eesel tools [agent]` still works (now `eesel integrations <x>
-actions`), `eesel triggers fire <id>` maps to `eesel schedules fire`, `eesel
-triggers --all` lists every trigger, and `eesel agents add` aliases `eesel
-agents create`. They're hidden from `--help`; prefer the canonical spellings.
+actions`) and `eesel agents add` aliases `eesel agents create`. They're hidden
+from `--help`; prefer the canonical spellings. Manually firing a scheduled job
+is `eesel schedules fire <id>` (the old `eesel triggers fire` has been removed).
 
 ## Cost
 

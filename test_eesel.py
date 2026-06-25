@@ -2616,31 +2616,18 @@ class TestArgParser:
 
     def test_triggers_removed_verbs_no_longer_parse(self):
         # The REST-derived verbs (`create`/`delete`) were renamed to the canonical
-        # set and must not parse. (`fire`/`run` remain as hidden back-compat
-        # aliases — see test_triggers_fire_run_are_hidden_backcompat_aliases.)
+        # set and must not parse. `fire`/`run` previously lingered as triggers
+        # aliases that no longer dispatched; manually firing a scheduled job now
+        # lives solely under `eesel schedules fire`, so they must not parse here.
         parser = eesel.build_parser()
         for argv in (
             ["triggers", "create", "Support Bot", "--key", "k"],
             ["triggers", "delete", "trg-1"],
+            ["triggers", "fire", "heartbeat"],
+            ["triggers", "run", "heartbeat"],
         ):
             with pytest.raises(SystemExit):
                 parser.parse_args(argv)
-
-    def test_triggers_fire_run_are_hidden_backcompat_aliases(self):
-        # `eesel triggers fire <job>` (and `run`) moved to `eesel schedules fire`,
-        # but are kept as hidden aliases so existing scripts still work.
-        parser = eesel.build_parser()
-        for verb in ("fire", "run"):
-            args = parser.parse_args(["triggers", verb, "heartbeat"])
-            assert args.triggers_cmd == verb
-            assert args.job == "heartbeat"
-        # ...and they must be hidden from `triggers --help`: absent from both the
-        # subcommand choices list and the metavar (no `==SUPPRESS==` leak).
-        triggers_sub = _subparsers_action(parser).choices["triggers"]
-        visible = [a.dest for a in _subparsers_action(triggers_sub)._choices_actions]
-        assert "fire" not in visible and "run" not in visible
-        metavar = _subparsers_action(triggers_sub).metavar or ""
-        assert "fire" not in metavar and "run" not in metavar
 
     def test_schedules_list_parses(self):
         parser = eesel.build_parser()
@@ -3516,7 +3503,7 @@ class TestTaskExport:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Integrations / tools / triggers --all  (read-only inspectors)
+# Integrations / tools / triggers list  (read-only inspectors)
 # ──────────────────────────────────────────────────────────────────────────
 
 
