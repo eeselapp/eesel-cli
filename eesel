@@ -82,11 +82,19 @@ DEV_JWT_SECRET = "dev-fallback-secret-key-not-for-production"
 POSTGRES_CONTAINER = "slack-postgres_db_dev-1"
 POSTGRES_DB = "eesel_dev"
 
-# 30 days. Matches the long-lived TTL that /workspaces/token applies when
-# called with `client: "cli"` (server/app/api/agents/agents.py). In prod the
-# value comes from the server response; this constant is the dev-path
-# fallback when the CLI self-mints its own JWT.
+# 30 days. The TTL the CLI self-mints its dev JWT with (--dev path). Also the
+# long-lived TTL that /workspaces/token applies to the workspace token minted
+# lazily for MCP (server/app/api/agents/agents.py).
 CLI_TOKEN_TTL_SECONDS = 30 * 24 * 3600
+
+# Prod logins store a short-lived Auth0 access token plus a refresh token.
+# Renew the access token this many seconds before it expires so a command
+# doesn't start with a token that dies mid-request.
+TOKEN_REFRESH_SKEW_SECONDS = 120
+
+# Conservative fallback when the dashboard bridge / refresh response omits the
+# access token's TTL. Short on purpose: the refresh path renews it promptly.
+PROD_TOKEN_TTL_FALLBACK_SECONDS = 3600
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -273,14 +281,71 @@ def save_creds(creds: dict) -> None:
         pass
 
 
+def refresh_prod_token(creds: dict) -> dict | None:
+    """Exchange the stored Auth0 refresh token for a fresh access token.
+
+    The dashboard performs the actual grant — it holds the Auth0 client secret,
+    which must never live on a user's machine — so the CLI just hands it the
+    refresh token. On success, updates `token`/`refresh_token`/`expires_at` in
+    place, saves, and returns the creds. Returns None if the refresh failed
+    (e.g. the refresh token was revoked, or rotated away because the dashboard
+    session refreshed), leaving the caller to decide whether to force re-login.
+    """
+    dashboard = creds.get("dashboard_url") or ENVS["prod"]["dashboard"]
+    payload = json.dumps({"refresh_token": creds["refresh_token"]}).encode()
+    req = urllib.request.Request(
+        f"{dashboard}/api/cli/refresh",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Unlike http_request, a failed refresh must not exit the process — it's
+    # recoverable by re-login — so we handle errors locally.
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read() or b"{}")
+    except Exception:
+        return None
+
+    access_token = data.get("access_token")
+    if not access_token:
+        return None
+    creds["token"] = access_token
+    if data.get("refresh_token"):
+        creds["refresh_token"] = data["refresh_token"]
+    expires_in = data.get("expires_in")
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        expires_in = PROD_TOKEN_TTL_FALLBACK_SECONDS
+    creds["expires_at"] = int(time.time()) + expires_in
+    save_creds(creds)
+    return creds
+
+
 def require_creds() -> dict:
     creds = load_creds()
     if not creds:
         err("Not logged in. Run `eesel login` first.")
         sys.exit(1)
-    if creds.get("expires_at") and time.time() > creds["expires_at"]:
+
+    expires_at = creds.get("expires_at") or 0
+    near_expiry = bool(expires_at) and time.time() > expires_at - TOKEN_REFRESH_SKEW_SECONDS
+
+    # Prod logins carry an Auth0 refresh token — renew silently rather than
+    # making the user re-run `eesel login`.
+    if near_expiry and creds.get("refresh_token"):
+        refreshed = refresh_prod_token(creds)
+        if refreshed:
+            return refreshed
+        # Refresh failed. If the access token is already dead we can't proceed;
+        # if it's merely near expiry, fall through and use it for this command.
+        if time.time() > expires_at:
+            err("Session expired and refresh failed. Run `eesel login` again.")
+            sys.exit(1)
+    # Dev tokens (and any login without a refresh token) can't be renewed.
+    elif expires_at and time.time() > expires_at:
         err("Token expired. Run `eesel login` again.")
         sys.exit(1)
+
     return creds
 
 
@@ -703,6 +768,58 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _creds_from_login_payload(captured: dict, api_url: str, dashboard: str) -> dict:
+    """Build stored credentials from the browser bridge's POST to /auth.
+
+    Supports both handoff formats so a current CLI works against any dashboard:
+
+    - **Auth0 (preferred, what new logins request via `token=auth0`):**
+      `access_token` + `refresh_token`. The CLI acts as the real user, so every
+      `@requires_auth` route (writes + billing) works in prod, and the token
+      refreshes silently. TTL is short, so a missing `expires_in` falls back to
+      a conservative window that the refresh path renews.
+
+    - **Workspace token (back-compat):** a bare `token`, handed back by a
+      dashboard that predates the Auth0 handoff — or after a rollback, since the
+      dashboard keeps the workspace flow as its default. Reads work; writes and
+      billing still 401 in prod (the original limitation this migration removes
+      for Auth0 logins). TTL falls back to the 30-day workspace lifetime.
+    """
+    access_token = captured.get("access_token")
+    refresh_token = captured.get("refresh_token")
+    workspace_token = captured.get("token")
+    workspace_id = captured.get("workspace_id") or captured.get("workspaceId")
+    user_email = captured.get("user_email") or captured.get("email")
+
+    creds = {
+        "env": "prod",
+        "api_url": api_url,
+        "dashboard_url": dashboard,
+        "workspace_id": workspace_id,
+        "user_email": user_email,
+        "agent_id": None,  # picked on first chat / via `eesel agents use`
+    }
+
+    if access_token and refresh_token:
+        creds["token"] = access_token
+        creds["refresh_token"] = refresh_token
+        default_ttl = PROD_TOKEN_TTL_FALLBACK_SECONDS
+    elif workspace_token:
+        creds["token"] = workspace_token
+        default_ttl = CLI_TOKEN_TTL_SECONDS
+    else:
+        sys.exit(f"Auth response missing a token: {captured}")
+
+    if not workspace_id:
+        sys.exit(f"Auth response missing workspace_id: {captured}")
+
+    expires_in = captured.get("expires_in")
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        expires_in = default_ttl
+    creds["expires_at"] = int(time.time()) + expires_in
+    return creds
+
+
 def login_prod() -> dict:
     """Browser bridge: open dashboard.eesel.ai/cli, capture token via local HTTP server."""
     state = secrets_mod.token_urlsafe(24)
@@ -773,7 +890,11 @@ def login_prod() -> dict:
     # /cli reads the cookie server-side — state never lives in the URL,
     # so it can't end up in browser history, referrer headers, or be
     # injected by a malicious deep-link.
-    url = f"{dashboard}/api/cli/init?{urllib.parse.urlencode({'port': port, 'state': state})}"
+    # `token=auth0` opts into the Auth0-token handoff (access + refresh token)
+    # so writes and billing reads work in prod. The dashboard defaults to the
+    # legacy workspace token when the param is absent, so older CLIs are
+    # unaffected.
+    url = f"{dashboard}/api/cli/init?{urllib.parse.urlencode({'port': port, 'state': state, 'token': 'auth0'})}"
     info(f"Opening {url}")
     info("If the browser didn't open, paste that URL manually.")
     try:
@@ -786,32 +907,13 @@ def login_prod() -> dict:
         sys.exit("Timed out waiting for browser auth (5 min).")
     server.shutdown()
 
-    token = captured.get("token")
-    workspace_id = captured.get("workspace_id") or captured.get("workspaceId")
-    user_email = captured.get("user_email") or captured.get("email")
-    if not token or not workspace_id:
-        sys.exit(f"Auth response missing fields: {captured}")
-
-    # `expires_in` is forwarded from the server's /workspaces/token response
-    # by the dashboard bridge (CliAuthClient.tsx). It's the source of truth
-    # for the JWT's `exp` claim. Fall back to the dev-path default only if
-    # the bridge is older than the server change that added the field.
-    expires_in = captured.get("expires_in")
-    if not isinstance(expires_in, int) or expires_in <= 0:
-        expires_in = CLI_TOKEN_TTL_SECONDS
-
-    creds = {
-        "env": "prod",
-        "api_url": api_url,
-        "dashboard_url": dashboard,
-        "workspace_id": workspace_id,
-        "user_email": user_email,
-        "agent_id": None,  # picked on first chat / via `eesel agents use`
-        "token": token,
-        "expires_at": int(time.time()) + expires_in,
-    }
+    # The CLI requests the Auth0 handoff (`token=auth0`), but accepts whichever
+    # credential the dashboard returns — Auth0 tokens from a current dashboard,
+    # or a workspace token from one that predates the handoff / after a rollback.
+    creds = _creds_from_login_payload(captured, api_url, dashboard)
     save_creds(creds)
-    ok(f"Logged in — workspace={workspace_id}{f' as {user_email}' if user_email else ''}")
+    ok(f"Logged in — workspace={creds['workspace_id']}"
+       + (f" as {creds['user_email']}" if creds.get("user_email") else ""))
     return creds
 
 
@@ -916,15 +1018,12 @@ def fetch_tools(creds: dict, agent_id: str) -> list[dict]:
 def _is_sysadmin(creds: dict) -> bool:
     """True if the caller is on the impersonator/sysadmin allowlist.
 
-    Reuses the GET /cli/impersonate introspection `whoami` surfaces (it returns
-    ``{"allowed": bool}``). Fails closed: any error — including http_request's
-    sys.exit on a non-200 from an older server — means "not a sysadmin".
+    Reuses the same introspection `whoami` uses (`/sysadmin/impersonator-status`,
+    normalized to ``{"allowed": bool}``). Fails closed: any error means "not a
+    sysadmin".
     """
-    try:
-        status = http_request("GET", f"{creds['api_url']}/cli/impersonate", token=creds["token"])
-    except (Exception, SystemExit):
-        return False
-    return bool(isinstance(status, dict) and status.get("allowed"))
+    status = _get_impersonate_status(creds)
+    return bool(status and status.get("allowed"))
 
 
 def _tool_row(t: dict) -> dict:
@@ -1054,12 +1153,14 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
     if sess.get("trigger_id"):
         body["triggerId"] = sess["trigger_id"]
     url = f"{creds['api_url']}/agents/sandbox/start"
+    # sandbox/start decodes the bearer with HS256 only (it predates the Auth0
+    # migration), so an Auth0 login must send a minted workspace token here.
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {creds['token']}",
+            "Authorization": f"Bearer {workspace_token(creds)}",
         },
         method="POST",
     )
@@ -1095,7 +1196,9 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
         headers = {}
     else:
         url = f"{creds['api_url']}/agents/chat/{task_id}/raw-stream"
-        headers = {"Authorization": f"Bearer {creds['token']}"}
+        # Same HS256-only chat auth as sandbox/start — mint a workspace token
+        # for Auth0 logins (the streamUrl path above is presigned, no header).
+        headers = {"Authorization": f"Bearer {workspace_token(creds)}"}
     req = urllib.request.Request(url, headers=headers)
 
     text_buffers: dict[str, str] = {}
@@ -1152,22 +1255,31 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
 
 
 def _get_impersonate_status(creds: dict) -> dict | None:
-    """GET /cli/impersonate, returning the parsed JSON or None on any error.
+    """Best-effort impersonation status, normalized to ``{allowed, target_user_id}``.
 
-    Unlike `http_request`, this never calls sys.exit — it's for best-effort
-    checks (whoami display, caching the staff-command gate) where a network
-    hiccup or older server must not abort the CLI.
+    Reads `/sysadmin/impersonator-status` (the same endpoint the dashboard uses,
+    now reachable with the CLI's Auth0 token). Never calls sys.exit — whoami
+    display and the staff-command gate must not abort the CLI on a network
+    hiccup.
+
+    `allowed` is whether the caller may impersonate. `target_user_id` is the
+    *active* target or None: the endpoint reports the effective user as
+    `target_uid` even when idle, so a target counts as active only when an
+    impersonator origin is present (i.e. a swap actually happened).
     """
     try:
         req = urllib.request.Request(
-            f"{creds['api_url']}/cli/impersonate",
+            f"{creds['api_url']}/sysadmin/impersonator-status",
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {creds['token']}"},
             method="GET",
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read() or b"{}")
+            data = json.loads(resp.read() or b"{}")
     except Exception:
         return None
+    allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
+    target = data.get("target_uid") if data.get("impersonator_uid") else None
+    return {"allowed": allowed, "target_user_id": target}
 
 
 def cache_impersonator_flag(creds: dict) -> bool:
@@ -1620,9 +1732,9 @@ def cmd_impersonate(args) -> int:
     Sets (or clears) a sticky impersonation target on the server. From the
     moment you set a target, every subsequent `eesel` command behaves as if
     that user were calling — auth, workspace context, agents, integrations.
-    Calls `/cli/impersonate` (workspace-JWT authed), which mirrors the
-    semantics of `/sysadmin/set-impersonator-target` for the CLI's token
-    shape.
+    Calls the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target`
+    and `/sysadmin/clear-impersonator-target`), reachable now that the CLI
+    authenticates with an Auth0 token.
 
     Combine with `eesel chat --trigger heartbeat` to preview a target's
     heartbeat, or just `eesel chat` to run a general chat as them. WRITE
@@ -1640,9 +1752,9 @@ def cmd_impersonate(args) -> int:
         return 1
 
     if target == "clear":
-        url = f"{creds['api_url']}/cli/impersonate"
+        url = f"{creds['api_url']}/sysadmin/clear-impersonator-target"
         try:
-            http_request("DELETE", url, token=creds["token"])
+            http_request("GET", url, token=creds["token"])
         except urllib.error.HTTPError as e:
             try:
                 payload = json.loads(e.read().decode("utf-8") or "{}")
@@ -1653,20 +1765,22 @@ def cmd_impersonate(args) -> int:
         ok("Impersonation cleared.")
         return 0
 
-    url = f"{creds['api_url']}/cli/impersonate"
+    # GET-with-side-effect, matching the /sysadmin/* convention. The target
+    # user id goes in the `target` query param.
+    url = f"{creds['api_url']}/sysadmin/set-impersonator-target?{urllib.parse.urlencode({'target': target})}"
     try:
-        resp = http_request("POST", url, token=creds["token"], body={"target_user_id": target})
+        resp = http_request("GET", url, token=creds["token"])
     except urllib.error.HTTPError as e:
         try:
             payload = json.loads(e.read().decode("utf-8") or "{}")
         except Exception:
             payload = {}
         err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
-        if e.code == 401:
+        if e.code in (401, 403):
             info("This command requires a sysadmin/impersonator account. Your current login isn't on the allowlist.")
         return 1
 
-    ok(f"Impersonating: {resp.get('target_user_id') or target}")
+    ok(f"Impersonating: {resp.get('target') or target}")
     info("All subsequent `eesel` commands run as this user.")
     info("Run `eesel whoami` to confirm. Clear with `eesel impersonate clear`.")
     return 0
@@ -1868,10 +1982,11 @@ def cmd_cost(args) -> int:
 # chats, the website widget, helpdesk ticket replies, scheduled-trigger runs,
 # and sub-agent spawns. This is the same data the dashboard's Activity view
 # shows — distinct from CLI "sessions", which are just local handles you
-# created. Backed entirely by the workspace-JWT endpoints POST /workspace/tasks
-# and GET /workspace/tasks/{id}/history, so this needs no extra auth and no
-# backend changes. (Staff preview/impersonation tasks are filtered out
-# server-side, so they never appear here.)
+# created. Backed by the workspace-JWT endpoints POST /workspace/tasks and
+# GET /workspace/tasks/{id}/history, which decode the bearer with HS256 only —
+# so an Auth0 login routes through `workspace_token()` to send a minted
+# workspace token rather than its RS256 access token. (Staff preview/
+# impersonation tasks are filtered out server-side, so they never appear here.)
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -1893,7 +2008,7 @@ def fetch_tasks(creds: dict, *, limit: int = 50, page: int = 1, agent_id: str | 
         "sorting": "updatedDate",
         "sort_order": 1,  # descending — most recently updated first
     }
-    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=workspace_token(creds), body=body)
     rows = data.get("tasks") or []
     # Server already sorts, but belt-and-braces in case grouping reorders.
     rows.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
@@ -1910,13 +2025,13 @@ def count_tasks(creds: dict, *, agent_id: str | None = None) -> int:
     if agent_id:
         filters["agent"] = [agent_id]
     body = {"page": 1, "limit": 1, "filters": filters, "grouping": "status"}
-    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=creds["token"], body=body)
+    data = http_request("POST", f"{creds['api_url']}/workspace/tasks", token=workspace_token(creds), body=body)
     return int(data.get("totalCount") or 0)
 
 
 def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
     """Return one task's history as a list of runs: ``[{run_id, items:[...]}]``."""
-    data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=creds["token"])
+    data = http_request("GET", f"{creds['api_url']}/workspace/tasks/{task_id}/history", token=workspace_token(creds))
     return data.get("runs") or []
 
 
@@ -2245,6 +2360,73 @@ def mcp_call_tool(creds: dict, tool_name: str, arguments: dict) -> dict:
     raise RuntimeError("Tool returned an invalid response")
 
 
+def mint_workspace_token(creds: dict, agent_id: str | None = None) -> str:
+    """Mint a 30-day workspace token (HS256) for the MCP endpoint.
+
+    The CLI's primary credential is an Auth0 access token, but `/mcp` only
+    accepts a workspace token. POST /workspaces/token exchanges the Auth0
+    Bearer for one; `client:"cli"` opts into the 30-day TTL. Returns the token
+    string, or exits with the server's error.
+    """
+    body: dict = {"client": "cli"}
+    if agent_id:
+        body["agent_id"] = agent_id
+    data = http_request(
+        "POST", f"{creds['api_url']}/workspaces/token", token=creds["token"], body=body
+    )
+    token = data.get("token")
+    if not token:
+        sys.exit("Mint failed: /workspaces/token returned no token.")
+    return token
+
+
+def workspace_token(creds: dict) -> str:
+    """Return a token accepted by the legacy HS256 workspace-token endpoints.
+
+    A handful of routes predate the Auth0 migration and still decode the bearer
+    with HS256 only — `/workspace/tasks`, `/workspace/tasks/analytics`,
+    `/workspace/tasks/{id}/history`, and `/agents/sandbox/start` (chat). An Auth0
+    login holds an RS256 access token these routes reject, so exchange it for an
+    HS256 workspace token. Workspace-token and dev logins already hold a token
+    these routes accept, so use it directly.
+
+    The minted token is cached on `creds` for the life of the process so a
+    multi-turn chat or a tasks command doesn't re-mint on every request.
+    """
+    if not creds.get("refresh_token"):
+        return creds["token"]
+    cached = creds.get("_workspace_token")
+    if not cached:
+        cached = mint_workspace_token(creds, creds.get("agent_id"))
+        creds["_workspace_token"] = cached
+    return cached
+
+
+def cmd_mcp(args) -> int:
+    """`eesel mcp token` — print a workspace token for an MCP client header.
+
+    External MCP clients (Claude Code, Cursor) send the workspace token as
+    their `Authorization: Bearer`. Since `eesel login` now stores an Auth0
+    token instead, this mints the workspace token on demand:
+
+        claude mcp add --transport http eesel "$(eesel whoami ...)/mcp" \\
+          --header "Authorization: Bearer $(eesel mcp token)"
+    """
+    creds = require_creds()
+    sub = args.mcp_cmd or "token"
+    if sub == "token":
+        # Auth0 logins must exchange their access token for a workspace token,
+        # since `/mcp` only accepts the latter. Workspace-token and dev logins
+        # already hold a token `/mcp` accepts — print it directly.
+        if creds.get("refresh_token"):
+            print(mint_workspace_token(creds, creds.get("agent_id")))
+        else:
+            print(creds["token"])
+        return 0
+    err(f"Unknown mcp command: {sub}")
+    return 1
+
+
 def _document_record(creds: dict, *, document_id: str | None = None, document_key: str | None = None) -> dict | None:
     """Look up a single document dict (id, key, name) the CLI agent owns."""
     if document_key:
@@ -2530,6 +2712,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
     sp.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp.set_defaults(func=cmd_tools)
+
+    sp = sub.add_parser("mcp", help="Set up eesel's MCP server for external clients (Claude Code, Cursor)")
+    m_sub = sp.add_subparsers(dest="mcp_cmd")
+    m_sub.add_parser("token", help="Print a workspace token for the MCP client's Authorization header")
+    sp.set_defaults(func=cmd_mcp, mcp_cmd="token")
 
     sp = sub.add_parser("triggers", help="List or fire triggers")
     # --all (+ --json) live on both the parent and the `list` subparser so both
