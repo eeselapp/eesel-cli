@@ -950,16 +950,6 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     return None
 
 
-def confirm(prompt: str) -> bool:
-    """Prompt for a yes/no answer. Affirmative = `y` or `yes` (case-insensitive);
-    anything else, including a bare Enter or EOF, is treated as no."""
-    try:
-        answer = input(prompt).strip().lower()
-    except EOFError:
-        return False
-    return answer in ("y", "yes")
-
-
 def _agent_label(a: dict, active: str | None = None) -> str:
     """One-line display label for an agent, used in lists and pickers."""
     aid = a.get("agent_id", "?")
@@ -2564,26 +2554,15 @@ def _skill_is_on(skill: dict) -> bool:
 
 
 def _resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
-    """Resolve `target` to one agent, or print why it couldn't and return None.
+    """Resolve `target` to exactly one agent, or print why not and return None.
 
     The agent scope is explicit: `target` is the positional you typed, falling
     back to the ``EESEL_AGENT`` environment variable. There is no hidden stateful
-    "current agent" mode. Matches by exact id, id-prefix, then exact name
-    (see `resolve_agent`).
+    "current agent" mode. Delegates to the shared resolver, which refuses an
+    ambiguous name (skills add/remove/edit are writes) rather than acting on an
+    arbitrary first match.
     """
-    target = target or os.environ.get("EESEL_AGENT")
-    if not target:
-        err("No agent given. Pass one (e.g. `eesel skills list <agent>`) or set EESEL_AGENT.")
-        return None
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
-        return None
-    agent = resolve_agent(agents, target)
-    if not agent:
-        err(f"No agent matches '{target}'.")
-        return None
-    return agent
+    return resolve_agent_or_error(creds, target)
 
 
 def cmd_skills(args) -> int:
@@ -2664,14 +2643,7 @@ def cmd_skills(args) -> int:
         return 0
 
     if sub == "edit":
-        try:
-            config = json.loads(args.config)
-        except json.JSONDecodeError as e:
-            err(f"--config is not valid JSON: {e}")
-            return 1
-        if not isinstance(config, dict):
-            err("--config must be a JSON object (e.g. '{\"key\": \"value\"}').")
-            return 1
+        config = parse_config_object(args.config)
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
         http_request("PUT", url, token=creds["token"], body=config)
         ok(f"Updated config for skill '{args.skill_id}' on {agent.get('name')} ({agent_id}).")
