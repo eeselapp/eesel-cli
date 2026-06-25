@@ -365,15 +365,23 @@ def apply_agent_env_override(creds: dict) -> dict:
 
     The value is a full id, id-prefix, or agent name — resolved exactly like
     `--agent`. Resolution needs the agent list, so this makes one extra API
-    call, but only when EESEL_AGENT is actually set. An unresolvable value is a
-    hard error so a typo fails loudly here instead of silently falling back to
-    the wrong agent."""
+    call, but only when EESEL_AGENT is actually set. A value that matches no
+    agent — or an ambiguous prefix/name that matches more than one — is a hard
+    error, so a typo or an under-specified value fails loudly here instead of
+    silently scoping the command to the wrong agent. This mirrors the strict
+    resolution the write/destructive commands use on their `--agent` target."""
     target = (os.environ.get("EESEL_AGENT") or "").strip()
     if not target:
         return creds
-    match = resolve_agent(fetch_agents(creds), target)
+    match, candidates = resolve_agent_strict(fetch_agents(creds), target)
     if not match:
-        err(f"EESEL_AGENT='{target}' matches no agent in this workspace.")
+        if candidates:
+            err(f"EESEL_AGENT='{target}' is ambiguous — it matches {len(candidates)} "
+                "agents. Use a full id (shown below):")
+            for a in candidates:
+                print(f"   {a.get('agent_id', '?')}  {a.get('name', '?')}", file=sys.stderr)
+        else:
+            err(f"EESEL_AGENT='{target}' matches no agent in this workspace.")
         sys.exit(1)
     # Copy so the override stays in memory for this process and is never saved.
     creds = dict(creds)
@@ -1563,6 +1571,11 @@ def cmd_agents(args) -> int:
         if getattr(args, "json", False):
             print(json.dumps(agents, indent=2))
             return 0
+        if getattr(args, "plain", False):
+            for a in agents:
+                state = "on" if a.get("is_active") else "off"
+                print(f"{str(a.get('agent_id') or '')}\t{state}\t{str(a.get('name') or '')}")
+            return 0
         if not agents:
             info("(no agents)")
             return 0
@@ -1620,6 +1633,11 @@ def cmd_agents(args) -> int:
         return 0
     if sub == "show":
         return _agents_get(args, creds)
+    if sub == "instructions":
+        # An agent's instructions are an attribute of the agent, so they're
+        # reachable under the `agents` noun too. The top-level `eesel
+        # instructions` is kept as a convenience alias for the same view.
+        return cmd_instructions(args)
     if sub == "create":
         return _agents_create(args, creds)
     if sub in ("set", "edit"):
@@ -1628,22 +1646,6 @@ def cmd_agents(args) -> int:
     if sub == "remove":
         return _agents_delete(args, creds)
     return 1
-
-
-def _resolve_one_agent(target: str, creds: dict) -> dict | None:
-    """Resolve `target` to exactly one agent for a write/destructive command, or
-    print why it couldn't and return None. Ambiguous matches list the candidates
-    and refuse rather than acting on an arbitrary one."""
-    agent, candidates = resolve_agent_strict(fetch_agents(creds), target)
-    if agent:
-        return agent
-    if candidates:
-        err(f"'{target}' matches {len(candidates)} agents — narrow it down (full id shown):")
-        for a in candidates:
-            print(f"   {a.get('agent_id', '?')}  {a.get('name', '?')}", file=sys.stderr)
-    else:
-        err(f"No agent matches '{target}'.")
-    return None
 
 
 def _agents_create(args, creds: dict) -> int:
@@ -1662,20 +1664,28 @@ def _agents_create(args, creds: dict) -> int:
 
 
 def _agents_update(args, creds: dict) -> int:
-    agent = _resolve_one_agent(args.agent_id, creds)
+    agent = resolve_agent_or_error(creds, args.agent_id)
     if not agent:
         return 1
     body = build_agent_update_body(name=args.name, instructions=args.instructions)
     if not body:
         err("Nothing to change. Pass --name and/or --instructions.")
         return 1
-    http_request("PUT", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"], body=body)
-    ok(f"Edited {agent.get('name')} ({agent['agent_id']}): {', '.join(body.keys())}")
+    aid = agent["agent_id"]
+    http_request("PUT", f"{creds['api_url']}/agents/{aid}", token=creds["token"], body=body)
+    # Read the record back rather than trusting the 200: confirm every field the
+    # user changed now holds the value we sent.
+    updated = http_request("GET", f"{creds['api_url']}/agents/{aid}", token=creds["token"])
+    mismatched = [k for k, v in body.items() if updated.get(k) != v]
+    if mismatched:
+        err(f"Server accepted the change but {', '.join(mismatched)} did not update as sent.")
+        return 1
+    ok(f"Edited {updated.get('name') or agent.get('name')} ({aid}): {', '.join(body.keys())}")
     return 0
 
 
 def _agents_delete(args, creds: dict) -> int:
-    agent = _resolve_one_agent(args.agent_id, creds)
+    agent = resolve_agent_or_error(creds, args.agent_id)
     if not agent:
         return 1
     if not args.force and not confirm(f"Remove agent '{agent.get('name')}' ({agent['agent_id']})? [y/N] "):
@@ -1696,7 +1706,7 @@ def _agents_get(args, creds: dict) -> int:
     """Print one agent's full record: id, type, live/off status, description, and
     instructions. The agent listing already carries every field, so this resolves
     the target from that list rather than making a second call."""
-    agent = _resolve_one_agent(args.agent_id, creds)
+    agent = resolve_agent_or_error(creds, args.agent_id)
     if not agent:
         return 1
     if getattr(args, "json", False):
@@ -1826,9 +1836,10 @@ def cmd_sessions(args) -> int:
         set_current(sess["id"])
         ok(f"Active session: {sess['id']} ({sess.get('name')})")
         return 0
-    if sub == "delete":
+    if sub in ("remove", "delete"):
+        # `remove` is canonical; `delete` is the prior name, kept as a hidden alias.
         if delete_session(args.session_id):
-            ok(f"Deleted {args.session_id}.")
+            ok(f"Removed {args.session_id}.")
         else:
             err(f"No session {args.session_id}.")
             return 1
@@ -1855,7 +1866,11 @@ def cmd_triggers(args) -> int:
     sub = args.triggers_cmd or "list"
 
     if sub == "list":
-        return _triggers_list_events(creds, as_json=getattr(args, "json", False))
+        return _triggers_list_events(
+            creds,
+            as_json=getattr(args, "json", False),
+            as_plain=getattr(args, "plain", False),
+        )
 
     if sub == "show":
         return _triggers_show(creds, args.trigger_id, as_json=getattr(args, "json", False))
@@ -1939,15 +1954,35 @@ def _triggers_add(creds: dict, args) -> int:
     return 0
 
 
+def _resolve_trigger(creds: dict, trigger_id: str) -> dict | None:
+    """Find one event/webhook trigger by exact id or id-prefix, from the
+    workspace-wide list (there is no single-trigger GET endpoint). Returns the
+    trigger dict or None. Shared by `show` and `remove` so a prefix resolves to
+    a full id client-side: a bad or partial id is a clean 'no match' here rather
+    than a 500 from `DELETE /triggers/{prefix}` (the server has no such row)."""
+    rows = fetch_all_event_triggers(creds)
+    match = next((t for t in rows if t.get("id") == trigger_id), None)
+    if match is None:
+        match = next((t for t in rows if (t.get("id") or "").startswith(trigger_id)), None)
+    return match
+
+
 def _triggers_remove(creds: dict, args) -> int:
     """`eesel triggers remove <id> [--force]`: DELETE /triggers/{id}.
 
-    Prompts for confirmation unless --force is passed. The id is the trigger's
-    own id (the first column of `eesel triggers list`), not the trigger key.
+    The id is the trigger's own id (the first column of `eesel triggers list`),
+    accepted as a full id or an unambiguous prefix. Prompts for confirmation
+    unless --force is passed.
     """
-    trigger_id = args.trigger_id
+    match = _resolve_trigger(creds, args.trigger_id)
+    if match is None:
+        err(f"No event/webhook trigger matches '{args.trigger_id}'.")
+        info("Run `eesel triggers list` to see triggers (the first column is the id).")
+        return 1
+    trigger_id = match.get("id")
+    label = match.get("trigger_key") or trigger_id
     if not getattr(args, "force", False):
-        if not confirm(f"Remove trigger {trigger_id}? This cannot be undone. [y/N] "):
+        if not confirm(f"Remove trigger {trigger_id} ({label})? This cannot be undone. [y/N] "):
             info("Cancelled.")
             return 1
 
@@ -1963,10 +1998,7 @@ def _triggers_show(creds: dict, trigger_id: str, *, as_json: bool = False) -> in
     workspace-wide list (GET /agents/{id}/triggers across agents) by exact id or
     id prefix. Secrets in the config are masked in the human view; --json emits
     the raw payload."""
-    rows = fetch_all_event_triggers(creds)
-    match = next((t for t in rows if t.get("id") == trigger_id), None)
-    if match is None:
-        match = next((t for t in rows if (t.get("id") or "").startswith(trigger_id)), None)
+    match = _resolve_trigger(creds, trigger_id)
     if match is None:
         err(f"No event/webhook trigger matches '{trigger_id}'.")
         info("Run `eesel triggers list` to see triggers (the first column is the id).")
@@ -2001,13 +2033,21 @@ def _trigger_enabled(t: dict) -> bool:
     return True
 
 
-def _triggers_list_events(creds: dict, *, as_json: bool = False) -> int:
+def _triggers_list_events(creds: dict, *, as_json: bool = False, as_plain: bool = False) -> int:
     """`eesel triggers list`: every event/webhook trigger in the workspace,
     grouped by integration. Scheduled jobs are excluded — see `eesel schedules
     list`. Read-only."""
     rows = fetch_all_event_triggers(creds)
     if as_json:
         print(json.dumps(rows, indent=2))
+        return 0
+    if as_plain:
+        for t in rows:
+            state = "on" if _trigger_enabled(t) else "off"
+            print(
+                f"{str(t.get('id') or '')}\t{state}\t"
+                f"{str(t.get('trigger_key') or '')}\t{str(t.get('agent_name') or '')}"
+            )
         return 0
     if not rows:
         info("(no event/webhook triggers in this workspace)")
@@ -2281,6 +2321,13 @@ def _integrations_list(args, creds: dict) -> int:
     integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
     if getattr(args, "json", False):
         print(json.dumps(integrations, indent=2))
+        return 0
+    if getattr(args, "plain", False):
+        for it in integrations:
+            print(
+                f"{str(it.get('id') or '')}\t{str(it.get('integrationType') or '')}\t"
+                f"{str(it.get('connectionStatus') or '')}\t{str(it.get('identifier') or '')}"
+            )
         return 0
     if not integrations:
         info("(no integrations)")
@@ -3374,6 +3421,14 @@ def cmd_tasks(args) -> int:
         if getattr(args, "json", False):
             print(json.dumps({"tasks": rows, "has_next": has_next, "next_page": next_page}, indent=2))
             return 0
+        if getattr(args, "plain", False):
+            for r in rows:
+                agent = r.get("agent_name") or r.get("agent_id") or ""
+                print(
+                    f"{str(r.get('task_id') or '')}\t{str(_fmt_task_ts(r.get('updated_at')) or '')}\t"
+                    f"{str(agent or '')}\t{str(_task_source(r) or '')}\t{str(_task_label(r) or '')}"
+                )
+            return 0
         if not rows:
             info("(no tasks)")
             return 0
@@ -3755,6 +3810,14 @@ def cmd_mcp(args) -> int:
         if getattr(args, "json", False):
             print(json.dumps(servers, indent=2))
             return 0
+        if getattr(args, "plain", False):
+            for s in servers:
+                state = "on" if s.get("is_active") else "off"
+                print(
+                    f"{str(s.get('id') or '')}\t{state}\t"
+                    f"{str(s.get('name') or '')}\t{str(s.get('base_url') or '')}"
+                )
+            return 0
         if not servers:
             info("(no MCP servers)")
             return 0
@@ -3870,6 +3933,12 @@ def cmd_document(args) -> int:
         documents = [doc for doc in documents if document_matches_agent(creds, doc)]
         if getattr(args, "json", False):
             print(json.dumps(documents, indent=2))
+            return 0
+        if getattr(args, "plain", False):
+            for doc in documents:
+                key = doc.get("key") or doc.get("document_key") or ""
+                name = doc.get("name") or key.rsplit("/", 1)[-1]
+                print(f"{str(doc.get('id') or '')}\t{str(key or '')}\t{str(name or '')}")
             return 0
         if not documents:
             info("(no documents)")
@@ -4116,16 +4185,17 @@ def cmd_document_export(args) -> int:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def fetch_agent_skills(creds: dict, agent_id: str) -> list[dict]:
-    """Return every skill installed on one agent, enabled or not.
+def fetch_agent_skills(creds: dict, agent_id: str, *, filter_: str = "all") -> list[dict]:
+    """Return an agent's skills, selected by the server's ``filter`` query.
 
-    GET /agents/{agent_id}/skills defaults to ``filter=enabled`` server-side, so
-    we pass ``filter=all`` to get every installed skill (each carries an
-    ``enabled`` flag) — `list` shows status as a column rather than hiding the
-    off ones. The endpoint returns a bare JSON array of skill dicts
+    ``all`` (the default) returns every installed skill, each carrying an
+    ``enabled`` flag — so `list` can show on/off as a column instead of hiding
+    the off ones. ``enabled`` returns only the on ones. ``available`` returns
+    the marketplace catalog of skills not yet installed — the ids that `skills
+    add` accepts. The endpoint returns a bare JSON array of skill dicts
     (id, name, description, enabled, icon, …).
     """
-    qs = urllib.parse.urlencode({"filter": "all"})
+    qs = urllib.parse.urlencode({"filter": filter_})
     data = http_request("GET", f"{creds['api_url']}/agents/{agent_id}/skills?{qs}", token=creds["token"])
     if isinstance(data, list):
         return data
@@ -4181,13 +4251,6 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     return None
 
 
-def _resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
-    """Back-compat wrapper around `resolve_agent_or_error`; delegates to the
-    shared resolver, which refuses an ambiguous name (skills add/remove/edit are
-    writes) rather than acting on an arbitrary first match."""
-    return resolve_agent_or_error(creds, target)
-
-
 def cmd_skills(args) -> int:
     """Manage the skills installed on an agent.
 
@@ -4201,7 +4264,7 @@ def cmd_skills(args) -> int:
     creds = require_creds()
     sub = args.skills_cmd
     if sub is None:
-        err("Specify a skills subcommand: list, show, add, remove, or edit.")
+        err("Specify a skills subcommand: list, available, show, add, remove, or set.")
         return 1
 
     agent = resolve_agent_or_error(creds, args.agent)
@@ -4233,6 +4296,33 @@ def cmd_skills(args) -> int:
             if len(desc) > 60:
                 desc = desc[:60] + "…"
             print(fmt.format(str(sid)[:28], state, name, desc))
+        return 0
+
+    if sub == "available":
+        # The marketplace catalog scoped to this agent: the skills it can still
+        # install. These ids are exactly what `skills add` accepts, so this is
+        # how you discover a valid <skill_id> without leaving the CLI.
+        skills = fetch_agent_skills(creds, agent_id, filter_="available")
+        if getattr(args, "json", False):
+            print(json.dumps(skills, indent=2))
+            return 0
+        if getattr(args, "plain", False):
+            for s in skills:
+                print(f"{s.get('id') or '?'}\t{s.get('name') or ''}")
+            return 0
+        if not skills:
+            info(f"(no more skills available to install on {agent.get('name', agent_id)})")
+            return 0
+        fmt = " {:<28}  {:<24}  {}"
+        info(fmt.format("id", "name", "description"))
+        for s in skills:
+            sid = s.get("id") or "?"
+            name = (s.get("name") or sid)[:24]
+            desc = (s.get("description") or "").replace("\n", " ")
+            if len(desc) > 60:
+                desc = desc[:60] + "…"
+            print(fmt.format(str(sid)[:28], name, desc))
+        info(f"Install one with: eesel skills add {args.agent or agent_id} <id>")
         return 0
 
     if sub == "show":
@@ -4270,6 +4360,15 @@ def cmd_skills(args) -> int:
         config = parse_config_object(args.config)
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
         http_request("PUT", url, token=creds["token"], body=config)
+        # Read the config back rather than trusting the 200: confirm each field
+        # we sent now holds the value we sent. The server may merge other keys,
+        # so we check only the keys we wrote, not the whole object.
+        saved = http_request("GET", url, token=creds["token"])
+        if isinstance(saved, dict):
+            mismatched = [k for k, v in config.items() if saved.get(k) != v]
+            if mismatched:
+                err(f"Server accepted the change but {', '.join(mismatched)} did not update as sent.")
+                return 1
         ok(f"Updated config for skill '{args.skill_id}' on {agent.get('name')} ({agent_id}).")
         return 0
 
@@ -4374,7 +4473,21 @@ def cmd_workspace(args) -> int:
                 token=creds["token"],
                 body={"value": amount},
             )
-            ok(f"Billing limit set to {amount}.")
+            # Read the active cap back from the subscription license rather than
+            # trusting the status message. On a trial workspace the active cap is
+            # fixed at the trial allowance until the plan converts, so the limit
+            # just submitted may not be reflected yet — report what the customer
+            # will actually see instead of a bare "done".
+            license = http_request("GET", f"{creds['api_url']}/subscription/license", token=creds["token"])
+            stored = license.get("billingLimit") if isinstance(license, dict) else None
+            if stored is not None and float(stored) == float(amount):
+                ok(f"Billing limit set to {amount} (active cap confirmed).")
+            elif stored is not None:
+                ok(f"Billing limit set to {amount}.")
+                info(f"Active cap still shows {stored}. On a trial plan the cap is fixed at the "
+                     "trial allowance until you upgrade; otherwise re-check with `eesel billing show license`.")
+            else:
+                ok(f"Billing limit set to {amount}.")
             return 0
 
         err(f"Unknown workspace field '{field}'.")
@@ -4762,6 +4875,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
     ls.add_argument("--json", action="store_true", help="Emit the raw documents payload")
+    ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>key<TAB>name` row per document")
 
     # `show` is the canonical verb for "see one document"; `read` is its hidden
     # alias, kept for existing scripts. Both print a document's contents.
@@ -4890,10 +5004,14 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     a_sub = sp.add_subparsers(dest="agents_cmd")
     list_p = a_sub.add_parser("list", help="List agents in this workspace (each row shows its on/off status)")
     list_p.add_argument("--json", action="store_true", help="Print the raw agent list as JSON")
+    list_p.add_argument("--plain", action="store_true", help="Emit one tab-separated `agent_id<TAB>state<TAB>name` row per agent")
 
     show = a_sub.add_parser("show", help="Show one agent's full detail (type, status, instructions)")
     show.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     show.add_argument("--json", action="store_true", help="Print the raw agent record as JSON")
+
+    instr = a_sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")
+    instr.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
 
     create = a_sub.add_parser("create", help="Create a new agent")
     create.add_argument("--name", help="Agent name (required)")
@@ -4954,10 +5072,16 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     s_sub.add_parser("list", help="List sessions")
     use = s_sub.add_parser("use", help="Switch active session")
     use.add_argument("session_id")
-    de = s_sub.add_parser("delete", help="Delete a session")
+    rm = s_sub.add_parser("remove", help="Remove a session")
+    rm.add_argument("session_id")
+    # `delete` is the prior name, kept as a hidden alias for `remove`.
+    de = s_sub.add_parser("delete", help=argparse.SUPPRESS)
     de.add_argument("session_id")
     show = s_sub.add_parser("show", help="Print session history")
     show.add_argument("session_id", nargs="?", help="(default: active session)")
+    # Drop the hidden `delete` alias from the help list and metavar (canonical is `remove`).
+    s_sub._choices_actions = [a for a in s_sub._choices_actions if a.dest != "delete"]
+    s_sub.metavar = "{" + ",".join(ca.dest for ca in s_sub._choices_actions) + "}"
     sp.set_defaults(func=cmd_sessions)
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
@@ -4994,6 +5118,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_ls.add_argument("--page", type=int, default=1, help="Page number (1-based)")
     tk_ls.add_argument("--agent", help="Filter to one agent (full id, id-prefix, or name)")
     tk_ls.add_argument("--json", action="store_true", help="Emit the raw task rows as JSON instead of a table")
+    tk_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `task_id<TAB>updated<TAB>agent<TAB>source<TAB>label` row per task")
     tk_ct = tk_sub.add_parser("count", help="Print the total number of tasks")
     tk_ct.add_argument("--agent", help="Count only one agent's tasks (full id, id-prefix, or name)")
     tk_ct.add_argument("--json", action="store_true", help="Emit the count as JSON instead of a sentence")
@@ -5042,6 +5167,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # (which defaults to `list`) keeps accepting them.
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
+    sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
     # Bare `eesel integrations [--json] [--secrets]` lists integrations.
     # `eesel integrations <integration> actions ...` drops into the actions
     # sub-namespace. main() normalizes the latter form into the `actions`
@@ -5052,6 +5178,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_ls = ig_sub.add_parser("list", help="List every connected integration with status columns (read-only)")
     i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
+    i_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
     i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with syncStatus)")
@@ -5141,6 +5268,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     m_sub = sp.add_subparsers(dest="mcp_cmd")
     m_list = m_sub.add_parser("list", help="List MCP servers registered on this workspace (status shown as a column)")
     m_list.add_argument("--json", action="store_true", help="Emit the raw MCP servers payload")
+    m_list.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>name<TAB>url` row per server")
 
     m_show = m_sub.add_parser("show", help="Show one MCP server's details")
     m_show.add_argument("server", help="Full id, id prefix, or exact name")
@@ -5185,9 +5313,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # have their own command group below: `eesel schedules`.
     sp = sub.add_parser("triggers", help="List, show, add, or remove event/webhook triggers")
     sp.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
+    sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>trigger_key<TAB>agent` row per trigger")
     t_sub = sp.add_subparsers(dest="triggers_cmd")
     t_ls = t_sub.add_parser("list", help="List all event/webhook triggers (status shown as a column)")
     t_ls.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
+    t_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>trigger_key<TAB>agent` row per trigger")
 
     t_show = t_sub.add_parser("show", help="Show one trigger's full detail by id")
     t_show.add_argument("trigger_id", help="The trigger's id or id-prefix (first column of `eesel triggers list`)")
@@ -5261,6 +5391,10 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_ls.add_argument("agent", nargs="?", help=_AGENT_HELP)
     sk_ls.add_argument("--json", action="store_true", help="Emit the raw skills payload")
     sk_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>name` row per skill")
+    sk_av = sk_sub.add_parser("available", help="List installable skills from the marketplace (the ids `skills add` accepts)")
+    sk_av.add_argument("agent", nargs="?", help=_AGENT_HELP)
+    sk_av.add_argument("--json", action="store_true", help="Emit the raw catalog payload")
+    sk_av.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>name` row per skill")
     sk_sh = sk_sub.add_parser("show", help="Show one installed skill's detail")
     sk_sh.add_argument("agent", help=_AGENT_HELP)
     sk_sh.add_argument("skill_id", help="Skill id to show")

@@ -34,10 +34,11 @@ EESEL_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/ee
 ```bash
 eesel login                         # opens dashboard.eesel.ai, signs in as you (Auth0)
 eesel whoami
-eesel agents list
+eesel agents list                   # --json or --plain for machine-readable output
 eesel agents show <id-or-name>      # full detail (type, status, instructions)
+eesel agents instructions <id-or-name>   # just the system prompt (also `eesel instructions`)
 eesel agents create --name "QA Bot" --instructions "..."
-eesel agents edit <id-or-name> --name "..."  # change name and/or instructions
+eesel agents set <id-or-name> --name "..."   # change name and/or instructions
 eesel agents remove <id-or-name>    # delete an agent (asks to confirm; --force to skip)
 
 # Scope a command to an agent explicitly — no hidden saved state:
@@ -64,7 +65,7 @@ Sessions:
 eesel sessions list
 eesel sessions use <id>
 eesel sessions show
-eesel sessions delete <id>
+eesel sessions remove <id>
 ```
 
 In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/tasks`, `/task <id>`,
@@ -144,12 +145,13 @@ eesel integrations                  # id, type, connection status, subdomain
 eesel integrations --json           # raw payload
 eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
 
-# Actions (formerly `tools`) are scoped under their integration
-eesel integrations <integration> actions list <agent>      # the agent's actions for one integration
-eesel integrations <integration> actions show <agent> <action>
-eesel integrations <integration> actions enable <agent> <action>
-eesel integrations <integration> actions disable <agent> <action>   # -f to skip the prompt
-eesel integrations <integration> actions edit <agent> <action> --config '{...}'
+# Actions (formerly `tools`) are scoped under their integration; --agent picks
+# whose action set to read/write (default: the active agent)
+eesel integrations <integration> actions list [--agent <agent>]            # the agent's actions for one integration
+eesel integrations <integration> actions show <action> [--agent <agent>]
+eesel integrations <integration> actions enable <action> [--agent <agent>]
+eesel integrations <integration> actions disable <action> [--agent <agent>]   # -f to skip the prompt
+eesel integrations <integration> actions set <action> --config '{...}' [--agent <agent>]
 
 # Event/webhook triggers
 eesel triggers                      # every event trigger, grouped by integration
@@ -165,8 +167,8 @@ eesel schedules fire <id-or-title>  # run one manually, now
 eesel schedules remove <id>
 ```
 
-`eesel integrations <integration> actions list <agent>` lists each action's
-name, read/write kind, permission mode, and integration. `eesel triggers` shows
+`eesel integrations <integration> actions list [--agent <agent>]` lists each
+action's name, read/write kind, permission mode, and integration. `eesel triggers` shows
 each event trigger's type, config, last-run time, and integration. `eesel
 schedules` shows each job's title, cron, and timezone. Secret-looking values in
 trigger config (access tokens, signing secrets) are masked in the human view;
