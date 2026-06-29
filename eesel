@@ -2378,6 +2378,26 @@ def cmd_integrations(args) -> int:
     triggers a data refresh for a connected integration.
     """
     creds = require_creds()
+    # `--agent` scopes this command to one agent (id, id-prefix, or name), like
+    # the EESEL_AGENT env var but per-command. It is resolved in memory and not
+    # persisted, so it never changes the saved active agent. Every integrations
+    # subcommand reads creds["agent_id"] — listing/connection status is computed
+    # against it, and `add` folds it into the setup payload — so overriding it
+    # here applies the scope uniformly across list/show/add/sync/remove.
+    if getattr(args, "agent", None):
+        agent, candidates = resolve_agent_strict(fetch_agents(creds), args.agent)
+        if not agent:
+            if candidates:
+                err(f"'{args.agent}' is ambiguous — it matches {len(candidates)} agents:")
+                for a in candidates:
+                    err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+                err("Re-run with a full agent id to disambiguate.")
+            else:
+                err(f"No agent matches '{args.agent}'.")
+                info("Run `eesel agents list` to see available agents.")
+            return 1
+        creds = dict(creds)
+        creds["agent_id"] = agent["agent_id"]
     sub = getattr(args, "integrations_cmd", None) or "list"
     if sub == "list":
         return _integrations_list(args, creds)
@@ -5290,6 +5310,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
     sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
+    sp.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     # Bare `eesel integrations [--json] [--secrets]` lists integrations.
     # `eesel integrations <integration> actions ...` drops into the actions
     # sub-namespace. main() normalizes the latter form into the `actions`
@@ -5301,9 +5322,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
     i_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
+    i_ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with syncStatus)")
+    i_show.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     i_add = ig_sub.add_parser(
         "add",
         aliases=["connect"],
@@ -5319,6 +5342,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_add.add_argument("--config", help="Setup payload as a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
     i_add.add_argument("--token", help="Access token to authorize the connector without a browser (headless/agent runs)")
     i_add.add_argument("--no-input", action="store_true", help="Never prompt or print a browser URL; fail if interactive OAuth is required")
+    i_add.add_argument("--agent", help="Agent id, id-prefix, or name to connect the integration for (default: active agent, or $EESEL_AGENT)")
     i_sy = ig_sub.add_parser(
         "sync",
         help="Trigger a data sync for a connected integration (Zendesk only today)",
@@ -5331,6 +5355,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         choices=list(INTEGRATION_SYNC_TYPES),
         help="What to sync (default: help-center). One of: help-center, macros, tickets.",
     )
+    i_sy.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     i_rm = ig_sub.add_parser(
         "remove",
         aliases=["disconnect"],
@@ -5338,6 +5363,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     )
     i_rm.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    i_rm.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
 
     ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or edit an integration's actions")
     # The integration that scopes these actions (path positional, not a flag).

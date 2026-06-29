@@ -151,6 +151,15 @@ eesel integrations                  # id, type, connection status, subdomain
 eesel integrations --json           # raw payload
 eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
 
+# The integrations group is agent-scoped: connection status is computed against
+# an agent, and `add` connects the integration for one. It defaults to the
+# active agent / $EESEL_AGENT; --agent overrides that for a single command.
+eesel integrations --agent <agent>                       # list, scoped to one agent
+eesel integrations show <id> [--agent <agent>]           # one integration's detail + sync status
+eesel integrations add <type> [--config '{...}'] [--token <tok>] [--agent <agent>]   # connect (alias: connect)
+eesel integrations sync <id> [--type help-center] [--agent <agent>]                  # trigger a data sync
+eesel integrations remove <id> [--agent <agent>]         # disconnect (alias: disconnect; -f to skip the prompt)
+
 # Actions (formerly `tools`) are scoped under their integration; --agent picks
 # whose action set to read/write (default: the active agent)
 eesel integrations <integration> actions list [--agent <agent>]            # the agent's actions for one integration

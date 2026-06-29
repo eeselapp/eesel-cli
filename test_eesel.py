@@ -3924,6 +3924,65 @@ class TestIntegrationsCommand:
         assert "zendesk" in capsys.readouterr().out
 
 
+class TestIntegrationsAgentScope:
+    """`--agent` overrides the active agent for the whole integrations group."""
+
+    _AGENTS = [
+        {"agent_id": "agent-test-456", "name": "Default Bot"},
+        {"agent_id": "agent-other-789", "name": "Other Bot"},
+    ]
+
+    def test_agent_flag_overrides_active_agent_for_list(self, fake_creds, monkeypatch):
+        # The active agent is agent-test-456; --agent must scope the fetch to the
+        # resolved agent instead, without persisting the change.
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+
+        def fake_fetch(creds, agent_id=None):
+            seen["agent_id"] = agent_id
+            return []
+
+        monkeypatch.setattr(eesel, "fetch_integrations", fake_fetch)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="Other Bot"))
+        assert rc == 0
+        assert seen["agent_id"] == "agent-other-789"
+
+    def test_agent_flag_scopes_add_payload(self, fake_creds, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["body"] = body
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        rc = eesel.cmd_integrations(
+            _add_args(integrations_cmd="add", key="zendesk", config=None, agent="agent-other-789")
+        )
+        assert rc == 0
+        # The resolved --agent, not the stored active agent, is folded in.
+        assert captured["body"]["agent_id"] == "agent-other-789"
+
+    def test_unknown_agent_errors_before_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+        # If resolution fails the command must abort before touching the network.
+        monkeypatch.setattr(
+            eesel, "fetch_integrations",
+            lambda *a, **k: pytest.fail("should not fetch when --agent is unresolvable"),
+        )
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="nope"))
+        assert rc == 1
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
+    def test_ambiguous_agent_errors_with_candidates(self, fake_creds, monkeypatch, capsys):
+        # Both ids share the "agent-" prefix; a prefix that matches more than one
+        # agent is refused rather than resolved to an arbitrary one.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="agent-"))
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err
+
+
 def _add_args(**kw):
     """args for `integrations add`/`connect` with token/no-input defaulted off."""
     kw.setdefault("token", None)
