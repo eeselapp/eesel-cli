@@ -1182,16 +1182,24 @@ class TestDocumentsAdd:
 
 
 class TestDocumentsRemove:
-    def _args(self, keys, force=False):
-        return type("Args", (), {"document_cmd": "remove", "keys": keys, "force": force})()
+    # `remove` resolves each argument against the documents that actually exist
+    # before deleting anything, so the tests stand up a small document set.
+    DOCS = [
+        {"id": "doc-a", "key": "files/a.md"},
+        {"id": "doc-b", "key": "files/b.md"},
+    ]
 
-    def test_removes_with_keys_body_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
+    def _args(self, keys, force=False):
+        return type("Args", (), {"document_cmd": "remove", "keys": keys, "force": force, "agent": None})()
+
+    def test_removes_resolved_keys_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
         calls = []
 
         def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
             calls.append((method, url, body))
             return {"message": "Documents deleted successfully"}
 
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
         monkeypatch.setattr(eesel, "http_request", fake_http)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
         rc = eesel.cmd_document(self._args(["files/a.md", "files/b.md"]))
@@ -1200,8 +1208,20 @@ class TestDocumentsRemove:
             ("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md", "files/b.md"]})
         ]
 
+    def test_resolves_an_id_to_its_key(self, tmp_config, fake_creds, monkeypatch):
+        # A document id is a valid address; it resolves to that document's key,
+        # which is what the DELETE body carries.
+        calls = []
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, k.get("body"))) or {})
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["doc-a"]))
+        assert rc == 0
+        assert calls == [("DELETE", {"keys": ["files/a.md"]})]
+
     def test_force_flag_skips_confirmation(self, tmp_config, fake_creds, monkeypatch):
         calls = []
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, url, k.get("body"))) or {})
 
         def boom(prompt):
@@ -1213,13 +1233,87 @@ class TestDocumentsRemove:
         assert calls == [("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md"]})]
 
     def test_aborts_without_confirmation(self, tmp_config, fake_creds, monkeypatch):
-        def boom(*a, **k):
-            raise AssertionError("must not call the API when the user declines")
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when the user declines")
 
         monkeypatch.setattr(eesel, "http_request", boom)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
         rc = eesel.cmd_document(self._args(["files/a.md"]))
         assert rc == 1
+
+    def test_unknown_key_refuses_and_deletes_nothing(self, tmp_config, fake_creds, monkeypatch):
+        # A typo'd / nonexistent key must refuse the whole command (deleting
+        # nothing) rather than POST the unresolved key and report a fabricated
+        # "Removed N" for a key the server silently ignored.
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when an argument matches no document")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/typo.md"]))
+        assert rc == 1
+
+    def test_one_bad_key_among_good_ones_refuses_all(self, tmp_config, fake_creds, monkeypatch):
+        # All-or-nothing: a single unmatched argument blocks the batch, so a
+        # partial silent delete can't happen behind a fabricated success.
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when any argument is unmatched")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/a.md", "files/nope.md"]))
+        assert rc == 1
+
+    def test_blank_key_refuses(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("a blank key must not delete anything")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args([""], force=True))
+        assert rc == 1
+
+
+class TestBlankTargetRefusal:
+    """A blank/whitespace target must match nothing across every resolver. An
+    empty string is a prefix of every id, so without the guard a blank target
+    would match every row — and on a single-row workspace that lone match would
+    resolve as 'unique' and let a destructive `remove` act with no real target
+    given. The strict resolvers refuse only on 0 or 2+ matches, so the guard has
+    to live in the matchers."""
+
+    AGENTS = [{"agent_id": "agent-one", "name": "Only Agent"}]
+    INTEGRATIONS = [{"id": "int-one", "integrationType": "zendesk"}]
+    JOBS = [{"id": "job-one", "config": {"title": "Nightly"}}]
+    TRIGGERS = [{"id": "trig-one", "trigger_key": "ticket.created"}]
+    SERVERS = [{"id": "mcp-one", "name": "Notion"}]
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_matchers_return_nothing_for_blank(self, blank):
+        assert eesel.match_agents(self.AGENTS, blank) == []
+        assert eesel.match_integrations(self.INTEGRATIONS, blank) == []
+        assert eesel.match_scheduled_jobs(self.JOBS, blank) == []
+        assert eesel.match_event_triggers(self.TRIGGERS, blank) == []
+        assert eesel.match_mcp_servers(self.SERVERS, blank) == []
+
+    def test_a_real_prefix_still_matches_the_sole_row(self):
+        # Sanity: the guard only rejects blanks — a real id-prefix on a
+        # single-row workspace still resolves.
+        assert len(eesel.match_agents(self.AGENTS, "agent")) == 1
+        assert len(eesel.match_event_triggers(self.TRIGGERS, "trig")) == 1
+
+    def test_strict_resolvers_refuse_blank(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "")
+        assert agent is None and candidates == []
+        assert eesel.resolve_integration_strict(self.INTEGRATIONS, "") is None
 
 
 class TestDocumentsAcl:

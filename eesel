@@ -1109,7 +1109,14 @@ def match_agents(agents: list[dict], target: str) -> list[dict]:
     An exact id is unique, so it short-circuits to a single result. The same
     agent never appears twice (a prefix match isn't re-listed as a name match),
     so callers can count the result to detect ambiguity.
+
+    A blank/whitespace target matches nothing (returns `[]`). An empty string is
+    a prefix of every id, so without this guard a blank target would match every
+    agent — and on a single-agent workspace that lone match would resolve as
+    "unique" and let a destructive command act on it with no real target given.
     """
+    if not (target or "").strip():
+        return []
     exact_id = [a for a in agents if a.get("agent_id") == target]
     if exact_id:
         return exact_id
@@ -1241,7 +1248,11 @@ def match_integrations(integrations: list[dict], target: str) -> list[dict]:
     """All connected integrations matching `target`, in resolution-priority
     order: an exact id first, then id-prefix matches, then exact integration
     type (e.g. ``zendesk``). The same integration never appears twice, so
-    callers can count the result to detect ambiguity."""
+    callers can count the result to detect ambiguity. A blank/whitespace target
+    matches nothing, so a destructive command can't act on the sole integration
+    when no real target was given (an empty string prefixes every id)."""
+    if not (target or "").strip():
+        return []
     exact = [it for it in integrations if str(it.get("id")) == target]
     if exact:
         return exact
@@ -1377,7 +1388,11 @@ def match_scheduled_jobs(rows: list[dict], target: str) -> list[dict]:
     """All scheduled jobs matching `target`, in resolution-priority order: an
     exact id first, then id-prefix matches, then a case-insensitive substring of
     config.title. The same job never appears twice, so callers can count the
-    result to detect ambiguity."""
+    result to detect ambiguity. A blank/whitespace target matches nothing, so a
+    destructive command can't act on the sole job when no real target was given
+    (an empty string both prefixes every id and is a substring of every title)."""
+    if not (target or "").strip():
+        return []
     exact = [t for t in rows if t.get("id") == target]
     if exact:
         return exact
@@ -2068,7 +2083,13 @@ def match_event_triggers(rows: list[dict], trigger_id: str) -> list[dict]:
     order: an exact id first, then id-prefix matches. The same trigger never
     appears twice, so callers can count the result to detect ambiguity. Triggers
     have no title, so the id is the only key (unlike scheduled jobs, which also
-    match on config.title)."""
+    match on config.title).
+
+    A blank/whitespace `trigger_id` matches nothing: an empty string prefixes
+    every id, so without this guard a destructive `remove` could resolve to the
+    sole trigger on a single-trigger workspace with no real id given."""
+    if not (trigger_id or "").strip():
+        return []
     exact = [t for t in rows if t.get("id") == trigger_id]
     if exact:
         return exact
@@ -3858,6 +3879,9 @@ def _looks_like_uuid(value: str) -> bool:
 
 
 def resolve_document_id(creds: dict, target: str) -> str | None:
+    if not (target or "").strip():
+        err("No document given.")
+        return None
     documents = [doc for doc in fetch_documents(creds, limit=500) if document_matches_agent(creds, doc)]
     exact = next((doc for doc in documents if doc.get("id") == target), None)
     if exact:
@@ -3890,8 +3914,11 @@ def match_document(docs: list[dict], target: str) -> dict | list[dict] | None:
     list of >1 candidates when an id-prefix/filename is ambiguous, or None.
 
     Resolution order: exact id, exact key, then id-prefix or basename (filename)
-    match.
+    match. A blank/whitespace target matches nothing (an empty string would
+    otherwise prefix every id).
     """
+    if not (target or "").strip():
+        return None
     exact = next((d for d in docs if d.get("id") == target), None) or next(
         (d for d in docs if _document_key(d) == target), None
     )
@@ -4059,7 +4086,12 @@ def fetch_mcp_servers(creds: dict, *, include_inactive: bool = True) -> list[dic
 def match_mcp_servers(servers: list[dict], target: str) -> list[dict]:
     """All MCP servers matching `target`, in resolution-priority order: an exact
     id first, then id-prefix matches, then exact-name matches. The same server
-    never appears twice, so callers can count the result to detect ambiguity."""
+    never appears twice, so callers can count the result to detect ambiguity. A
+    blank/whitespace target matches nothing, so a destructive command can't act
+    on the sole server when no real target was given (an empty string prefixes
+    every id)."""
+    if not (target or "").strip():
+        return []
     exact = [s for s in servers if s.get("id") == target]
     if exact:
         return exact
@@ -4358,17 +4390,48 @@ def _documents_add(args) -> int:
 
 
 def _documents_remove(args) -> int:
-    """`eesel documents remove <key>...` — take documents out of the workspace
-    (DELETE /documents). Prompts before deleting; `--force` skips the prompt."""
-    creds = require_creds()
-    keys = args.keys
+    """`eesel documents remove <key|id>...` — take documents out of the workspace
+    (DELETE /documents). Prompts before deleting; `--force` skips the prompt.
+
+    Each argument is resolved against the documents that actually exist (by exact
+    key or exact id) before anything is deleted. If any argument matches no
+    document, the command refuses and deletes nothing — rather than POSTing an
+    unresolved key and reporting a fabricated "Removed N" for a typo the server
+    silently ignored. The reported count is the number of documents actually
+    matched and sent for deletion, not the number of arguments passed."""
+    creds = require_creds_scoped(args)
+    documents = agent_documents(creds, limit=500)
+    by_key = {_document_key(doc): doc for doc in documents if _document_key(doc)}
+    by_id = {doc.get("id"): doc for doc in documents if doc.get("id")}
+
+    resolved_keys: list[str] = []
+    unmatched: list[str] = []
+    seen: set[str] = set()
+    for target in args.keys:
+        doc = by_key.get(target) or by_id.get(target)
+        if doc is None:
+            unmatched.append(target)
+            continue
+        key = _document_key(doc)
+        if key and key not in seen:
+            seen.add(key)
+            resolved_keys.append(key)
+
+    if unmatched:
+        err(f"No document matches: {', '.join(unmatched)}")
+        info("Run `eesel documents list` to see this agent's documents (the key is the second column).")
+        return 1
+    if not resolved_keys:
+        err("No documents to remove.")
+        return 1
+
     if not args.force:
-        listed = "\n".join(f"  {k}" for k in keys)
-        if not confirm(f"Remove {len(keys)} document(s)?\n{listed}\n[y/N] "):
+        listed = "\n".join(f"  {k}" for k in resolved_keys)
+        if not confirm(f"Remove {len(resolved_keys)} document(s)?\n{listed}\n[y/N] "):
             info("Aborted.")
             return 1
-    http_request("DELETE", f"{creds['api_url']}/documents", token=creds["token"], body={"keys": keys})
-    ok(f"Removed {len(keys)} document(s).")
+    http_request("DELETE", f"{creds['api_url']}/documents", token=creds["token"], body={"keys": resolved_keys})
+    ok(f"Removed {len(resolved_keys)} document(s).")
     return 0
 
 
@@ -4524,7 +4587,7 @@ def cmd_document_export(args) -> int:
 #
 # `add`/`remove` install or uninstall a skill on an agent (the marketplace is a
 # read-only catalog you install FROM). `list` shows every installed skill with
-# its on/off status as a column. `edit` replaces a skill's per-agent config.
+# its on/off status as a column. `set` merges keys into a skill's per-agent config.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -4599,8 +4662,9 @@ def cmd_skills(args) -> int:
 
     `list` shows every installed skill with its on/off status as a column;
     `show` prints one skill's detail; `add`/`remove` install or uninstall a
-    skill (the marketplace is a read-only catalog you install FROM); `edit`
-    replaces a skill's per-agent config with a JSON object. Every subcommand
+    skill (the marketplace is a read-only catalog you install FROM); `set`
+    merges keys from a JSON object into a skill's per-agent config (it does not
+    replace the whole config). Every subcommand
     resolves its `<agent>` argument by exact id, id-prefix, or name, falling
     back to the EESEL_AGENT environment variable.
     """
@@ -5266,7 +5330,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access (default: active agent, or $EESEL_AGENT)")
 
     de = d_sub.add_parser("remove", help="Remove documents by key (asks for confirmation)")
-    de.add_argument("keys", nargs="+", help="One or more exact document keys to remove")
+    de.add_argument("keys", nargs="+", help="One or more document keys or ids to remove (each must match an existing document)")
     de.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
     acl = d_sub.add_parser("acl", help="Show or set an agent's knowledge-ACL key prefixes")
@@ -5755,12 +5819,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_rm.add_argument("agent", help=_AGENT_HELP)
     sk_rm.add_argument("skill_id", help="Skill id to uninstall")
     sk_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-    # `set` replaces a skill's per-agent config; `edit` is the prior name, kept
-    # as a hidden alias.
+    # `set` merges keys into a skill's per-agent config (PATCH, not replace);
+    # `edit` is the prior name, kept as a hidden alias.
     for _verb in ("set", "edit"):
         sk_ed = sk_sub.add_parser(
             _verb,
-            help="Replace a skill's per-agent config with a JSON object"
+            help="Set a skill's per-agent config — merges the given keys into the existing config (does not replace it)"
             if _verb == "set" else argparse.SUPPRESS,
         )
         sk_ed.add_argument("agent", help=_AGENT_HELP)

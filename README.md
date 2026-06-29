@@ -192,15 +192,21 @@ integration credentials and is gated to sysadmin/impersonator accounts.
 
 ### `set` (and the old `edit` alias)
 
-`set` is the canonical write verb across the CLI. Depending on the command it
-either replaces a free-form object or writes a named field:
+`set` is the canonical write verb across the CLI. How it treats the keys you
+*don't* pass differs by command — `set` does **not** mean "replace everything"
+everywhere. When in doubt, check that verb's `--help`:
 
-- **Replaces a `--config` object** — a skill's or action's config JSON, or an
-  agent's name/instructions: `eesel agents set <agent> --instructions …`,
-  `eesel integrations <x> actions set <action> --config '{…}'`,
-  `eesel mcp set <server> …`, `eesel skills set <agent> <skill> --config '{…}'`.
-- **Writes a single named field** — `eesel workspace set <field> <value>`,
-  `eesel documents acl set <agent> --prefix …`.
+- **Merges** the keys you pass into the existing config, leaving the rest intact
+  (PATCH) — `eesel skills set <agent> <skill> --config '{…}'`.
+- **Replaces** the config wholesale, dropping any key you omit — `eesel
+  integrations <x> actions set <action> --config '{…}'`. The tools endpoint has
+  no partial-merge, so a one-field write drops the action's other settings
+  (only the permission keys are preserved).
+- **Writes only the named fields you pass**, leaving the rest of the record
+  untouched — `eesel agents set <agent> --instructions …`, `eesel mcp set
+  <server> --name … --url …`, `eesel workspace set <field> <value>`.
+- **Replaces a whole set** — `eesel documents acl set <agent> --prefix …`
+  replaces the agent's ACL key prefixes (it does not append).
 
 `edit` is kept only as a **hidden back-compat alias** for `set` on the commands
 that used to spell it that way (agents, mcp, skills, `integrations actions`); new
