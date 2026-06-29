@@ -63,20 +63,21 @@
 <h1>Verify — ENG-4700 · CLI namespace consolidation</h1>
 <div class="sub">
   PR <a href="https://github.com/eeselapp/eesel-cli/pull/21">eeselapp/eesel-cli #21</a> ·
-  base <code>main</code> (93d6765) · HEAD <code>2a7c38a</code> ·
+  base <code>main</code> (93d6765) · HEAD <code>2497001</code> ·
   independent re-verify · tested live against a local dev stack (server :8080) ·
-  <b style="color:var(--grn)">finding 1 fixed + re-verified</b>
+  <b style="color:var(--grn)">findings 1 + 2 fixed and re-verified live</b>
 </div>
 
-<div class="verdict">
-  <h2>Verdict: <span style="color:var(--amb)">Works — one fix before merge</span></h2>
+<div class="verdict" style="border-left-color:var(--grn)">
+  <h2>Verdict: <span style="color:var(--grn)">Ready to merge</span></h2>
   <div>The namespace consolidation is genuinely solid: the headline new capability — the <em>write</em> half of
   the CLI — works end-to-end against a live server, the unified verbs are consistent, destructive commands refuse
   ambiguity, and every read path still works. This pass found two real defects the prior review missed;
-  <b style="color:var(--grn)">finding 1 (<code>agents add</code> broken) is now fixed and re-verified live</b>.
-  The one remaining is finding 2: two <code>set --config</code> paths silently <em>replace</em> config rather than
-  patch it — a small fix, left for a deliberate product call. One earlier flag (a wrong-token bug) was chased down
-  and <b>cleared as a false alarm</b> against the server.</div>
+  <b style="color:var(--grn)">both are now fixed and re-verified live</b> — finding 1 (<code>agents add</code> was a
+  dead alias) and finding 2 (<code>skills set</code> silently replaced config). Findings 3–5 are low/conventions;
+  one earlier flag (a wrong-token bug) was chased down and <b>cleared as a false alarm</b> against the server.
+  Two sign-off items remain for a human (the documented back-compat breaks, and the prod chat path that can't be
+  reached from here).</div>
 
   <div class="kv"><b>What changes for users:</b> every command group now speaks one verb vocabulary
   (<code>list / show / add / set / remove</code>; <code>create</code> for agents); the CLI gains the
@@ -88,19 +89,19 @@
   works — verified live. One read command's <em>human</em> output shifted (an <code>[on]/[off]</code> column was
   inserted into <code>agents list</code>) — see finding 4.</div>
 
-  <div class="kv"><b>Watch this:</b> <span style="color:var(--amb)">②</span> <code>skills set --config</code> /
-  <code>actions set --config</code> <em>replace</em> the whole config object (wholesale), not patch it — a data-loss
-  footgun, and the CLI's own comment claims the opposite. (<span style="color:var(--grn)">① <code>agents add</code>
-  now fixed</span> — see below.)</div>
+  <div class="kv"><b>Watch this:</b> nothing blocking. <span style="color:var(--grn)">① <code>agents add</code> now
+  dispatches to create; ② <code>skills set</code> now merges via PATCH</span> (verified live: writing one field twice
+  keeps both). <code>actions set</code> stays a wholesale replace — that's the server's actual contract (no merge
+  endpoint, and its read enriches config with schema), now stated honestly in the docstring + <code>--help</code>.</div>
 
   <div class="row">
     <span class="chip ok">535 unit tests green</span>
     <span class="chip ok">agent lifecycle live ✓</span>
     <span class="chip ok">strict resolution live ✓</span>
     <span class="chip ok">read paths live ✓</span>
-    <span class="chip ok">536 tests green</span>
+    <span class="chip ok">537 tests green</span>
     <span class="chip ok">① agents add fixed + re-verified</span>
-    <span class="chip warn">② set --config clobbers</span>
+    <span class="chip ok">② skills set merges (PATCH) + re-verified</span>
     <span class="chip ok">billing-limit token: false alarm, cleared</span>
   </div>
   <div class="legend">Evidence grades below:
@@ -157,7 +158,7 @@ fully adopt the triad is <code>documents</code> (finding 5).</p>
     <td>⚠️ Pass functionally — <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> reads all returned live. But <code>agents list</code>'s <em>human</em> output gained a status column, shifting columns (finding 4).</td></tr>
 <tr><td>Unit suite green</td>
     <td><span class="ev test">TEST</span></td>
-    <td>✅ 536 passed in 4.6s (+1: a new test locks the <code>agents add</code> alias). Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract).</td></tr>
+    <td>✅ 537 passed in 4.6s (+2 net: a test locks the <code>agents add</code> alias; two skills tests now assert PATCH + a no-PUT-regression guard). Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract).</td></tr>
 <tr><td>Connect a live helpdesk integration (real OAuth)</td>
     <td><span class="ev no">NOT RUN</span></td>
     <td>Command exists (<code>integrations add</code>); a real OAuth round-trip needs a third party. Per ENG-4700 the bar is "command exists + endpoint reachable," which holds.</td></tr>
@@ -188,20 +189,28 @@ $ eesel agents list | grep ZZ-add-fix-test
 Suite: 536 passing (+1).
 </div>
 
-<div class="f warn">
-<h4><span class="tag warn">SHOULD FIX</span> 2 · <code>skills set --config</code> / <code>actions set --config</code> <em>replace</em> the whole config — and the comment says the opposite <span class="ev read">READ</span> (server-traced)</h4>
-<div class="meta"><code>eesel:4457–4472</code> (skills PUT) · <code>eesel:2826–2862</code> (actions) · server <code>skill_service.py:522–536</code> · confidence: high</div>
-<code>skills set</code> issues <b>PUT</b> <code>/agents/{id}/skills/{skill}/config</code> → server <code>save_skill_config</code>
-→ <code>replace_skill_properties</code> — a <b>wholesale replace</b>. A <code>patch_skill_config</code> that merges
-(<code>merged = {**existing, **partial}</code>) sits right next to it in the same service file and the CLI doesn't use it.
-So <code>eesel … skills set &lt;skill&gt; --config '{"one_field": x}'</code> to tweak one setting silently drops every
-other stored field. The CLI comment at <code>eesel:4463</code> claims <em>"The server may merge other keys, so we check
-only the keys we wrote"</em> — false for the PUT it sends, and because the read-back only checks the keys it sent, it can
-never surface the keys it just dropped. <code>actions set --config</code> has the same shape server-side (only the
-permission keys are preserved on a config write). <b>Note:</b> the field-level <code>set</code>s (<code>agents set</code>,
-<code>mcp set</code>, <code>notifications set</code>, <code>workspace set</code>) all correctly merge — the footgun is
-specific to the two <code>--config</code>-object commands. <b>Fix:</b> point <code>skills set</code> at the existing PATCH
-endpoint (and correct the comment), or make the read-back diff the whole object and warn on dropped keys.
+<div class="f ok">
+<h4><span class="tag ok">RESOLVED</span> 2 · <code>skills set</code> now merges (PATCH); <code>actions set</code> replace is now honest <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
+<div class="meta">fixed in <code>2497001</code> · server merge endpoint confirmed at <code>skills/__init__.py:421</code> (PATCH) · confidence: certain</div>
+<b>Skills (fixed):</b> <code>skills set</code> issued <b>PUT</b> <code>/skills/{id}/config</code> → <code>save_skill_config</code>
+→ <code>replace_skill_properties</code>, a wholesale replace that dropped any field the call didn't include — and the CLI
+comment falsely claimed it merged. The same path already exposes a <b>PATCH</b> (<code>patch_skill_config</code>,
+<code>merged = {**existing, **partial}</code>, returns the merged config). Switched <code>skills set</code> to PATCH and
+use its response for the read-back; corrected the comment. Re-verified live:
+<pre>$ eesel skills set &lt;agent&gt; support_analytics --config '{"zz_a":"alpha"}'
+$ eesel skills set &lt;agent&gt; support_analytics --config '{"zz_b":"beta"}'
+# GET …/config → {"zz_a":"alpha","zz_b":"beta"}   # both present — the first survived</pre>
+Two tests updated to assert PATCH + a guard test that the command never sends a replacing PUT (537 passing).
+<br><br>
+<b>Actions (left as replace, now honest):</b> the tools endpoint has <b>no</b> merge — <code>configure_tool</code> replaces
+the row config wholesale (preserving only permission keys), and the tools <em>read</em> enriches config with
+<code>schema</code>/<code>tool_data</code>, so a client-side fetch-merge would re-persist that definition blob (the data
+shape rules it out). The dashboard form avoids this by always posting the full schema-derived config. So replace is the
+correct contract; the fix is to stop framing it as a patch — the <code>_actions_edit</code> docstring and
+<code>--config</code> help now say it writes the action's <b>full</b> config and that only permission keys are kept when
+omitted. Verified live: <code>actions set … --config '{"permission_mode":"ask"}'</code> applied, server preserved
+<code>require_human_approval</code>. (A true actions merge would be a server-side PATCH on the tools endpoint — a slack-repo
+change, out of scope for this CLI PR.)
 </div>
 
 <div class="f info">
@@ -257,7 +266,7 @@ deliberately omitting <code>billing-limit</code> from the HS256 list was right. 
 <tr><td>Resilience</td><td><span class="ev live">LIVE</span> <span class="ev read">READ</span> Strong. <code>http_request</code> <code>sys.exit</code>s non-zero on any 4xx/5xx or server-down; a non-JSON 2xx gets a clean "looks like a proxy/login page" message, no traceback. <code>confirm()</code> fails safe (abort on EOF/empty). No success-on-failure path found.</td></tr>
 <tr><td>Operational load</td><td>N/A — local single-user CLI. Resolvers add at most one extra <code>fetch_*</code> per invocation; task lookups capped (<code>limit=200–500</code>). No fan-out, no recursive pagination.</td></tr>
 <tr><td>Cost</td><td>N/A — no new metered/LLM calls. <code>schedules fire</code> enqueues an agent run (costs when it executes), but that's a deliberate user action mirroring the old <code>triggers fire</code>; <code>billing-limit</code> controls spend, doesn't incur it.</td></tr>
-<tr><td>Customer impact / back-compat</td><td>Most renames fenced behind hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read→show</code>, <code>tools→actions</code>, <code>sessions/schedules delete→remove</code>). Three <b>documented-only</b> breaks with no alias — see Needs-a-human. Plus the <code>agents add</code> bug (finding 1).</td></tr>
+<tr><td>Customer impact / back-compat</td><td>Most renames fenced behind hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read→show</code>, <code>tools→actions</code>, <code>sessions/schedules delete→remove</code>). Three <b>documented-only</b> breaks with no alias — see Needs-a-human. (The <code>agents add</code> dead-alias bug, finding 1, is now fixed.)</td></tr>
 </table>
 
 <h4 style="margin-top:18px;color:var(--mut)">Dropped after pressure-test (not real findings)</h4>
@@ -274,7 +283,7 @@ deliberately omitting <code>billing-limit</code> from the HS256 list was right. 
 <div class="body">
 <ul>
 <li><b>[x] Fix <code>agents add</code> (finding 1) — done.</b> Routed to the create path in <code>2a7c38a</code>, locked with a test, re-verified live (<code>agents add --name X</code> creates an agent, read-back confirms, exit 0).</li>
-<li><b>[ ] Decide replace-vs-merge for <code>skills set</code> / <code>actions set --config</code> (finding 2).</b> A merge (PATCH) endpoint exists right beside the replace one the CLI uses; the CLI comment claims merge but does replace. Either switch to PATCH + fix the comment, or make the read-back warn on dropped keys. Pass = a partial <code>--config</code> doesn't silently drop other stored fields (verify by read-back of the full object).</li>
+<li><b>[x] Fix replace-vs-merge for <code>set --config</code> (finding 2) — done.</b> <code>skills set</code> now PATCHes (merges), re-verified live (a field written in an earlier call survives a later one). <code>actions set</code> stays a wholesale replace (the tools endpoint has no merge and its read enriches config), now documented honestly in the docstring + <code>--help</code>. A true actions merge would need a server-side PATCH on the tools endpoint (slack repo) — worth a follow-up ticket if partial action config writes become common.</li>
 <li><b>[ ] Ratify the three back-compat breaks with no alias.</b> <code>triggers fire</code> → <code>schedules fire</code> (removed); bare <code>eesel triggers</code> now lists event triggers, not scheduled ones; <code>triggers --all</code> removed. All are documented in the README only — a non-interactive script never sees the note. Decide deliberately: leave as-is, add redirecting aliases, or emit a stderr migration hint.</li>
 <li><b>[ ] Prod chat path.</b> Verify <code>eesel chat</code> → <code>sandbox/start</code> with the minted workspace token actually works against production (can't browser-login from here). Pass = a real prod chat returns a streamed reply.</li>
 </ul>
