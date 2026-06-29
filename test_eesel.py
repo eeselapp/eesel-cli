@@ -3433,6 +3433,21 @@ class TestTaskAnalyticsFetch:
         # No date range and no agent → an empty body, yielding all-time totals.
         assert captured["body"] == {}
 
+    def test_uses_workspace_token_not_raw_login_token(self, fake_creds, monkeypatch):
+        # /workspace/tasks/analytics is workspace-authenticated (HS256), so it must
+        # send the exchanged workspace token like the other /workspace/tasks calls.
+        # The raw login token is an RS256 access token in prod and gets 401'd there.
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "WS-EXCHANGED")
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["token"] = token
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds)
+        assert captured["token"] == "WS-EXCHANGED"
+
 
 class TestTaskAnalyticsCommand:
     def test_summary_prints_resolution_rate_and_breakdowns(self, fake_creds, monkeypatch, capsys):
@@ -6008,6 +6023,18 @@ class TestNormalizeIntegrationsArgv:
     def test_actions_help_reaches_actions_parser(self):
         assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "--help"]) == [
             "integrations", "actions", "zendesk", "--help"]
+
+    def test_actions_unknown_verb_passed_through_for_suggestion(self):
+        # A typo'd verb must NOT be defaulted to `list` (which would bury it as an
+        # unexpected argument to `list`); it's passed through unchanged so the
+        # actions subparser raises a suggesting "invalid choice" error.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "enabl", "reply"]) == [
+            "integrations", "actions", "zendesk", "enabl", "reply"]
+
+    def test_actions_flags_only_defaults_to_list(self):
+        # Only flags after `actions` (no verb at all) still defaults to `list`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "--json"]) == [
+            "integrations", "actions", "zendesk", "list", "--json"]
 
 
 class TestChatAgentFlag:

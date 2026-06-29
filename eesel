@@ -3246,7 +3246,7 @@ def fetch_task_analytics(
         body["end_date"] = end_date
     if agent_id:
         body["agent_ids"] = [agent_id]
-    return http_request("POST", f"{creds['api_url']}/workspace/tasks/analytics", token=creds["token"], body=body)
+    return http_request("POST", f"{creds['api_url']}/workspace/tasks/analytics", token=workspace_token(creds), body=body)
 
 
 def export_tasks(
@@ -5641,9 +5641,13 @@ def _normalize_integrations_argv(argv: list[str]) -> list[str]:
         # `integrations zendesk actions --help` → show the actions help.
         return argv[: i + 1] + ["actions", integration] + tail
     first_positional = next((tok for tok in tail if not tok.startswith("-")), None)
-    if first_positional not in _ACTIONS_SUBCOMMANDS:
-        # No explicit verb → default to `list`.
+    if first_positional is None:
+        # No verb at all (bare `actions`, or only flags) → default to `list`.
         tail = ["list"] + tail
+    # A positional that isn't a known verb is passed through unchanged so the
+    # actions subparser raises a suggesting "invalid choice" on a typo (e.g.
+    # `actions enabl` → "Did you mean 'enable'?"). Defaulting it to `list` here
+    # would instead bury the typo as an unexpected argument to `list`.
     return argv[: i + 1] + ["actions", integration] + tail
 
 
