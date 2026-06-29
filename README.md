@@ -177,7 +177,7 @@ eesel triggers remove <id>
 
 # Scheduled jobs (cron)
 eesel schedules                     # every scheduled job (id, title, cron, tz)
-eesel schedules add <agent> --cron "0 9 * * *" --title "Morning digest"
+eesel schedules add <agent> --cron "0 9 * * *" --prompt "Summarise overnight tickets" --title "Morning digest"
 eesel schedules fire <id-or-title>  # run one manually, now
 eesel schedules remove <id>
 ```

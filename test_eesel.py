@@ -698,6 +698,39 @@ class TestDocumentCommand:
         # Only the current agent's document survives the scope filter.
         assert [d["id"] for d in payload] == ["doc-1"]
 
+    def test_document_list_agent_flag_scopes_to_resolved_agent(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # --agent (id, id-prefix, or name) overrides the active agent for the
+        # listing scope, in memory only — it never rewrites the saved active agent.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "agent-test-456", "name": "Default Bot"},
+            {"agent_id": "other-agent", "name": "Other Bot"},
+        ])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--agent must not persist the active agent"))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"documents": [
+            {"id": "doc-1", "key": "files/agent-test-456/a.md", "name": "a.md"},
+            {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
+        ]})
+        args = type("Args", (), {
+            "document_cmd": "list", "prefix": None, "search": None,
+            "limit": 100, "offset": 0, "json": True, "agent": "Other Bot",
+        })()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Only the --agent target's document survives the scope filter.
+        assert [d["id"] for d in payload] == ["doc-2"]
+
+    def test_document_list_unknown_agent_errors_before_fetch(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not fetch on an unresolved --agent"))
+        args = type("Args", (), {
+            "document_cmd": "list", "prefix": None, "search": None,
+            "limit": 100, "offset": 0, "json": False, "agent": "nope",
+        })()
+        with pytest.raises(SystemExit):
+            eesel.cmd_document(args)
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
     def test_document_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
         # `--plain` emits one decoration-free, tab-separated row per document:
         # id<TAB>key<TAB>name, scoped to the current agent. The human view's
@@ -2779,6 +2812,16 @@ class TestConfirm:
         assert args.search == "post"
         assert args.limit == 25
 
+    def test_document_subcommands_accept_agent_flag(self):
+        parser = eesel.build_parser()
+        for argv in (
+            ["documents", "list", "--agent", "Bot"],
+            ["documents", "show", "doc-1", "--agent", "Bot"],
+            ["documents", "add", "--title", "T", "--content", "x", "--agent", "Bot"],
+        ):
+            args = parser.parse_args(argv)
+            assert args.agent == "Bot"
+
     def test_document_export_subcommand_parses(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["document", "export", "--document-id", "doc-123", "--format", "html"])
@@ -4448,6 +4491,26 @@ class TestIntegrationActionsList:
         assert "Leave internal note" in out and "WRITE" in out and "ask" in out
         assert "Search docs" not in out
 
+    def test_list_shows_tool_key_column(self, fake_creds, monkeypatch, capsys):
+        # The key the write verbs (show/enable/disable/set) require must be
+        # visible in the table, not only under --json.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
+        cap = capsys.readouterr()
+        assert "zendesk_leave_internal_note" in cap.out
+        assert "key" in cap.err  # header line goes to stderr
+
+    def test_show_resolves_display_name(self, fake_creds, monkeypatch, capsys):
+        # `show` accepts the human display name, not just the tool_key.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="Leave internal note", agent=None, json=False))
+        cap = capsys.readouterr()
+        assert rc == 0
+        assert "zendesk_leave_internal_note" in (cap.out + cap.err)
+
     def test_resolves_named_agent(self, fake_creds, monkeypatch, capsys):
         captured = {}
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
@@ -6116,6 +6179,16 @@ class TestIntegrationActionsWrite:
             actions_cmd="enable", integration="ai_actions", agent="agent-test-456", action="doc_search"))
         assert captured["body"] == {"config": {}}
 
+    def test_enable_accepts_display_name(self, fake_creds, monkeypatch, capsys):
+        # A human display name resolves to its tool_key for the write.
+        captured = self._setup(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Sales Bot", action="Leave internal note"))
+        assert rc == 0
+        assert captured["url"].endswith("/tools/zendesk_leave_internal_note")
+        assert "Enabled 'zendesk_leave_internal_note'" in capsys.readouterr().err
+
     def test_enable_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
@@ -6307,3 +6380,38 @@ class TestChatAgentFlag:
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
         rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
         assert rc == 0
+
+
+class TestChatTaskFlag:
+    def test_resolves_prefix_to_full_task_id_before_binding(self, fake_creds, monkeypatch, capsys):
+        # A `--task` id-prefix is resolved to the full task id before the session
+        # is pinned — binding the truncated value would create a junk session that
+        # fails the stream with an empty error.
+        full_id = "330c8f22-aaaa-bbbb-cccc-dddddddddddd"
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "fetch_tasks", lambda creds, **k: ([{"task_id": full_id}], None, None))
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: None)
+        created = {}
+
+        def fake_new_session(creds, **k):
+            created.update(k)
+            return {"id": "sess-1", **k}
+
+        monkeypatch.setattr(eesel, "new_session", fake_new_session)
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
+        assert rc == 0
+        # The full resolved id is pinned, not the truncated prefix.
+        assert created["task_id"] == full_id
+
+    def test_ambiguous_prefix_errors_without_binding(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(
+            eesel, "fetch_tasks",
+            lambda creds, **k: ([{"task_id": "330c8f22-aaaa"}, {"task_id": "330c8f22-bbbb"}], None, None),
+        )
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: pytest.fail("must not look up a session before resolving"))
+        monkeypatch.setattr(eesel, "new_session", lambda *a, **k: pytest.fail("must not bind a session on an ambiguous prefix"))
+        rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err

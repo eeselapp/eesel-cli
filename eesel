@@ -390,6 +390,41 @@ def apply_agent_env_override(creds: dict) -> dict:
     return creds
 
 
+def apply_agent_flag_override(creds: dict, agent: str | None) -> dict:
+    """Scope a single command to `agent` (a `--agent` value: full id, id-prefix,
+    or name), overriding the active agent / EESEL_AGENT for this invocation only.
+
+    Returns creds unchanged when `agent` is None. Resolved in memory and never
+    written to disk. An unmatched or ambiguous value is a hard error, mirroring
+    EESEL_AGENT handling so a typo fails loudly instead of silently scoping the
+    command to the wrong agent."""
+    if not agent:
+        return creds
+    match, candidates = resolve_agent_strict(fetch_agents(creds), agent)
+    if not match:
+        if candidates:
+            err(f"'{agent}' is ambiguous — it matches {len(candidates)} agents:")
+            for a in candidates:
+                err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+            err("Re-run with a full agent id to disambiguate.")
+        else:
+            err(f"No agent matches '{agent}'.")
+            info("Run `eesel agents list` to see available agents.")
+        sys.exit(1)
+    creds = dict(creds)
+    creds["agent_id"] = match["agent_id"]
+    return creds
+
+
+def require_creds_scoped(args) -> dict:
+    """`require_creds()` plus an optional per-command `--agent` override.
+
+    A `--agent` flag (full id, id-prefix, or name) scopes this one command to a
+    specific agent, exactly like `EESEL_AGENT` but per-invocation and winning over
+    it. The value is resolved in memory and never persisted."""
+    return apply_agent_flag_override(require_creds(), getattr(args, "agent", None))
+
+
 def require_creds() -> dict:
     creds = load_creds()
     if not creds:
@@ -2896,6 +2931,33 @@ def cmd_integration_actions(args) -> int:
     return _actions_list(args, creds)
 
 
+def _resolve_action_key(creds: dict, agent_id: str, integration: str, action: str) -> tuple[str | None, list[dict]]:
+    """Map a user-supplied action reference to its canonical `tool_key`.
+
+    Accepts the exact `tool_key`, the case-insensitive display name (e.g.
+    "Search tickets" → `zendesk_search_tickets`), or a unique `tool_key`/name
+    prefix — so the write verbs aren't limited to the key that only shows under
+    `--json`. Returns ``(tool_key, scoped_tools)`` where `scoped_tools` is the
+    agent's tools filtered to this integration; `tool_key` is None when nothing
+    matches uniquely, so callers can report a clear error or fall back to the raw
+    value (e.g. enabling a not-yet-configured action by its exact key)."""
+    scoped = [t for t in fetch_tools(creds, agent_id) if _action_matches_integration(_tool_row(t), integration)]
+    exact = next((t for t in scoped if t.get("tool_key") == action), None)
+    if exact:
+        return action, scoped
+    lowered = action.lower()
+    named = [t for t in scoped if (_tool_row(t)["name"] or "").lower() == lowered]
+    if len(named) == 1:
+        return named[0].get("tool_key"), scoped
+    prefixed = [
+        t for t in scoped
+        if (t.get("tool_key") or "").startswith(action) or (_tool_row(t)["name"] or "").lower().startswith(lowered)
+    ]
+    if len(prefixed) == 1:
+        return prefixed[0].get("tool_key"), scoped
+    return None, scoped
+
+
 def _actions_list(args, creds: dict) -> int:
     """List the integration's actions for an agent (read-only).
 
@@ -2920,10 +2982,13 @@ def _actions_list(args, creds: dict) -> int:
 
     info(f"# {agent.get('name', '?')} ({agent_id[:12]}) / {integration} — {len(scoped)} action{'s' if len(scoped) != 1 else ''}")
     rows = sorted((_tool_row(t) for t in scoped), key=lambda r: r["name"].lower())
-    fmt = " {:<32}  {:<5}  {:<13}  {}"
-    info(fmt.format("action", "r/w", "permission", "integration_id"))
+    # The `key` column is the value the show/enable/disable/set verbs accept, so
+    # it must be visible here rather than only under --json. It is printed in full
+    # (not truncated) so it can be copied.
+    fmt = " {:<28}  {:<32}  {:<5}  {:<11}  {}"
+    info(fmt.format("action", "key", "r/w", "permission", "integration_id"))
     for r in rows:
-        print(fmt.format(r["name"][:32], r["action"], r["permission"][:13], r["integration_id"][:12]))
+        print(fmt.format(r["name"][:28], r["tool_key"], r["action"], r["permission"][:11], r["integration_id"][:12]))
     return 0
 
 
@@ -2938,16 +3003,12 @@ def _actions_show(args, creds: dict) -> int:
         return 1
     agent_id = agent["agent_id"]
     integration = args.integration
-    action_key = args.action
 
-    tools = fetch_tools(creds, agent_id)
-    match = next(
-        (t for t in tools
-         if t.get("tool_key") == action_key and _action_matches_integration(_tool_row(t), integration)),
-        None,
-    )
+    tool_key, scoped = _resolve_action_key(creds, agent_id, integration, args.action)
+    match = next((t for t in scoped if t.get("tool_key") == tool_key), None) if tool_key else None
     if match is None:
-        err(f"No '{action_key}' action under '{integration}' for {agent.get('name', agent_id)}.")
+        err(f"No '{args.action}' action under '{integration}' for {agent.get('name', agent_id)}.")
+        info("Run `eesel integrations <integration> actions list` to see action keys (or add --json).")
         return 1
     if getattr(args, "json", False):
         print(json.dumps(_redact_secrets(match), indent=2))
@@ -3010,10 +3071,14 @@ def _actions_enable(args, creds: dict) -> int:
     if not agent:
         return 1
     agent_id = agent["agent_id"]
+    # Accept a display name or prefix; fall back to the raw value so a not-yet-
+    # configured action can still be enabled by its exact key.
+    tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
+    action_key = tool_key or args.action
     integration_id = _resolve_integration_id(creds, agent_id, args.integration)
-    _configure_tool(creds, agent_id, args.action, {}, integration_id)
-    ok(f"Enabled '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
-    info("Set its permission/settings with `eesel integrations <integration> actions edit`.")
+    _configure_tool(creds, agent_id, action_key, {}, integration_id)
+    ok(f"Enabled '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
+    info("Set its permission/settings with `eesel integrations <integration> actions set`.")
     return 0
 
 
@@ -3037,9 +3102,11 @@ def _actions_edit(args, creds: dict) -> int:
         err(str(e))
         return 1
     agent_id = agent["agent_id"]
+    tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
+    action_key = tool_key or args.action
     integration_id = _resolve_integration_id(creds, agent_id, args.integration)
-    result = _configure_tool(creds, agent_id, args.action, config, integration_id)
-    ok(f"Updated '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
+    result = _configure_tool(creds, agent_id, action_key, config, integration_id)
+    ok(f"Updated '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
     saved = result.get("config") if isinstance(result, dict) else None
     if saved is not None:
         info(f"  config: {json.dumps(_redact_secrets(saved))}")
@@ -3059,17 +3126,22 @@ def _actions_disable(args, creds: dict) -> int:
     if not agent:
         return 1
     agent_id = agent["agent_id"]
+    # Confirm before any network call so a declined prompt stays fully read-free.
     if not args.force and not confirm(
         f"Disable '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}? [y/N] "
     ):
         info("Aborted.")
         return 1
+    # Accept a display name or prefix; fall back to the raw value (e.g. an exact
+    # key for a row that isn't listed).
+    tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
+    action_key = tool_key or args.action
     integration_id = _resolve_integration_id(creds, agent_id, args.integration)
-    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(args.action, safe='')}"
+    url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(action_key, safe='')}"
     if integration_id:
         url += f"?{urllib.parse.urlencode({'integration_id': integration_id})}"
     http_request("DELETE", url, token=creds["token"])
-    ok(f"Disabled '{args.action}' ({args.integration}) for {agent.get('name', agent_id)}.")
+    ok(f"Disabled '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
     return 0
 
 
@@ -3189,22 +3261,28 @@ def cmd_chat(args) -> int:
     if task_target:
         # Attach to an existing backend conversation by its task id — e.g. one
         # an agent handed to an external service so it can post a result back
-        # into the same conversation. Reuse the local session bound to that
-        # task if we have one (keeps local history accumulating), otherwise
-        # create a fresh session pinned to the given task id. The backend
-        # resumes the conversation from its own task state either way.
-        sess = find_session_by_task(task_target)
+        # into the same conversation. Resolve an id-prefix to a full task id
+        # first (like `tasks show`/`tasks cost`); binding to a truncated id would
+        # create a junk session and fail the stream with an empty error. A full
+        # uuid is used as-is, so a task that isn't in the recent list still works.
+        task_id = resolve_task_id(creds, task_target)
+        if not task_id:
+            return 1
+        # Reuse the local session bound to that task if we have one (keeps local
+        # history accumulating), otherwise create a fresh session pinned to it.
+        # The backend resumes the conversation from its own task state either way.
+        sess = find_session_by_task(task_id)
         if sess:
             set_current(sess["id"])
         else:
             sess = new_session(
                 creds,
                 agent_id=creds.get("agent_id"),
-                name=f"task-{task_target[:8]}",
+                name=f"task-{task_id[:8]}",
                 switch_to=True,
-                task_id=task_target,
+                task_id=task_id,
             )
-        info(f"session {sess['id']} bound to task {task_target}")
+        info(f"session {sess['id']} bound to task {task_id}")
     elif target:
         match = resolve_scheduled_job(creds, target)
         if not match:
@@ -4187,7 +4265,7 @@ def cmd_document(args) -> int:
     <q>`, not a separate verb."""
     sub = args.document_cmd or "list"
     if sub == "list":
-        creds = require_creds()
+        creds = require_creds_scoped(args)
         documents = fetch_documents(
             creds,
             prefix=args.prefix,
@@ -4241,7 +4319,7 @@ def build_document_create_body(*, title: str, content: str, source_type: str, ag
 def _documents_add(args) -> int:
     """`eesel documents add` — bring a new document into the workspace
     (POST /documents). Prints the new document's key so it can be captured."""
-    creds = require_creds()
+    creds = require_creds_scoped(args)
     if args.content is not None and args.content_file is not None:
         err("Pass either --content or --content-file, not both.")
         return 1
@@ -4350,7 +4428,7 @@ def cmd_document_read(args) -> int:
     Like `instructions`, the body goes to stdout and the header to stderr, so
     `eesel document read <id> > out.md` captures just the content.
     """
-    creds = require_creds()
+    creds = require_creds_scoped(args)
     fmt = (getattr(args, "format", None) or "md").lower()
     prefix = getattr(args, "prefix", None)
 
@@ -5155,6 +5233,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     ls.add_argument("--search", help="Free-text query over document names/keys")
     ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
+    ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     ls.add_argument("--json", action="store_true", help="Emit the raw documents payload")
     ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>key<TAB>name` row per document")
 
@@ -5167,6 +5246,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         )
         rd.add_argument("target", nargs="?", help="Document id, id-prefix, key, or filename (omit to pick from a menu)")
         rd.add_argument("--prefix", help="Filter the menu/list to keys under this prefix (e.g. files/, outputs/)")
+        rd.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
         rd.add_argument("--format", default="md", choices=["md", "html"], help="Content format (default: md)")
         rd.add_argument("--json", action="store_true", help="Emit the document as a JSON object (id, key, content)")
 
@@ -5183,6 +5263,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     content.add_argument("--content", help="Document content (inline)")
     content.add_argument("--content-file", help="Read document content from this file")
     cr.add_argument("--source-type", default="files", help="Source type the document is filed under (default: files)")
+    cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access (default: active agent, or $EESEL_AGENT)")
 
     de = d_sub.add_parser("remove", help="Remove documents by key (asks for confirmation)")
     de.add_argument("keys", nargs="+", help="One or more exact document keys to remove")
