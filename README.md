@@ -181,17 +181,21 @@ trigger config (access tokens, signing secrets) are masked in the human view;
 use `--json` for the raw payload. `eesel integrations --secrets` reveals
 integration credentials and is gated to sysadmin/impersonator accounts.
 
-### `edit` vs `set`
+### `set` (and the old `edit` alias)
 
-Two write verbs that look similar but mean different things:
+`set` is the canonical write verb across the CLI. Depending on the command it
+either replaces a free-form object or writes a named field:
 
-- **`edit`** replaces a free-form object — a skill's or action's `--config`
-  JSON, or an agent's name/instructions. You pass the whole value.
-- **`set`** writes a single named field. `eesel workspace set <field> <value>`
-  and `eesel documents acl set <agent> --prefix …` write one specific thing.
+- **Replaces a `--config` object** — a skill's or action's config JSON, or an
+  agent's name/instructions: `eesel agents set <agent> --instructions …`,
+  `eesel integrations <x> actions set <action> --config '{…}'`,
+  `eesel mcp set <server> …`, `eesel skills set <agent> <skill> --config '{…}'`.
+- **Writes a single named field** — `eesel workspace set <field> <value>`,
+  `eesel documents acl set <agent> --prefix …`.
 
-Rule of thumb: if the command takes a `--config` JSON blob it's `edit`; if it
-writes one named field it's `set`.
+`edit` is kept only as a **hidden back-compat alias** for `set` on the commands
+that used to spell it that way (agents, mcp, skills, `integrations actions`); new
+scripts should use `set`.
 
 Some renamed commands keep **hidden back-compat aliases** so existing scripts
 don't break: `eesel tools [agent]` still works (now `eesel integrations <x>
