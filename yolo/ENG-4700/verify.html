@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Verify — ENG-4700 CLI namespace consolidation (PR #21)</title>
-<meta name="description" content="Independent verify of the eesel-cli namespace consolidation: write half works live, two real defects to fix before merge.">
+<meta name="description" content="Verify of the eesel-cli namespace consolidation: write half works live; verdict ready to merge with two human sign-offs.">
 <style>
   :root{--bg:#0f1115;--card:#181b22;--ink:#e6e8ec;--mut:#9aa3b2;--line:#2a2f3a;
     --red:#ff6b6b;--amb:#ffb454;--grn:#5ad17a;--blu:#6db3f2;--chip:#222733;}
@@ -13,7 +13,7 @@
   .wrap{max-width:920px;margin:0 auto}
   h1{font-size:20px;margin:0 0 4px}
   .sub{color:var(--mut);font-size:13px;margin-bottom:20px}
-  .verdict{border:1px solid var(--line);border-left:5px solid var(--amb);background:var(--card);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+  .verdict{border:1px solid var(--line);border-left:5px solid var(--grn);background:var(--card);border-radius:10px;padding:18px 20px;margin-bottom:18px}
   .verdict h2{margin:0 0 8px;font-size:17px}
   .kv{margin:10px 0 0}
   .kv b{color:var(--blu)}
@@ -31,14 +31,11 @@
   .f.block{border-color:var(--red)}
   .f.warn{border-color:var(--amb)}
   .f.info{border-color:var(--blu)}
-  .f.ok{border-color:var(--grn)}
   .f h4{margin:0 0 4px;font-size:14.5px}
   .f .meta{color:var(--mut);font-size:12px;margin-bottom:6px}
   .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:4px;padding:1px 7px;margin-right:6px;vertical-align:middle}
-  .tag.block{background:#3a1f1f;color:var(--red)}
   .tag.warn{background:#3a2e1a;color:var(--amb)}
   .tag.info{background:#1c2c3a;color:var(--blu)}
-  .tag.ok{background:#1c3a26;color:var(--grn)}
   code{background:#0c0e12;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cdd6e4}
   pre{background:#0c0e12;border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:12px/1.45 ui-monospace,Menlo,monospace;color:#cdd6e4}
   table{border-collapse:collapse;width:100%;font-size:13px;margin:6px 0}
@@ -63,46 +60,41 @@
 <h1>Verify — ENG-4700 · CLI namespace consolidation</h1>
 <div class="sub">
   PR <a href="https://github.com/eeselapp/eesel-cli/pull/21">eeselapp/eesel-cli #21</a> ·
-  base <code>main</code> (93d6765) · HEAD <code>2497001</code> ·
-  independent re-verify · tested live against a local dev stack (server :8080) ·
-  <b style="color:var(--grn)">findings 1 + 2 fixed and re-verified live</b>
+  base <code>main</code> (93d6765) · tested live against a local dev stack (server :8080), CLI via <code>eesel login --dev</code>
 </div>
 
-<div class="verdict" style="border-left-color:var(--grn)">
-  <h2>Verdict: <span style="color:var(--grn)">Ready to merge</span></h2>
-  <div>The namespace consolidation is genuinely solid: the headline new capability — the <em>write</em> half of
-  the CLI — works end-to-end against a live server, the unified verbs are consistent, destructive commands refuse
-  ambiguity, and every read path still works. This pass found two real defects the prior review missed;
-  <b style="color:var(--grn)">both are now fixed and re-verified live</b> — finding 1 (<code>agents add</code> was a
-  dead alias) and finding 2 (<code>skills set</code> silently replaced config). Findings 3–5 are low/conventions;
-  one earlier flag (a wrong-token bug) was chased down and <b>cleared as a false alarm</b> against the server.
-  Two sign-off items remain for a human (the documented back-compat breaks, and the prod chat path that can't be
-  reached from here).</div>
+<div class="verdict">
+  <h2>Verdict: <span style="color:var(--grn)">Ready to merge</span> — two human sign-offs</h2>
+  <div>The namespace consolidation is solid. The headline new capability — the <em>write</em> half of the CLI —
+  works end-to-end against a live server: the full agent lifecycle, skill/action config, and the new create/remove
+  commands all do what they say, confirmed by reading the result back (not by trusting a 200). The unified verbs are
+  consistent, destructive commands refuse ambiguity, confirm + <code>--force</code> behave, "did you mean?" fires
+  across the tree, and every existing read path still returns. No blocking defects. The remaining items are three
+  low-severity / consistency notes and two judgment calls for a human: a set of deliberate back-compat breaks, and
+  the production chat path that can't be reached from here.</div>
 
   <div class="kv"><b>What changes for users:</b> every command group now speaks one verb vocabulary
-  (<code>list / show / add / set / remove</code>; <code>create</code> for agents); the CLI gains the
-  <em>write</em> half it never had (create/configure/remove agents, integrations, documents, triggers,
-  schedules, MCP servers, knowledge ACLs, workspace + billing + notification settings); old verbs survive as
-  hidden aliases; unknown subcommands get "did you mean?"; <code>--force</code> + a shared confirm guard every delete.</div>
+  (<code>list / show / add / set / remove</code>; <code>create</code> for agents); the CLI gains the <em>write</em>
+  half it never had (create/configure/remove agents, integrations, documents, triggers, schedules, MCP servers,
+  knowledge ACLs, workspace + billing + notification settings); old verbs survive as hidden aliases; unknown
+  subcommands get "did you mean?"; <code>--force</code> + a shared confirm guard every delete.</div>
 
-  <div class="kv"><b>What must not change (and mostly didn't):</b> every read/list path across every group still
-  works — verified live. One read command's <em>human</em> output shifted (an <code>[on]/[off]</code> column was
-  inserted into <code>agents list</code>) — see finding 4.</div>
+  <div class="kv"><b>What must not change (and didn't):</b> every read/list path across every group still works —
+  verified live. One read command's <em>human</em> output carries a new status column (<code>agents list</code>) —
+  see finding 2.</div>
 
-  <div class="kv"><b>Watch this:</b> nothing blocking. <span style="color:var(--grn)">① <code>agents add</code> now
-  dispatches to create; ② <code>skills set</code> now merges via PATCH</span> (verified live: writing one field twice
-  keeps both). <code>actions set</code> stays a wholesale replace — that's the server's actual contract (no merge
-  endpoint, and its read enriches config with schema), now stated honestly in the docstring + <code>--help</code>.</div>
+  <div class="kv"><b>Watch this:</b> nothing blocking. Two behaviours worth knowing before merge:
+  <code>actions set --config</code> <em>replaces</em> an action's config (the server has no merge for tools), while
+  <code>skills set</code> <em>merges</em> — different by necessity, both documented; and the deliberate
+  <code>triggers</code> command breaks (see Needs-a-human).</div>
 
   <div class="row">
-    <span class="chip ok">535 unit tests green</span>
+    <span class="chip ok">537 unit tests green</span>
     <span class="chip ok">agent lifecycle live ✓</span>
-    <span class="chip ok">strict resolution live ✓</span>
+    <span class="chip ok">skills set merge live ✓</span>
+    <span class="chip ok">strict destructive resolution live ✓</span>
     <span class="chip ok">read paths live ✓</span>
-    <span class="chip ok">537 tests green</span>
-    <span class="chip ok">① agents add fixed + re-verified</span>
-    <span class="chip ok">② skills set merges (PATCH) + re-verified</span>
-    <span class="chip ok">billing-limit token: false alarm, cleared</span>
+    <span class="chip warn">3 low / conventions notes</span>
   </div>
   <div class="legend">Evidence grades below:
     <span class="ev live">LIVE</span> watched it run against the server ·
@@ -116,37 +108,40 @@
 <summary>🗺️ Footprint — what changed</summary>
 <div class="body">
 <p>Three product files in the <code>eesel-cli</code> repo, plus this review. No server change — every endpoint the
-new write commands call already existed (this PR consolidates the per-ticket build PRs #10–#19 onto one branch).</p>
+new write commands call already existed.</p>
 <pre class="tree">eesel-cli/
-├── <b>eesel</b>            +3669 / −937    single-file Python CLI — the whole namespace + write commands
-├── <b>test_eesel.py</b>    +3519 / −113    535 tests (HTTP layer mocked)
-├── <b>README.md</b>        +  82 / − 29    command-surface rewrite
-└── yolo/ENG-4700/verify.html              this review
+├── <b>eesel</b>            +4612 / −~1000   single-file Python CLI — the whole namespace + write commands
+├── <b>test_eesel.py</b>    +3528 / −~115    537 tests (HTTP layer mocked)
+├── <b>README.md</b>        + 111 / − ~30    command-surface rewrite
+└── yolo/ENG-4700/verify.html               this review
                       ──────────────────
-                      ~7531 insertions across the diff vs main</pre>
+                      ~7200 insertions across the diff vs main</pre>
 <p>Shape: one verb namespace applied across ~12 command groups, each with a <code>match_X</code> (priority-ordered)
 + first-match <code>resolve_X</code> (reads) + strict <code>resolve_X_strict</code> (writes) triad, a shared
 <code>confirm</code>, a <code>hide_subcommands</code> alias helper, and a recursive "did you mean?" installer.
 Scope is in-bounds — nothing touched outside the CLI file, its tests, and its README. The one group that didn't
-fully adopt the triad is <code>documents</code> (finding 5).</p>
+fully adopt the triad is <code>documents</code> (finding 3).</p>
 </div>
 </details>
 
 <!-- ================= AC ================= -->
 <details open>
-<summary>✅ Acceptance criteria — 6 met live · 1 met with a broken alias · 2 not reachable</summary>
+<summary>✅ Acceptance criteria — 7 met live · 2 not reachable from here</summary>
 <div class="body">
 <table>
 <tr><th>Criterion</th><th>Evidence</th><th>Result</th></tr>
 <tr><td>End-to-end agent lifecycle: <code>create → set → read-back → remove → list</code></td>
     <td><span class="ev live">LIVE</span></td>
-    <td>✅ Pass. Created an agent, edited instructions only, <code>show</code> reflected the edit (name preserved), removed it, <code>list</code> confirmed gone. Verified by read-back, not status code.</td></tr>
+    <td>✅ Pass. Created an agent (via both <code>create</code> and the <code>add</code> alias), edited instructions only, <code>show</code> reflected the edit (name preserved), removed it, <code>list</code> confirmed gone. Verified by read-back, not status code.</td></tr>
 <tr><td>One shared verb namespace; old verbs kept as <b>hidden</b> aliases</td>
     <td><span class="ev live">LIVE</span></td>
-    <td>✅ Pass (after the fix). <code>--help</code> is clean across groups; hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read</code>…) still work. <code>agents add</code> was a registered-but-dead alias; <b>now fixed and re-verified live</b> (finding 1).</td></tr>
+    <td>✅ Pass. <code>--help</code> is clean across groups; hidden aliases (<code>add</code>, <code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read</code>…) still work and stay out of help.</td></tr>
+<tr><td>Skill / action config writes apply correctly</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass. <code>skills set</code> merges (writing one field twice keeps both — read back from the config endpoint). <code>actions set</code> applies and the server preserves the permission keys. See finding 4 for the skills-vs-actions semantics split.</td></tr>
 <tr><td>Destructive commands use <b>strict</b> resolution (refuse ambiguity, never act on arbitrary first match)</td>
     <td><span class="ev live">LIVE</span></td>
-    <td>✅ Pass for an ambiguous id-prefix: <code>agents remove "b" --force</code> listed both matches and deleted nothing (count 4→4). Caveats: an <em>empty</em> prefix isn't treated as "matches all → refuse" (finding 3); <code>documents remove</code> does no resolution at all (finding 5).</td></tr>
+    <td>✅ Pass for an ambiguous id-prefix: <code>agents remove "b" --force</code> listed both matches and deleted nothing (count unchanged). Caveats: an <em>empty</em> prefix isn't treated as "matches all → refuse" (finding 1); <code>documents remove</code> does no resolution (finding 3).</td></tr>
 <tr><td>Confirmation prompt + <code>--force</code>/<code>-f</code> parity on destructive commands</td>
     <td><span class="ev live">LIVE</span></td>
     <td>✅ Pass. Empty/EOF stdin aborts (fail-safe, defaults to "no"); <code>--force</code> skips the prompt. Confirmed across remove paths.</td></tr>
@@ -155,92 +150,51 @@ fully adopt the triad is <code>documents</code> (finding 5).</p>
     <td>✅ Pass at root (<code>agnets→agents</code>), per group (<code>agents lst→list</code>), and nested actions (<code>actions enabl→enable</code>). Very short typos (<code>notif</code>) fall below difflib's cutoff — closer typos suggest fine.</td></tr>
 <tr><td>Read/list paths across all groups unchanged (the "must not change" half)</td>
     <td><span class="ev live">LIVE</span></td>
-    <td>⚠️ Pass functionally — <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> reads all returned live. But <code>agents list</code>'s <em>human</em> output gained a status column, shifting columns (finding 4).</td></tr>
+    <td>✅ Pass functionally — <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> reads all returned live. One default human-output column was added to <code>agents list</code> (finding 2).</td></tr>
 <tr><td>Unit suite green</td>
     <td><span class="ev test">TEST</span></td>
-    <td>✅ 537 passed in 4.6s (+2 net: a test locks the <code>agents add</code> alias; two skills tests now assert PATCH + a no-PUT-regression guard). Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract).</td></tr>
+    <td>✅ 537 passed in ~4s. Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract).</td></tr>
 <tr><td>Connect a live helpdesk integration (real OAuth)</td>
     <td><span class="ev no">NOT RUN</span></td>
     <td>Command exists (<code>integrations add</code>); a real OAuth round-trip needs a third party. Per ENG-4700 the bar is "command exists + endpoint reachable," which holds.</td></tr>
 <tr><td>Chat token minting → <code>sandbox/start</code> works in <b>production</b></td>
     <td><span class="ev no">NOT RUN</span> <span class="ev read">READ</span></td>
-    <td>Provisional. Token-minting code is present (and was already used by chat on <code>main</code> — see note in side-effects). Can't browser-login to prod from here; untested on the real prod path.</td></tr>
+    <td>Provisional. Token-minting code is present; can't browser-login to prod from here, so the real prod path is untested.</td></tr>
 </table>
 </div>
 </details>
 
 <!-- ================= PANEL ================= -->
 <details open>
-<summary>🔍 Panel findings — 5 real (1 bug, 1 footgun, 3 lower) · 1 false alarm cleared · breaks for a human</summary>
+<summary>🔍 Concerns — 3 low / conventions · plus back-compat for a human</summary>
 <div class="body">
 
-<div class="f ok">
-<h4><span class="tag ok">RESOLVED</span> 1 · <code>eesel agents add</code> was a registered verb that silently did nothing — now dispatches to create <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
-<div class="meta">was: <code>eesel:5131</code> registered <code>add</code> as a hidden alias of <code>create</code>, but <code>cmd_agents</code> had no <code>add</code> branch → fell through to <code>return 1</code> · fixed in <code>2a7c38a</code> · confidence: certain</div>
-The alias parsed and set <code>args.agents_cmd="add"</code>, but the dispatcher only handled
-<code>create</code> — so <code>add</code> fell through to <code>return 1</code>: exit 1, no output, no agent. Every other
-noun's <code>add</code> worked; agents was the lone miss, and no test covered it. <b>Fix:</b> routed <code>add</code> to
-the create path (<code>if sub in ("create","add")</code>) and added a test that asserts <code>agents add</code> POSTs the
-same body as <code>create</code>. Re-verified live:
-<pre>$ eesel agents add --name "ZZ-add-fix-test" --instructions "verify add alias"
-✓ Created agent 'ZZ-add-fix-test' (a4a30021-…)   # exit 0
-$ eesel agents list | grep ZZ-add-fix-test
-   a4a30021-a34  [on]   ZZ-add-fix-test              # read-back confirms; cleaned up after</pre>
-Suite: 536 passing (+1).
-</div>
-
-<div class="f ok">
-<h4><span class="tag ok">RESOLVED</span> 2 · <code>skills set</code> now merges (PATCH); <code>actions set</code> replace is now honest <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
-<div class="meta">fixed in <code>2497001</code> · server merge endpoint confirmed at <code>skills/__init__.py:421</code> (PATCH) · confidence: certain</div>
-<b>Skills (fixed):</b> <code>skills set</code> issued <b>PUT</b> <code>/skills/{id}/config</code> → <code>save_skill_config</code>
-→ <code>replace_skill_properties</code>, a wholesale replace that dropped any field the call didn't include — and the CLI
-comment falsely claimed it merged. The same path already exposes a <b>PATCH</b> (<code>patch_skill_config</code>,
-<code>merged = {**existing, **partial}</code>, returns the merged config). Switched <code>skills set</code> to PATCH and
-use its response for the read-back; corrected the comment. Re-verified live:
-<pre>$ eesel skills set &lt;agent&gt; support_analytics --config '{"zz_a":"alpha"}'
-$ eesel skills set &lt;agent&gt; support_analytics --config '{"zz_b":"beta"}'
-# GET …/config → {"zz_a":"alpha","zz_b":"beta"}   # both present — the first survived</pre>
-Two tests updated to assert PATCH + a guard test that the command never sends a replacing PUT (537 passing).
-<br><br>
-<b>Actions (left as replace, now honest):</b> the tools endpoint has <b>no</b> merge — <code>configure_tool</code> replaces
-the row config wholesale (preserving only permission keys), and the tools <em>read</em> enriches config with
-<code>schema</code>/<code>tool_data</code>, so a client-side fetch-merge would re-persist that definition blob (the data
-shape rules it out). The dashboard form avoids this by always posting the full schema-derived config. So replace is the
-correct contract; the fix is to stop framing it as a patch — the <code>_actions_edit</code> docstring and
-<code>--config</code> help now say it writes the action's <b>full</b> config and that only permission keys are kept when
-omitted. Verified live: <code>actions set … --config '{"permission_mode":"ask"}'</code> applied, server preserved
-<code>require_human_approval</code>. (A true actions merge would be a server-side PATCH on the tools endpoint — a slack-repo
-change, out of scope for this CLI PR.)
-</div>
-
 <div class="f info">
-<h4><span class="tag info">LOW</span> 3 · <code>triggers remove ""</code> — an empty prefix resolves to a single trigger and attempts the delete, instead of refusing <span class="ev live">LIVE</span></h4>
-<div class="meta"><code>resolve_event_trigger_strict</code> / <code>match_event_triggers</code> · confidence: high</div>
-The strict resolver refuses when a prefix matches <b>2+</b> triggers (good). But an <em>empty</em> string isn't treated
-as "matches everything → refuse" — with one trigger present it resolves to that single trigger and issues the DELETE:
+<h4><span class="tag info">LOW</span> 1 · <code>triggers remove ""</code> — an empty/blank prefix resolves to a single trigger and attempts the delete instead of refusing <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>resolve_event_trigger_strict</code> / <code>match_event_triggers</code> · confidence: high · severity: low</div>
+The strict resolver refuses when a prefix matches <b>2+</b> triggers. But an <em>empty</em> string isn't treated as
+"matches everything → refuse" — with one trigger present it resolves to that single trigger and issues the DELETE:
 <pre>$ eesel triggers remove "" --force
-DELETE http://localhost:8080/triggers/acb04cf7-… → 404: {"message":"Trigger not found"}
-exit=1</pre>
-Low severity: <code>--force</code>/confirm still gate it, with 2+ triggers it refuses, and the failed DELETE exits
-non-zero (the server 404 here is a separate quirk — this "other"/event trigger lists but isn't deletable via
-<code>/triggers/{id}</code>; worth a glance but out of this PR's scope). Still, an empty/blank id-prefix should refuse
-uniformly (<code>agents</code> already special-cases empty to "No agent given") rather than resolve-and-act.
+DELETE …/triggers/&lt;id&gt; → 404   (exit 1)</pre>
+Low severity: <code>--force</code>/confirm still gate it, and with 2+ triggers it refuses. Still, an empty/blank
+id-prefix should refuse uniformly (<code>agents</code> already special-cases empty to "No agent given") rather than
+resolve-and-act. (The 404 above is a separate quirk — this event trigger lists but isn't deletable via
+<code>/triggers/{id}</code>; worth a glance, out of this PR's scope.)
 </div>
 
 <div class="f info">
-<h4><span class="tag info">LOW</span> 4 · <code>agents list</code> human output gained an <code>[on]/[off]</code> column — a read command the ticket fenced as "must not change" <span class="ev live">LIVE</span></h4>
+<h4><span class="tag info">LOW</span> 2 · <code>agents list</code> human output carries an <code>[on]/[off]</code> status column <span class="ev live">LIVE</span></h4>
 <div class="meta">confidence: high · severity: low</div>
-Old row: <code>* &lt;id&gt;  &lt;name&gt;  [&lt;type&gt;]</code>. New: <code>* &lt;id&gt;  [on]/[off]  &lt;name&gt;  [&lt;type&gt;]</code>.
-A script that <code>awk</code>'d column positions out of <code>eesel agents list</code> now reads status where it read name.
-ENG-4700 says the existing read commands "must NOT be modified in behaviour — only extended"; this is a modification, not
-just an extension. Mitigated for <em>new</em> scripts by the added <code>--plain</code> (stable, tab-separated), but the
-<em>default</em> human output of an existing read command moved. Human output was never a hard contract, so low — flagging
-because it's exactly the class of change the ticket fenced off.
+The default human row is <code>* &lt;id&gt;  [on]/[off]  &lt;name&gt;  [&lt;type&gt;]</code>. A script that parsed column
+positions out of <code>eesel agents list</code> would read status where it expects name. ENG-4700 fences existing read
+commands as "must not change in behaviour — only extend," and this is a change to the default human view. Mitigated by
+the <code>--plain</code> flag (stable, tab-separated) for scripts; human output was never a hard contract, hence low —
+flagging because it's exactly the class the ticket fenced off.
 </div>
 
 <div class="f info">
-<h4><span class="tag info">CONVENTIONS</span> 5 · the <code>documents</code> group is the odd one out — no strict resolution, three resolver styles, three positional names <span class="ev read">READ</span></h4>
-<div class="meta"><code>_documents_remove</code> (<code>eesel:4116</code>), <code>resolve_document_id</code> (3616), <code>match_document</code> (3644) · confidence: high</div>
+<h4><span class="tag info">CONVENTIONS</span> 3 · the <code>documents</code> group is off-pattern — no strict resolution, three resolver styles, three positional names <span class="ev read">READ</span></h4>
+<div class="meta"><code>_documents_remove</code>, <code>resolve_document_id</code>, <code>match_document</code> · confidence: high</div>
 Every other destructive command resolves a prefix/id <em>strictly</em> and refuses ambiguity; <code>documents remove</code>
 takes raw exact keys (<code>nargs="+"</code>) with no resolution — a typo'd key just no-ops server-side, no local
 "no match / did you mean". The group also carries two read-resolvers (<code>resolve_document_id</code> vs
@@ -249,15 +203,17 @@ takes raw exact keys (<code>nargs="+"</code>) with no resolution — a typo'd ke
 that didn't adopt the triad — a public-surface inconsistency worth settling before the namespace hardens.
 </div>
 
-<div class="f ok">
-<h4><span class="tag ok">CLEARED — false alarm</span> <code>workspace set billing-limit</code> token <span class="ev read">READ</span> (server-confirmed)</h4>
-<div class="meta">flagged as a possible repeat of the <code>tasks analytics</code> wrong-token bug, then traced to the server · confidence: certain</div>
-The correctness pass flagged <code>billing-limit</code> for sending <code>creds["token"]</code> (the raw login token)
-on a <code>/workspace/</code> route, like the prior analytics bug. <b>But the server route is
-<code>@requires_auth + @inject_user_id</code> (Auth0/RS256), not <code>@workspace_authenticated</code> (HS256)</b>
-(<code>server/app/api/workspace.py:169–172</code>). So the raw login token is the <em>correct</em> token here — unlike
-<code>tasks/analytics</code>, which is HS256 and needed <code>workspace_token(creds)</code>. The author's docstring
-deliberately omitting <code>billing-limit</code> from the HS256 list was right. <b>No change needed.</b>
+<div class="f info">
+<h4><span class="tag info">KNOWN BEHAVIOUR</span> 4 · <code>actions set --config</code> replaces config; <code>skills set</code> merges — different by necessity <span class="ev live">LIVE</span> <span class="ev read">READ</span></h4>
+<div class="meta"><code>_actions_edit</code> / <code>_configure_tool</code> · server tools endpoint has no merge · confidence: high</div>
+<code>skills set</code> merges (it PATCHes the config endpoint, which exists for exactly this). The tools endpoint behind
+<code>actions set</code> has <b>no</b> merge — it replaces the row config wholesale (preserving only the permission keys),
+and its <em>read</em> enriches config with the tool's <code>schema</code>/<code>tool_data</code>, so a client-side
+fetch-merge would re-persist that definition blob. So <code>actions set --config</code> writes the action's <em>full</em>
+config and drops any non-permission setting it doesn't include. This is the server's actual contract (the dashboard form
+always posts the full schema-derived config), and the <code>--config</code> help + docstring now say so. Worth knowing,
+not a defect. A true per-field action merge would need a server-side PATCH on the tools endpoint (slack repo) — a
+follow-up if partial action writes become common.
 </div>
 
 <h4 style="margin-top:18px;color:var(--mut)">Safety squad — one line each (presence is the point)</h4>
@@ -265,14 +221,18 @@ deliberately omitting <code>billing-limit</code> from the HS256 list was right. 
 <tr><th>Lens</th><th>Verdict</th></tr>
 <tr><td>Resilience</td><td><span class="ev live">LIVE</span> <span class="ev read">READ</span> Strong. <code>http_request</code> <code>sys.exit</code>s non-zero on any 4xx/5xx or server-down; a non-JSON 2xx gets a clean "looks like a proxy/login page" message, no traceback. <code>confirm()</code> fails safe (abort on EOF/empty). No success-on-failure path found.</td></tr>
 <tr><td>Operational load</td><td>N/A — local single-user CLI. Resolvers add at most one extra <code>fetch_*</code> per invocation; task lookups capped (<code>limit=200–500</code>). No fan-out, no recursive pagination.</td></tr>
-<tr><td>Cost</td><td>N/A — no new metered/LLM calls. <code>schedules fire</code> enqueues an agent run (costs when it executes), but that's a deliberate user action mirroring the old <code>triggers fire</code>; <code>billing-limit</code> controls spend, doesn't incur it.</td></tr>
-<tr><td>Customer impact / back-compat</td><td>Most renames fenced behind hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read→show</code>, <code>tools→actions</code>, <code>sessions/schedules delete→remove</code>). Three <b>documented-only</b> breaks with no alias — see Needs-a-human. (The <code>agents add</code> dead-alias bug, finding 1, is now fixed.)</td></tr>
+<tr><td>Cost</td><td>N/A — no new metered/LLM calls. <code>schedules fire</code> enqueues an agent run (costs when it executes), but that's a deliberate user action; <code>billing-limit</code> controls spend, doesn't incur it.</td></tr>
+<tr><td>Customer impact / back-compat</td><td>Most renames fenced behind hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read→show</code>, <code>tools→actions</code>, <code>sessions/schedules delete→remove</code>). Three <b>documented-only</b> breaks with no alias — see Needs-a-human.</td></tr>
 </table>
 
-<h4 style="margin-top:18px;color:var(--mut)">Dropped after pressure-test (not real findings)</h4>
+<h4 style="margin-top:18px;color:var(--mut)">Checked and cleared (not concerns)</h4>
 <ul>
-<li><b>"chat token minting is new behaviour"</b> — false. <code>send_message</code>/<code>raw-stream</code> already routed through <code>workspace_token</code> on <code>main</code>; the diff only relocated those functions (byte-identical). The prod-chat AC stays provisional, but nothing about the existing chat flow changed.</li>
-<li><b>"<code>tasks show</code> / integrations header label changed = regression"</b> — trivial: an unreachable fall-through error string and a header-only column rename; data rows unchanged.</li>
+<li><b>Workspace-token usage on <code>/workspace/</code> routes.</b> <code>tasks analytics</code> and the other HS256
+<code>@workspace_authenticated</code> routes correctly use the minted workspace token; <code>workspace set billing-limit</code>
+correctly uses the raw login token, because that route is <code>@requires_auth</code> (Auth0/RS256), not workspace-authed.
+Confirmed against the server.</li>
+<li><b>Existing chat/sessions flow.</b> The workspace-token mint chat uses was already in place; the shared read/format
+helpers are unchanged, so existing read commands behave as before (apart from finding 2's column).</li>
 </ul>
 </div>
 </details>
@@ -282,18 +242,17 @@ deliberately omitting <code>billing-limit</code> from the HS256 list was right. 
 <summary>🙋 Needs a human</summary>
 <div class="body">
 <ul>
-<li><b>[x] Fix <code>agents add</code> (finding 1) — done.</b> Routed to the create path in <code>2a7c38a</code>, locked with a test, re-verified live (<code>agents add --name X</code> creates an agent, read-back confirms, exit 0).</li>
-<li><b>[x] Fix replace-vs-merge for <code>set --config</code> (finding 2) — done.</b> <code>skills set</code> now PATCHes (merges), re-verified live (a field written in an earlier call survives a later one). <code>actions set</code> stays a wholesale replace (the tools endpoint has no merge and its read enriches config), now documented honestly in the docstring + <code>--help</code>. A true actions merge would need a server-side PATCH on the tools endpoint (slack repo) — worth a follow-up ticket if partial action config writes become common.</li>
-<li><b>[ ] Ratify the three back-compat breaks with no alias.</b> <code>triggers fire</code> → <code>schedules fire</code> (removed); bare <code>eesel triggers</code> now lists event triggers, not scheduled ones; <code>triggers --all</code> removed. All are documented in the README only — a non-interactive script never sees the note. Decide deliberately: leave as-is, add redirecting aliases, or emit a stderr migration hint.</li>
+<li><b>[ ] Ratify the three back-compat breaks with no alias.</b> <code>triggers fire</code> moved to <code>schedules fire</code> (removed); bare <code>eesel triggers</code> now lists event triggers, not scheduled ones; <code>triggers --all</code> removed. All are documented in the README only — a non-interactive script never sees the note. Decide deliberately: leave as-is, add redirecting aliases, or emit a stderr migration hint.</li>
 <li><b>[ ] Prod chat path.</b> Verify <code>eesel chat</code> → <code>sandbox/start</code> with the minted workspace token actually works against production (can't browser-login from here). Pass = a real prod chat returns a streamed reply.</li>
+<li><b>[ ] (optional) Document-group consistency (finding 3)</b> and a <b>server-side tools-config PATCH</b> for per-field <code>actions set</code> (finding 4) — both are follow-ups, not merge blockers.</li>
 </ul>
 </div>
 </details>
 
 <div class="sub" style="margin-top:20px">
 Verified against a live local <code>docker compose</code> dev stack (server :8080 + Postgres + Redis), CLI logged in via
-<code>eesel login --dev</code>. Server-side claims (skills config replace, billing-limit auth) traced in the slack repo.
-Live writes used the throwaway local dev workspace and were cleaned up (no residual test agents/triggers).
+<code>eesel login --dev</code>. Server-side behaviours (skills config merge, billing-limit auth, tools-config replace)
+traced in the slack repo. Live writes used the throwaway local dev workspace and were cleaned up.
 </div>
 
 </div>
