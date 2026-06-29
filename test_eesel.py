@@ -3956,6 +3956,7 @@ class TestIntegrationsAgentScope:
             return 201, {"integration_id": "int-new-1"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch)
         rc = eesel.cmd_integrations(
             _add_args(integrations_cmd="add", key="zendesk", config=None, agent="agent-other-789")
         )
@@ -3990,6 +3991,16 @@ def _add_args(**kw):
     return _args(**kw)
 
 
+def _stub_status(monkeypatch, status="full", integration_id="int-new-1"):
+    """Stub the post-connect status re-fetch (GET /integrations) so `add` tests
+    don't hit the network. The create response carries no status, so the command
+    reads it back from the workspace integrations."""
+    monkeypatch.setattr(
+        eesel, "fetch_integrations",
+        lambda creds, agent_id=None: [{"id": integration_id, "connectionStatus": status}],
+    )
+
+
 class TestIntegrationsAdd:
     def test_posts_config_as_setup_payload_with_active_agent(self, fake_creds, monkeypatch, capsys):
         captured = {}
@@ -4001,6 +4012,7 @@ class TestIntegrationsAdd:
             return 201, {"integration_id": "int-new-1", "identifier": "acme.zendesk.com"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "full")
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config='{"subdomain": "acme"}'))
         assert rc == 0
         assert captured["method"] == "POST"
@@ -4010,7 +4022,7 @@ class TestIntegrationsAdd:
         assert captured["body"]["agent_id"] == "agent-test-456"
         out = capsys.readouterr()
         assert "int-new-1" in out.err
-        # No redirect_url came back, so the connector is fully authorized: report it as connected.
+        # The re-fetched connection status is "full", so report it as connected.
         assert "✓ Connected 'zendesk'" in out.err
 
     def test_connect_alias_routes_to_add(self, fake_creds, monkeypatch, capsys):
@@ -4021,11 +4033,15 @@ class TestIntegrationsAdd:
             return 201, {"integration_id": "int-new-1"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "full")
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="connect", key="zendesk", config=None))
         assert rc == 0
         assert captured["url"] == "http://localhost:8080/integrations/zendesk"
 
-    def test_token_is_folded_into_setup_payload(self, fake_creds, monkeypatch, capsys):
+    def test_token_yields_full_via_fallback_when_status_unreadable(self, fake_creds, monkeypatch, capsys):
+        # The token is folded into the payload, and when the status can't be read
+        # back (no matching integration returned) the command falls back to the
+        # server's own rule: an access token in the payload means a full connection.
         captured = {}
 
         def fake_request(method, url, *, token=None, body=None, timeout=60):
@@ -4033,16 +4049,19 @@ class TestIntegrationsAdd:
             return 201, {"integration_id": "int-new-1"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None, token="tok-headless"))
         assert rc == 0
         # The token authorizes the connector without a browser round-trip.
         assert captured["body"]["access_token"] == "tok-headless"
+        assert "✓ Connected 'zendesk'" in capsys.readouterr().err
 
-    def test_no_input_fails_when_oauth_url_returned(self, fake_creds, monkeypatch, capsys):
+    def test_no_input_fails_when_connection_is_not_full(self, fake_creds, monkeypatch, capsys):
         def fake_request(method, url, *, token=None, body=None, timeout=60):
-            return 201, {"integration_id": "int-2", "redirect_url": "https://auth.example.com/oauth?x=1"}
+            return 201, {"integration_id": "int-2"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "partial", integration_id="int-2")
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="hubspot", config=None, no_input=True))
         err = capsys.readouterr().err
         assert rc == 1
@@ -4061,35 +4080,79 @@ class TestIntegrationsAdd:
         assert "Invalid credentials for integration 'zendesk'" in err
         assert "subdomain is required" in err
 
-    def test_prints_redirect_url_when_oauth_needed(self, fake_creds, monkeypatch, capsys):
+    def test_prints_authorize_url_when_not_connected(self, fake_creds, monkeypatch, capsys):
         def fake_request(method, url, *, token=None, body=None, timeout=60):
-            return 201, {"integration_id": "int-2", "redirect_url": "https://auth.example.com/oauth?x=1"}
+            return 201, {"integration_id": "int-2", "identifier": "acme"}
 
         monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
-        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="hubspot", config=None))
-        err = capsys.readouterr().err
-        assert rc == 0
-        assert "https://auth.example.com/oauth?x=1" in err
-        # A redirect_url means the integration is a credential-less shell, not
-        # connected. The output must not claim success, or agent-driven flows
-        # will treat the half-created integration as done.
-        assert "✓ Connected" not in err
-        assert "pending authorization" in err
-
-    def test_relative_redirect_url_resolves_against_dashboard_host(self, fake_creds, monkeypatch, capsys):
-        # The server returns a dashboard-relative path. It must be resolved
-        # against the dashboard origin, not the API host — prepending the API
-        # host (what `eesel whoami` shows) lands on a 404.
-        def fake_request(method, url, *, token=None, body=None, timeout=60):
-            return 201, {"integration_id": "int-2", "redirect_url": "/agents/integrations/zendesk/acme"}
-
-        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "partial", integration_id="int-2")
+        monkeypatch.setattr(
+            eesel, "_oauth_authorize_url",
+            lambda creds, key, identifier: f"https://dashboard.eesel.ai/api/integrations/{key}/oauth/start?zendeskSubdomain={identifier}",
+        )
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config='{"subdomain": "acme"}'))
         err = capsys.readouterr().err
         assert rc == 0
-        assert "http://localhost:3000/agents/integrations/zendesk/acme" in err
-        # The bare API-host form must never be what we print.
-        assert "http://localhost:8080/agents/integrations/zendesk/acme" not in err
+        # Partial means the integration is a credential-less shell, not connected.
+        # The output must not claim success, and must point at the live OAuth URL.
+        assert "✓ Connected" not in err
+        assert "not yet connected" in err
+        assert "https://dashboard.eesel.ai/api/integrations/zendesk/oauth/start?zendeskSubdomain=acme" in err
+
+    def test_status_none_reports_connected_not_oauth_pending(self, fake_creds, monkeypatch, capsys):
+        # Some connectors have no auth concept and sit at "none" when working
+        # (e.g. website crawls). "none" must report as connected, not trigger the
+        # OAuth-pending path — only "partial" means set-up-but-not-authorized.
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "web-1", "identifier": "example.com"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "none", integration_id="web-1")
+        monkeypatch.setattr(eesel, "_oauth_authorize_url", lambda *a, **k: pytest.fail("must not seek OAuth for a 'none' connector"))
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="website", config='{"website_url": "https://example.com"}'))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "✓ Connected 'website'" in err
+        assert "not yet connected" not in err
+
+    def test_oauth_authorize_url_learns_identifier_param_from_definition(self, fake_creds, monkeypatch):
+        # The OAuth-start endpoint comes from the connection option whose
+        # handler_type is "redirect". Its identifier parameter name is integration-
+        # specific, so it's learned from another option that templates the
+        # identifier as `<param>={{integrationIdentifier}}`. The path is resolved
+        # against the dashboard host (not the API host) and the active agent id
+        # is appended.
+        definition = {
+            "integration": {
+                "connection_options": [
+                    {"type": "quick_start", "handler_type": "submit", "endpoint": "/integrations/zendesk/quick_start"},
+                    {"type": "oauth", "handler_type": "redirect", "endpoint": "/api/integrations/zendesk/oauth/start?createIntegration=true"},
+                    {"type": "messenger", "handler_type": "redirect", "endpoint": "/api/integrations/zendesk-conversations/oauth/start?zendeskSubdomain={{integrationIdentifier}}&agentId={{agentId}}"},
+                ]
+            }
+        }
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **kw: definition)
+        url = eesel._oauth_authorize_url(fake_creds, "zendesk", "acme")
+        # Dashboard host, the oauth/start endpoint, the learned identifier param,
+        # the preserved createIntegration flag, and the active agent id.
+        assert url.startswith("http://localhost:3000/api/integrations/zendesk/oauth/start?")
+        assert "zendeskSubdomain=acme" in url
+        assert "createIntegration=true" in url
+        assert "agentId=agent-test-456" in url
+        # Unresolved template params from the messenger option must not leak in.
+        assert "{{" not in url
+
+    def test_connection_status_after_connect_reads_back_status(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "fetch_integrations",
+            lambda creds, agent_id=None: [
+                {"id": "other", "connectionStatus": "full"},
+                {"id": "int-2", "connectionStatus": "partial"},
+            ],
+        )
+        assert eesel._connection_status_after_connect(fake_creds, "int-2") == "partial"
+        # No matching id → None, so the caller falls back to payload inference.
+        assert eesel._connection_status_after_connect(fake_creds, "missing") is None
 
     def test_invalid_config_json_exits(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("should not POST on bad JSON"))

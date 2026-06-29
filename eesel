@@ -57,6 +57,7 @@ import hmac
 import http.server
 import json
 import os
+import re
 import secrets as secrets_mod
 import socket
 import subprocess
@@ -2533,6 +2534,82 @@ def _parse_config_arg(raw: str | None) -> dict:
     return parsed
 
 
+def _connection_status_after_connect(creds: dict, integration_id: str | None) -> str | None:
+    """Re-fetch the workspace integrations and return the connectionStatus of
+    `integration_id` (e.g. "full", "partial", "none"), or None if it can't be
+    determined.
+
+    The create endpoint's response does not include a connection status, and its
+    `redirect_url` is only a dashboard navigation hint — it is returned even for
+    a fully-authorized connect, so it cannot be used to tell full from partial.
+    The status lives on the serialized integration, so read it back from
+    GET /integrations. Best-effort: returns None on any failure so the caller can
+    fall back to inferring status from the payload.
+    """
+    if not integration_id:
+        return None
+    try:
+        integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
+    except Exception:
+        return None
+    for it in integrations:
+        if str(it.get("id")) == str(integration_id):
+            status = it.get("connectionStatus")
+            return str(status) if status is not None else None
+    return None
+
+
+def _oauth_authorize_url(creds: dict, key: str, identifier: str | None) -> str | None:
+    """Build the browser URL that actually starts the OAuth authorization flow
+    for integration `key`, or None if one can't be determined.
+
+    The server's create response returns a stale dashboard *page* path that no
+    longer resolves. The live OAuth entry point is published in the integration
+    definition's connection options: the option whose ``handler_type`` is
+    ``redirect`` carries the real ``/api/.../oauth/start`` endpoint. That endpoint
+    needs the account identifier (e.g. a Zendesk subdomain), but its parameter
+    name is integration-specific. Other options in the same definition template
+    that identifier as ``<param>={{integrationIdentifier}}`` (e.g. the Zendesk
+    messenger option uses ``zendeskSubdomain={{integrationIdentifier}}``), so the
+    parameter name is learned from those templates and applied to the start URL.
+
+    The resulting path is resolved against the dashboard origin (the OAuth flow
+    is served by the dashboard, a different host than the API), and the active
+    agent id is appended so the post-authorization redirect lands on a real page.
+    """
+    try:
+        data = http_request("GET", f"{creds['api_url']}/integration-definitions/{urllib.parse.quote(key)}", token=creds["token"])
+    except Exception:
+        return None
+    definition = data.get("integration") if isinstance(data, dict) else None
+    options = (definition or {}).get("connection_options") or (definition or {}).get("connectionOptions") or []
+
+    redirect_endpoint = None
+    identifier_param = None
+    for opt in options:
+        endpoint = opt.get("endpoint") or ""
+        if opt.get("handler_type") == "redirect" and "oauth/start" in endpoint and redirect_endpoint is None:
+            redirect_endpoint = endpoint
+        # Learn the identifier parameter name from any endpoint that templates it.
+        match = re.search(r"([A-Za-z0-9_]+)=\{\{integrationIdentifier\}\}", endpoint)
+        if match and identifier_param is None:
+            identifier_param = match.group(1)
+    if not redirect_endpoint:
+        return None
+
+    # Drop any unresolved template params (e.g. agentId={{agentId}}) so we can
+    # set our own concrete values below.
+    base, _, query = redirect_endpoint.partition("?")
+    params = [(k, v) for k, v in urllib.parse.parse_qsl(query) if "{{" not in v]
+    if identifier and identifier_param:
+        params.append((identifier_param, identifier))
+    if creds.get("agent_id"):
+        params.append(("agentId", creds["agent_id"]))
+
+    dashboard = (creds.get("dashboard_url") or ENVS["prod"]["dashboard"]).rstrip("/")
+    return f"{dashboard}{base}?{urllib.parse.urlencode(params)}"
+
+
 def _integrations_add(args, creds: dict) -> int:
     """Connect (add) a new integration of type `<key>`, POSTing the `--config`
     JSON as the setup payload. Reached via `add` or its alias `connect`.
@@ -2544,9 +2621,16 @@ def _integrations_add(args, creds: dict) -> int:
 
     For headless/agent runs that can't open a browser, pass an access token with
     `--token`; it's folded into the setup payload so the connector authorizes
-    without an interactive OAuth step. If the server still returns an OAuth
-    redirect URL and `--no-input` was given, that's a hard failure (there is no
-    one to complete the browser flow); otherwise the URL is printed to open.
+    without an interactive OAuth step.
+
+    After the create call, the real connection status is read back from
+    GET /integrations (the create response carries no status). A "full" status is
+    reported as connected. A "partial" status means the setup fields were stored
+    but an OAuth round-trip is still required: the live authorization URL (from
+    the integration definition's connection options) is printed for the browser,
+    or, under `--no-input`, the command fails since no one can complete it. Other
+    statuses (e.g. "none", which is normal for connectors with no auth concept
+    such as website crawls) are reported as connected.
     """
     key = args.key
     config = _parse_config_arg(getattr(args, "config", None))
@@ -2579,28 +2663,34 @@ def _integrations_add(args, creds: dict) -> int:
     identifier = result.get("identifier")
     suffix = (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else "")
 
-    # A `redirect_url` means the server stored only the setup fields (e.g.
-    # subdomain) and still needs an external OAuth authorization round-trip to
-    # obtain access/refresh tokens. The integration exists but is NOT yet
-    # connected — it will not sync until OAuth completes. Don't report it as
-    # "Connected": a half-created shell that reads as success is the trap that
-    # leaves agent-driven flows thinking the job is done.
-    redirect_url = result.get("redirect_url")
-    if redirect_url:
-        # The server returns a dashboard-relative path. The OAuth flow lives in
-        # the Next.js dashboard, which is a DIFFERENT host than the API, so the
-        # path must be resolved against the dashboard origin. Prepending the API
-        # host (the obvious guess, since that's what `eesel whoami` shows) points
-        # at the wrong service entirely.
-        if redirect_url.startswith("/"):
-            dashboard = creds.get("dashboard_url") or ENVS["prod"]["dashboard"]
-            redirect_url = dashboard.rstrip("/") + redirect_url
+    # Determine whether the integration is actually connected. A connector is
+    # "full" once it has credentials (e.g. subdomain + access_token) and "partial"
+    # when only the setup fields were stored and an OAuth round-trip is still
+    # needed. The create response carries no status and its `redirect_url` is just
+    # a navigation hint (returned even when fully authorized), so read the real
+    # status back from the workspace integrations.
+    conn_status = _connection_status_after_connect(creds, integration_id)
+    if conn_status is None and config.get("access_token"):
+        # Couldn't read the status back, but a token was supplied — the server
+        # marks a connector full once it has an access token, so trust that.
+        conn_status = "full"
+
+    # "partial" is the only status that means "set up but not authorized": the
+    # connector stored its setup fields and still needs an OAuth round-trip.
+    # "full" is connected; "none" is normal for connectors with no auth concept
+    # (e.g. website crawls); an unknown status (re-fetch failed, no token) is
+    # reported as created rather than guessed either way.
+    if conn_status == "partial":
         if no_input:
             err(f"Created '{key}'{suffix}, but it is not connected — this connector needs an interactive OAuth step and --no-input was given.")
             info("Re-run with --token <access-token> to authorize without a browser.")
             return 1
-        info(f"Created '{key}'{suffix} — pending authorization, not yet connected (won't sync until OAuth completes).")
-        info(f"Open this URL in your browser to finish authorizing:\n  {redirect_url}")
+        authorize_url = _oauth_authorize_url(creds, key, identifier or config.get("subdomain"))
+        info(f"Created '{key}'{suffix} — not yet connected (won't sync until OAuth completes).")
+        if authorize_url:
+            info(f"Open this URL in your browser to authorize:\n  {authorize_url}")
+        else:
+            info("Open the integration in the dashboard to finish authorizing.")
         info("The browser OAuth step can't be completed headlessly; alternatively re-run with --token <access-token>.")
         return 0
 
