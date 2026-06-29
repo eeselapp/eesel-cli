@@ -1291,18 +1291,31 @@ _SECRET_KEY_HINTS = (
 
 
 def _redact_secrets(obj):
-    """Recursively copy obj, masking scalar values whose key looks sensitive.
+    """Recursively copy obj, masking scalar values that look sensitive.
 
-    Trigger config can embed integration access tokens and signing secrets, and
-    the read-only views print config inline — so mask anything secret-looking
-    (`token`, `secret`, `password`, …) before display. The raw values are still
-    reachable via `--json` or the API for those who need them.
+    Two shapes are masked, both used by the read-only views that print
+    config/properties inline:
+
+    - a dict value whose *key* looks sensitive, e.g. ``{"access_token": "..."}``
+      (trigger/schedule config); and
+    - an integration property entry ``{"key": "...access_token", "value": "..."}``,
+      where the secret-looking name is the value of the ``key`` field rather than
+      a dict key — so keying off dict keys alone would miss it.
+
+    Anything secret-looking (`token`, `secret`, `password`, …) is replaced with
+    ``"***"``. The raw values are reachable via the API, or via `--json` only with
+    `--secrets` on a sysadmin/impersonator account.
     """
     if isinstance(obj, dict):
+        # Property-entry shape: the secret name lives in the value of "key", so
+        # the sibling "value" field is what must be masked.
+        prop_key = obj.get("key")
+        prop_is_secret = isinstance(prop_key, str) and any(h in prop_key.lower() for h in _SECRET_KEY_HINTS)
         out = {}
         for k, v in obj.items():
-            sensitive = isinstance(k, str) and any(h in k.lower() for h in _SECRET_KEY_HINTS)
-            if sensitive and not isinstance(v, (dict, list)) and v not in (None, ""):
+            key_is_secret = isinstance(k, str) and any(h in k.lower() for h in _SECRET_KEY_HINTS)
+            mask = key_is_secret or (k == "value" and prop_is_secret)
+            if mask and not isinstance(v, (dict, list)) and v not in (None, ""):
                 out[k] = "***"
             else:
                 out[k] = _redact_secrets(v)
@@ -2425,8 +2438,20 @@ def _integrations_list(args, creds: dict) -> int:
     the same allowlist `eesel whoami` uses.
     """
     integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
+
+    # Sensitive properties (access tokens, secrets) are only revealed with
+    # --secrets AND a sysadmin/impersonator account. The gate applies to every
+    # render path — including --json — so secrets don't leak through a format that
+    # skips it. The warn goes to stderr and so does not corrupt --json on stdout.
+    reveal = False
+    if getattr(args, "secrets", False):
+        reveal = _is_sysadmin(creds)
+        if not reveal:
+            warn("--secrets is restricted to sysadmin/impersonator accounts — showing non-sensitive fields only.")
+
     if getattr(args, "json", False):
-        print(json.dumps(integrations, indent=2))
+        payload = integrations if reveal else _redact_secrets(integrations)
+        print(json.dumps(payload, indent=2))
         return 0
     if getattr(args, "plain", False):
         for it in integrations:
@@ -2438,12 +2463,6 @@ def _integrations_list(args, creds: dict) -> int:
     if not integrations:
         info("(no integrations)")
         return 0
-
-    reveal = False
-    if getattr(args, "secrets", False):
-        reveal = _is_sysadmin(creds)
-        if not reveal:
-            warn("--secrets is restricted to sysadmin/impersonator accounts — showing non-sensitive fields only.")
 
     fmt = " {:<12}  {:<18}  {:<10}  {}"
     info(fmt.format("id", "type", "connection", "subdomain"))
@@ -2484,7 +2503,9 @@ def _integrations_show(args, creds: dict) -> int:
     if getattr(args, "json", False):
         out = dict(integration)
         out["syncStatus"] = sync_status
-        print(json.dumps(out, indent=2))
+        # `show` has no --secrets flag, so there is no way to reveal sensitive
+        # properties here — always mask them, mirroring the list/table gate.
+        print(json.dumps(_redact_secrets(out), indent=2))
         return 0
 
     itype = integration.get("integrationType") or "?"
@@ -2631,6 +2652,12 @@ def _integrations_add(args, creds: dict) -> int:
     or, under `--no-input`, the command fails since no one can complete it. Other
     statuses (e.g. "none", which is normal for connectors with no auth concept
     such as website crawls) are reported as connected.
+
+    If the status can't be read back at all (the re-fetch failed, or the new row
+    isn't listed yet), the command reports the integration as created but with an
+    unverified connection status rather than claiming it is connected — a
+    supplied --token is not a validated one, so it cannot stand in for a real
+    "full" status.
     """
     key = args.key
     config = _parse_config_arg(getattr(args, "config", None))
@@ -2670,16 +2697,13 @@ def _integrations_add(args, creds: dict) -> int:
     # a navigation hint (returned even when fully authorized), so read the real
     # status back from the workspace integrations.
     conn_status = _connection_status_after_connect(creds, integration_id)
-    if conn_status is None and config.get("access_token"):
-        # Couldn't read the status back, but a token was supplied — the server
-        # marks a connector full once it has an access token, so trust that.
-        conn_status = "full"
 
     # "partial" is the only status that means "set up but not authorized": the
     # connector stored its setup fields and still needs an OAuth round-trip.
     # "full" is connected; "none" is normal for connectors with no auth concept
-    # (e.g. website crawls); an unknown status (re-fetch failed, no token) is
-    # reported as created rather than guessed either way.
+    # (e.g. website crawls); None means the status couldn't be read back and is
+    # reported as unverified rather than guessed — a supplied --token is not a
+    # validated one, so it can't stand in for a "full" status.
     if conn_status == "partial":
         if no_input:
             err(f"Created '{key}'{suffix}, but it is not connected — this connector needs an interactive OAuth step and --no-input was given.")
@@ -2692,6 +2716,11 @@ def _integrations_add(args, creds: dict) -> int:
         else:
             info("Open the integration in the dashboard to finish authorizing.")
         info("The browser OAuth step can't be completed headlessly; alternatively re-run with --token <access-token>.")
+        return 0
+
+    if conn_status is None:
+        info(f"Created '{key}'{suffix} — connection status could not be verified.")
+        info("Run `eesel integrations list` to check whether it is connected.")
         return 0
 
     ok(f"Connected '{key}'{suffix}")
@@ -3182,8 +3211,12 @@ def cmd_chat(args) -> int:
             err(f"No scheduled job matches '{target}'.")
             info("Run `eesel schedules list` to see available jobs.")
             return 1
+        # Pin the agent for this preview session only — resolve it in memory and
+        # never rewrite the saved active agent, mirroring --agent. The session
+        # itself stores agent_id (below), so the preview runs under the trigger's
+        # agent without leaking that choice into later unrelated commands.
+        creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
-        save_creds(creds)
         sess = new_session(
             creds,
             agent_id=creds["agent_id"],

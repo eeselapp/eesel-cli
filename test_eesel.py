@@ -3904,11 +3904,40 @@ class TestIntegrationsCommand:
         assert "tok-SECRET-xyz" not in cap.out
         assert "restricted" in cap.err
 
-    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_json_redacts_secrets_for_non_sysadmin(self, fake_creds, monkeypatch, capsys):
+        # --json goes through the same --secrets+sysadmin gate as the table view,
+        # so a non-sysadmin sees masked tokens but still gets the full structure
+        # (ids, types, non-sensitive properties like subdomain).
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
         eesel.cmd_integrations(_args(json=True, secrets=False))
-        payload = json.loads(capsys.readouterr().out)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
         assert payload[0]["integrationType"] == "zendesk"
+        assert "tok-SECRET-xyz" not in out
+        # The masked entry is present (just its value redacted), and non-secret
+        # properties survive.
+        props = {p["key"]: p["value"] for p in payload[0]["properties"]}
+        assert props["zendesk_conversations_access_token"] == "***"
+        assert props["subdomain"] == "acme"
+
+    def test_json_reveals_secrets_for_sysadmin_with_secrets_flag(self, fake_creds, monkeypatch, capsys):
+        # With --secrets on a sysadmin account, --json emits the raw payload,
+        # tokens included — mirroring the table view's reveal path.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
+        eesel.cmd_integrations(_args(json=True, secrets=True))
+        out = capsys.readouterr().out
+        assert "tok-SECRET-xyz" in out
+
+    def test_json_secrets_flag_denied_for_non_sysadmin_keeps_redaction(self, fake_creds, monkeypatch, capsys):
+        # A non-sysadmin passing --secrets is warned and still gets redacted JSON.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
+        eesel.cmd_integrations(_args(json=True, secrets=True))
+        cap = capsys.readouterr()
+        assert "tok-SECRET-xyz" not in cap.out
+        assert "restricted" in cap.err
 
     def test_empty(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
@@ -4038,10 +4067,11 @@ class TestIntegrationsAdd:
         assert rc == 0
         assert captured["url"] == "http://localhost:8080/integrations/zendesk"
 
-    def test_token_yields_full_via_fallback_when_status_unreadable(self, fake_creds, monkeypatch, capsys):
-        # The token is folded into the payload, and when the status can't be read
-        # back (no matching integration returned) the command falls back to the
-        # server's own rule: an access token in the payload means a full connection.
+    def test_unreadable_status_with_token_reports_unverified_not_connected(self, fake_creds, monkeypatch, capsys):
+        # The token is folded into the payload, but when the status can't be read
+        # back (no matching integration returned) a supplied token is not proof of
+        # a live connection — the server may have stored a bad token. Report the
+        # integration as created with an unverified status rather than "Connected".
         captured = {}
 
         def fake_request(method, url, *, token=None, body=None, timeout=60):
@@ -4052,9 +4082,25 @@ class TestIntegrationsAdd:
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
         rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None, token="tok-headless"))
         assert rc == 0
-        # The token authorizes the connector without a browser round-trip.
+        # The token is still folded into the payload for the headless connect path.
         assert captured["body"]["access_token"] == "tok-headless"
-        assert "✓ Connected 'zendesk'" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "✓ Connected" not in err
+        assert "connection status could not be verified" in err
+
+    def test_unreadable_status_without_token_reports_unverified(self, fake_creds, monkeypatch, capsys):
+        # With no token and an unreadable status, the command must not fall through
+        # to a bare "Connected" — it reports created-but-unverified.
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None))
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "✓ Connected" not in err
+        assert "connection status could not be verified" in err
 
     def test_no_input_fails_when_connection_is_not_full(self, fake_creds, monkeypatch, capsys):
         def fake_request(method, url, *, token=None, body=None, timeout=60):
@@ -4266,6 +4312,16 @@ class TestIntegrationsShow:
         payload = json.loads(capsys.readouterr().out)
         assert payload["integrationType"] == "zendesk"
         assert payload["syncStatus"] == "running"
+
+    def test_json_redacts_secrets(self, fake_creds, monkeypatch, capsys):
+        # `show` has no --secrets flag, so its --json output always masks tokens.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: "running")
+        eesel.cmd_integrations(_args(integrations_cmd="show", id="int-zendesk-1", json=True))
+        out = capsys.readouterr().out
+        assert "tok-SECRET-xyz" not in out
+        props = {p["key"]: p["value"] for p in json.loads(out)["properties"]}
+        assert props["zendesk_conversations_access_token"] == "***"
 
 
 class TestIntegrationsRemove:
@@ -6236,3 +6292,18 @@ class TestChatAgentFlag:
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: (_ for _ in ()).throw(SystemExit("stop")))
         with pytest.raises(SystemExit):
             eesel.cmd_chat(_args(agent="Other", message="hi", cost=False, task=None, trigger=None))
+
+    def test_schedule_flag_does_not_persist_active_agent(self, fake_creds, monkeypatch, capsys):
+        # Binding a chat to a scheduled job pins that job's agent for the preview
+        # session only — it must never rewrite the saved active agent on disk, or
+        # every later unrelated command would silently run against the wrong agent.
+        monkeypatch.setattr(
+            eesel, "resolve_scheduled_job",
+            lambda creds, target: {"id": "trig-1", "agent_id": "schedule-agent", "agent_name": "Heartbeat", "config": {"title": "heartbeat"}},
+        )
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "trigger_id": "trig-1", "trigger_title": "heartbeat", "agent_id": creds.get("agent_id")})
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
+        rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
+        assert rc == 0
