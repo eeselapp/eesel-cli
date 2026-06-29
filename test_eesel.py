@@ -4076,6 +4076,21 @@ class TestIntegrationsAdd:
         assert "✓ Connected" not in err
         assert "pending authorization" in err
 
+    def test_relative_redirect_url_resolves_against_dashboard_host(self, fake_creds, monkeypatch, capsys):
+        # The server returns a dashboard-relative path. It must be resolved
+        # against the dashboard origin, not the API host — prepending the API
+        # host (what `eesel whoami` shows) lands on a 404.
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "int-2", "redirect_url": "/agents/integrations/zendesk/acme"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config='{"subdomain": "acme"}'))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "http://localhost:3000/agents/integrations/zendesk/acme" in err
+        # The bare API-host form must never be what we print.
+        assert "http://localhost:8080/agents/integrations/zendesk/acme" not in err
+
     def test_invalid_config_json_exits(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("should not POST on bad JSON"))
         with pytest.raises(SystemExit):

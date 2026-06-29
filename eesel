@@ -2587,6 +2587,14 @@ def _integrations_add(args, creds: dict) -> int:
     # leaves agent-driven flows thinking the job is done.
     redirect_url = result.get("redirect_url")
     if redirect_url:
+        # The server returns a dashboard-relative path. The OAuth flow lives in
+        # the Next.js dashboard, which is a DIFFERENT host than the API, so the
+        # path must be resolved against the dashboard origin. Prepending the API
+        # host (the obvious guess, since that's what `eesel whoami` shows) points
+        # at the wrong service entirely.
+        if redirect_url.startswith("/"):
+            dashboard = creds.get("dashboard_url") or ENVS["prod"]["dashboard"]
+            redirect_url = dashboard.rstrip("/") + redirect_url
         if no_input:
             err(f"Created '{key}'{suffix}, but it is not connected — this connector needs an interactive OAuth step and --no-input was given.")
             info("Re-run with --token <access-token> to authorize without a browser.")
