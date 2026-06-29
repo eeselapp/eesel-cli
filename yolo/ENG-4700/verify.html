@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify — ENG-4700 CLI namespace consolidation (PR #21)</title>
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--ink:#e6e8ec;--mut:#9aa3b2;--line:#2a2f3a;
+    --red:#ff6b6b;--amb:#ffb454;--grn:#5ad17a;--blu:#6db3f2;--chip:#222733;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:32px 20px}
+  .wrap{max-width:920px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:20px}
+  .verdict{border:1px solid var(--line);border-left:5px solid var(--amb);background:var(--card);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+  .verdict h2{margin:0 0 8px;font-size:17px}
+  .verdict .big{color:var(--amb)}
+  .kv{margin:10px 0 0}
+  .kv b{color:var(--blu)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+  .chip{background:var(--chip);border:1px solid var(--line);border-radius:20px;padding:3px 11px;font-size:12px;color:var(--mut)}
+  .chip.ok{color:var(--grn);border-color:#264d33}
+  .chip.no{color:var(--red);border-color:#4d2626}
+  details{border:1px solid var(--line);background:var(--card);border-radius:10px;margin:10px 0;overflow:hidden}
+  summary{cursor:pointer;padding:13px 18px;font-weight:600;list-style:none;user-select:none}
+  summary::-webkit-details-marker{display:none}
+  summary:hover{background:#1d212a}
+  .body{padding:4px 18px 16px;border-top:1px solid var(--line)}
+  .f{border-left:3px solid var(--line);padding:8px 0 8px 14px;margin:14px 0}
+  .f.block{border-color:var(--red)}
+  .f.warn{border-color:var(--amb)}
+  .f.info{border-color:var(--blu)}
+  .f h4{margin:0 0 4px;font-size:14.5px}
+  .f .meta{color:var(--mut);font-size:12px;margin-bottom:6px}
+  .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:4px;padding:1px 7px;margin-right:6px;vertical-align:middle}
+  .tag.block{background:#3a1f1f;color:var(--red)}
+  .tag.warn{background:#3a2e1a;color:var(--amb)}
+  .tag.info{background:#1c2c3a;color:var(--blu)}
+  .tag.ok{background:#1c3a26;color:var(--grn)}
+  code{background:#0c0e12;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cdd6e4}
+  pre{background:#0c0e12;border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:12px/1.45 ui-monospace,Menlo,monospace;color:#cdd6e4}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:6px 0}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:#1d212a;color:var(--mut);font-weight:600}
+  .ev{font-size:11px;font-weight:700;border-radius:4px;padding:1px 6px;white-space:nowrap}
+  .ev.live{background:#1c3a26;color:var(--grn)}
+  .ev.test{background:#1c2c3a;color:var(--blu)}
+  .ev.read{background:#2e2730;color:#c8a8d8}
+  .ev.no{background:#3a2e1a;color:var(--amb)}
+  ul{margin:6px 0;padding-left:20px}
+  li{margin:4px 0}
+  .tree{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--mut)}
+  .tree b{color:var(--ink)}
+  .legend{font-size:11px;color:var(--mut);margin-top:6px}
+  a{color:var(--blu)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Verify — ENG-4700 · CLI namespace consolidation</h1>
+<div class="sub">
+  PR <a href="https://github.com/eeselapp/eesel-cli/pull/21">eeselapp/eesel-cli #21</a> ·
+  base <code>main</code> (93d6765) · reviewed at HEAD <code>44d3e28</code> ·
+  <b style="color:var(--grn)">Both safety blockers now resolved (B1 pushed · B2 fixed in <code>44d3e28</code>)</b>
+</div>
+
+<div class="verdict" style="border-left-color:var(--grn)">
+  <h2>Verdict: <span style="color:var(--grn)">Safety blockers cleared</span> — 3 smaller fixes remain</h2>
+  <div>The namespace consolidation is genuinely solid and the headline new capability (the
+  <em>write</em> half of the CLI) works end-to-end against a live dev server. <b>Both safety blockers
+  (B1, B2) are now fixed and verified</b> — see their entries below. Three smaller items remain
+  (a prod-only token bug, a README inversion, one did-you-mean gap); none block merging the namespace,
+  but they're worth landing.</div>
+
+  <div class="kv"><b>What changes for users:</b> every command group now speaks one verb vocabulary
+  (<code>list / show / add / set / remove</code>, <code>create</code> for agents); the CLI gains the
+  <em>write</em> half it never had (create/configure/remove agents, integrations, documents, triggers,
+  schedules, MCP servers, ACLs, workspace + billing settings); old verbs survive as hidden aliases;
+  unknown subcommands get "did you mean?"; chat mints a workspace token so <code>sandbox/start</code> works in prod.</div>
+
+  <div class="kv"><b>What must not change (and didn't):</b> all read/list paths across every group
+  still work — verified live against localhost:8080.</div>
+
+  <div class="kv"><b>Watch this:</b> the 3 remaining should-fix items —
+  <code>tasks analytics</code> wrong token (prod 401), README "edit vs set" inverted, and the
+  <code>integrations actions</code> did-you-mean gap. All small; details in the panel below.</div>
+
+  <div class="row">
+    <span class="chip ok">532 unit tests green</span>
+    <span class="chip ok">full agent lifecycle live ✓</span>
+    <span class="chip ok">strict resolution live ✓</span>
+    <span class="chip ok">B1 resolved (pushed)</span>
+    <span class="chip ok">B2 fixed + verified live</span>
+    <span class="chip no">3 should-fix remain</span>
+  </div>
+  <div class="legend">Evidence grades below:
+    <span class="ev live">LIVE</span> watched it run against the server ·
+    <span class="ev test">TEST</span> a unit test exercised it ·
+    <span class="ev read">READ</span> traced in code only ·
+    <span class="ev no">NOT RUN</span> couldn't reach it</div>
+</div>
+
+<!-- ================= FOOTPRINT ================= -->
+<details open>
+<summary>🗺️ Footprint — what changed</summary>
+<div class="body">
+<p>Three files, all in the <code>eesel-cli</code> repo. No server change — every endpoint the CLI calls
+already existed and was write-confirmed during the ENG-4700 audit.</p>
+<pre class="tree">eesel-cli/
+├── <b>eesel</b>            +3506 / −1087   single-file Python CLI — the whole namespace + write commands
+├── <b>test_eesel.py</b>    +3505 / −  ~0   531 tests (HTTP layer mocked)
+└── <b>README.md</b>        +  ~70 / − ~37  command-surface rewrite
+                      ──────────────────
+                      ~7200 insertions across the diff vs main</pre>
+<p>Shape: 48 commits, one per command group + a cross-cutting cleanup pass (shared <code>confirm</code>,
+strict resolvers, <code>hide_subcommands</code> alias helper, did-you-mean, <code>--force</code> parity).
+Scope is in-bounds for "consolidate the namespace" — nothing surprising touched outside the CLI file,
+its tests, and its README.</p>
+</div>
+</details>
+
+<!-- ================= AC ================= -->
+<details open>
+<summary>✅ Acceptance criteria — 7 met (live), 1 gap, 2 not reachable</summary>
+<div class="body">
+<table>
+<tr><th>Criterion (PR surface + ENG-4700 commitments)</th><th>Evidence</th><th>Result</th></tr>
+<tr><td>End-to-end agent lifecycle from the CLI: <code>create → set (partial) → read-back → remove</code></td>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass. Created agent, edited instructions only, <code>show</code> reflected the edit, removed it, <code>list</code> confirmed gone.</td></tr>
+<tr><td>Destructive commands use <b>strict</b> resolution (refuse ambiguity, never act on arbitrary first match)</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass for all destructive commands (agents/integrations/mcp/schedules + <code>triggers remove</code> after the B2 fix). Ambiguous <code>remove --force</code> refuses and lists candidates, deletes nothing — verified live for both agents and triggers.</td></tr>
+<tr><td>Confirmation prompt + <code>--force</code>/<code>-f</code> parity on destructive commands</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass. Empty stdin aborts (fail-safe, defaults to "no"); <code>--force</code> skips the prompt. Confirmed across remove paths.</td></tr>
+<tr><td>One shared verb namespace; old verbs kept as <b>hidden</b> back-compat aliases</td>
+    <td><span class="ev read">READ</span> (binary <code>--help</code>)</td>
+    <td>⚠️ Consistent. One leak on the PR branch only: <code>schedules --help</code> shows <code>delete,run</code> (fixed by the unpushed commit — Blocker 1).</td></tr>
+<tr><td>"Did you mean?" on unknown subcommands, <b>everywhere</b></td>
+    <td><span class="ev read">READ</span></td>
+    <td>⚠️ Works at root, every group, and nested (<code>settings notifications</code>) — <b>except</b> <code>integrations &lt;int&gt; actions &lt;typo&gt;</code> (Finding 5).</td></tr>
+<tr><td>Read/list paths across all groups unchanged (the "must not change" half)</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass. <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> read paths all returned live.</td></tr>
+<tr><td>Unit suite green</td>
+    <td><span class="ev test">TEST</span></td>
+    <td>✅ 532 passed (was 531; +1 for the B2 ambiguity guard). Tests mock the HTTP layer (so they cover request-building + parsing + resolution, not the wire contract).</td></tr>
+<tr><td>Connect a live helpdesk integration (real OAuth)</td>
+    <td><span class="ev no">NOT RUN</span></td>
+    <td>CLI command exists (<code>integrations add</code>); a real OAuth round-trip needs a third party. Per ENG-4700 the bar is "command exists + endpoint reachable," which holds.</td></tr>
+<tr><td>Chat token minting → <code>sandbox/start</code> works in <b>production</b></td>
+    <td><span class="ev no">NOT RUN</span> <span class="ev read">READ</span></td>
+    <td>Provisional. Token-minting code is present; can't browser-login to prod from here. Untested on the real prod path.</td></tr>
+</table>
+</div>
+</details>
+
+<!-- ================= PANEL ================= -->
+<details open>
+<summary>🔍 Panel findings — 5 real · B1 + B2 resolved · 3 should-fix remain</summary>
+<div class="body">
+
+<div class="f info" style="border-color:var(--grn)">
+<h4><span class="tag ok">RESOLVED</span> B1 · Fix commit <code>d6b2614</code> was not pushed to the PR branch — now pushed <span class="ev live">LIVE</span></h4>
+<div class="meta">was: origin PR <code>60426c9</code>, 1 behind local · confidence: certain</div>
+The commit that hardens destructive resolution (integrations/mcp/schedules strict resolvers) and the
+alias-hiding helper existed locally but was off the branch GitHub would merge — so the PR branch still had
+four first-match destructive commands and <code>schedules --help</code> leaked <code>{…,delete,run}</code>.
+<b>Resolved by pushing the branch</b>, so <code>d6b2614</code> (and the B2 fix) are now on PR #21.
+Post-push, <code>schedules --help</code> shows <code>{list,add,remove,fire}</code> with no leaked aliases.
+</div>
+
+<div class="f info" style="border-color:var(--grn)">
+<h4><span class="tag ok">RESOLVED</span> B2 · <code>triggers remove</code> resolved an ambiguous id-prefix to an arbitrary first match — now strict <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
+<div class="meta">fixed in <code>44d3e28</code> · was the one destructive command missed by the strict sweep · flagged by all 3 panel agents</div>
+<code>triggers remove</code> was the lone destructive command still on first-match: an ambiguous id-prefix
+resolved to an arbitrary trigger and deleted it (with <code>--force</code>, no candidate list, no undo).
+<b>Fix:</b> added a shared <code>match_event_triggers</code> helper + a <code>resolve_event_trigger_strict</code>
+variant that refuses ambiguity and lists candidates — mirroring the schedules/agents/integrations/mcp pattern;
+the read-only <code>show</code> path keeps first-match. Verified live with three matching triggers:
+<pre>$ eesel triggers remove "" --force
+✗ '' is ambiguous — it matches 3 triggers:
+✗   c85e2954-…  inline_chat
+✗   c6071edf-…  chat_bubble
+✗   acb04cf7-…  acb04cf7-…
+✗ Re-run with a full trigger id to disambiguate.   # deleted nothing; count stayed 3</pre>
+Removal by full id still works; a new unit test (<code>test_remove_ambiguous_prefix_refuses_without_request</code>)
+locks the behaviour. Suite: 532 passing.
+</div>
+
+<div class="f warn">
+<h4><span class="tag warn">FIX</span> 3 · <code>tasks analytics</code> sends the wrong token — dies in prod <span class="ev read">READ</span></h4>
+<div class="meta"><code>eesel:3220</code>, <code>fetch_task_analytics</code> · confidence: High (code + server auth confirmed; not reproduced in prod)</div>
+The call uses <code>token=creds["token"]</code>; every sibling tasks call (<code>fetch_tasks</code> :3178,
+<code>count_tasks</code> :3195, <code>fetch_task_history</code> :3247) uses <code>token=workspace_token(creds)</code>.
+The route <code>POST /workspace/tasks/analytics</code> is <code>@workspace_authenticated</code> (HS256 workspace
+JWT); a prod Auth0 login holds an RS256 token these routes reject, so the analytics call 401s while the rest
+of <code>tasks</code> works. <b>Invisible in dev</b> (the dev token <em>is</em> the HS256 workspace token — confirmed
+working live: "total tasks: 90"). The docstring even claims it "takes the same auth as the rest of the tasks
+commands" — it doesn't. Prod CLI auth is broadly tracked by ENG-4715, but this is an independent inconsistency
+the existing helper already solves.
+<br><b>Fix:</b> <code>token=workspace_token(creds)</code> (one line); correct the docstring.
+</div>
+
+<div class="f warn">
+<h4><span class="tag warn">FIX</span> 4 · README "edit vs set" box is inverted — points users at the hidden alias <span class="ev read">READ</span></h4>
+<div class="meta"><code>README.md</code>, <code>### edit vs set</code> section · confidence: High (reproduced vs binary)</div>
+The box says <code>edit</code> is canonical for <code>--config</code>/replace ops and <code>set</code> is for single
+fields. The binary is the opposite: <code>set</code> is the visible/canonical verb for <code>--config</code> ops
+(agents, mcp, <code>integrations actions</code>, skills) and <code>edit</code> is the <em>hidden</em> alias
+(<code>hide_subcommands(…, "edit")</code> at eesel:5341/5383/5487/5133). The whole PR exists to establish one
+canonical vocabulary; the headline doc explaining it contradicts the binary.
+<br><b>Fix:</b> swap the rule of thumb — canonical is <code>set</code> for everything; <code>edit</code> is back-compat only.
+</div>
+
+<div class="f warn">
+<h4><span class="tag warn">FIX</span> 5 · "Did you mean?" misses the <code>integrations &lt;int&gt; actions</code> sub-namespace <span class="ev read">READ</span></h4>
+<div class="meta"><code>eesel</code> ~5614, <code>_normalize_integrations_argv</code> · confidence: High (reproduced)</div>
+A typo'd action verb (<code>eesel integrations zendesk actions enabl reply</code>) dies with the root-level
+<code>unrecognized arguments</code> + top-level usage, no suggestion. Root cause: when the first positional
+isn't a known action verb, the argv normalizer prepends <code>list</code>, so the typo becomes a positional
+arg to <code>list</code> and never reaches the <code>actions</code> subparser's suggestion handler. Every other
+group suggests correctly. This is the one place the "everywhere" goal isn't met.
+<br><b>Fix:</b> in the normalizer, pass an unknown non-flag verb through to the <code>actions</code> parser instead of defaulting to <code>list</code>.
+</div>
+
+<h4 style="margin-top:18px;color:var(--mut)">Safety squad — one line each (presence is the point)</h4>
+<table>
+<tr><th>Lens</th><th>Verdict</th></tr>
+<tr><td>Resilience</td><td><span class="ev live">LIVE</span> <code>confirm()</code> defaults to "no" on empty/EOF (fail-safe); strict resolvers refuse ambiguity — except <code>triggers remove</code> (Finding 2).</td></tr>
+<tr><td>Operational load</td><td>N/A for a CLI — no spiky/duplicated events, no rollout fan-out. Task list paginates via <code>totalCount</code> (no row-drop found).</td></tr>
+<tr><td>Cost</td><td>N/A — no new LLM calls; <code>chat</code> path semantics unchanged (only token minting added).</td></tr>
+<tr><td>Customer impact / back-compat</td><td>Aliases preserved for <code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>tools</code>, <code>read→show</code>, <code>use</code>. One <b>deliberate</b> break: <code>triggers fire/run</code> removed (moved to <code>schedules fire</code>) with only a help epilog note — see Needs-a-human.</td></tr>
+</table>
+
+<h4 style="margin-top:18px;color:var(--mut)">Dropped after pressure-test (not real findings)</h4>
+<ul>
+<li><b>"<code>agents enable/disable</code> removed = back-compat break"</b> — false. They never shipped on <code>main</code> (added + removed within this branch). No external surface lost.</li>
+<li><b>"old flat top-level commands (<code>eesel list</code>/<code>fire</code>/<code>use</code>) broke"</b> — false. <code>main</code> was already grouped (<code>agents list</code>, <code>triggers fire</code>); those top-level forms never existed.</li>
+</ul>
+</div>
+</details>
+
+<!-- ================= NEEDS HUMAN ================= -->
+<details open>
+<summary>🙋 Needs a human</summary>
+<div class="body">
+<ul>
+<li><b>[x] Push the branch — done.</b> <code>d6b2614</code> (B1) and <code>44d3e28</code> (B2) are now on the PR; <code>schedules --help</code> shows <code>{list,add,remove,fire}</code> with no leaked aliases.</li>
+<li><b>[ ] Land the 3 should-fix items</b> (Findings 3–5): one-line token fix in <code>tasks analytics</code>, the README "edit vs set" swap, and the <code>integrations actions</code> did-you-mean normalizer. Say the word and I'll do them next.</li>
+<li><b>[ ] Ratify the <code>triggers fire</code> → <code>schedules fire</code> rename.</b> It silently breaks any script calling the old command (a help-only migration note doesn't reach a non-interactive script). For an internal/early CLI this may be fine — but it's a public-surface commitment per ENG-4700, so decide deliberately: leave as-is, add a redirecting alias, or emit a non-zero stderr hint.</li>
+<li><b>[ ] Prod chat path.</b> Verify <code>eesel chat</code> → <code>sandbox/start</code> with the minted workspace token actually works against production (can't browser-login from here). Pass = a real prod chat returns a streamed reply.</li>
+</ul>
+</div>
+</details>
+
+<div class="sub" style="margin-top:20px">
+Verified against a live <code>docker compose</code> dev stack (server :8080 + Postgres + Redis), CLI logged in via
+<code>eesel login --dev</code>. Live writes used a throwaway local workspace and were cleaned up.
+</div>
+
+</div>
+</body>
+</html>
