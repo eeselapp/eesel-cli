@@ -4568,6 +4568,19 @@ class TestTriggersRemove:
         assert calls == []  # no DELETE fired for a non-matching id
         assert "No event/webhook trigger matches" in capsys.readouterr().err
 
+    def test_remove_ambiguous_prefix_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two triggers whose ids share the given prefix: removing must refuse and
+        # list the candidates rather than delete an arbitrary first match. This is
+        # the same strict-resolution guard the destructive schedules/agents/mcp
+        # paths use; --force does not override it.
+        self._seed(monkeypatch, "trg-shared-1111", "trg-shared-2222")
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous trigger"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-shared", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "trg-shared-1111" in out and "trg-shared-2222" in out
+
 
 class TestSchedulesFire:
     def _match(self):

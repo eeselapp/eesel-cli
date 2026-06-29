@@ -2012,30 +2012,59 @@ def _triggers_add(creds: dict, args) -> int:
     return 0
 
 
+def match_event_triggers(rows: list[dict], trigger_id: str) -> list[dict]:
+    """All event/webhook triggers matching `trigger_id`, in resolution-priority
+    order: an exact id first, then id-prefix matches. The same trigger never
+    appears twice, so callers can count the result to detect ambiguity. Triggers
+    have no title, so the id is the only key (unlike scheduled jobs, which also
+    match on config.title)."""
+    exact = [t for t in rows if t.get("id") == trigger_id]
+    if exact:
+        return exact
+    return [t for t in rows if (t.get("id") or "").startswith(trigger_id)]
+
+
 def _resolve_trigger(creds: dict, trigger_id: str) -> dict | None:
-    """Find one event/webhook trigger by exact id or id-prefix, from the
-    workspace-wide list (there is no single-trigger GET endpoint). Returns the
-    trigger dict or None. Shared by `show` and `remove` so a prefix resolves to
-    a full id client-side: a bad or partial id is a clean 'no match' here rather
-    than a 500 from `DELETE /triggers/{prefix}` (the server has no such row)."""
-    rows = fetch_all_event_triggers(creds)
-    match = next((t for t in rows if t.get("id") == trigger_id), None)
-    if match is None:
-        match = next((t for t in rows if (t.get("id") or "").startswith(trigger_id)), None)
-    return match
+    """First event/webhook trigger matching `trigger_id` by exact id or id-prefix,
+    or None. First-match — used by the read-only `show`. The `remove` path uses
+    `resolve_event_trigger_strict`, which refuses an ambiguous prefix rather than
+    deleting an arbitrary match. Resolving client-side means a bad or partial id
+    is a clean 'no match' here rather than a 500 from `DELETE /triggers/{prefix}`
+    (the server has no such row)."""
+    matches = match_event_triggers(fetch_all_event_triggers(creds), trigger_id)
+    return matches[0] if matches else None
+
+
+def resolve_event_trigger_strict(creds: dict, trigger_id: str) -> dict | None:
+    """Resolve `trigger_id` to exactly one event/webhook trigger for `remove`, or
+    print why it could not (no match, or ambiguous with the candidates listed)
+    and return None. An id-prefix can match several triggers, so deleting must
+    not act on an arbitrary first match."""
+    matches = match_event_triggers(fetch_all_event_triggers(creds), trigger_id)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        err(f"No event/webhook trigger matches '{trigger_id}'.")
+        info("Run `eesel triggers list` to see triggers (the first column is the id).")
+        return None
+    err(f"'{trigger_id}' is ambiguous — it matches {len(matches)} triggers:")
+    for t in matches:
+        label = t.get("trigger_key") or t.get("id") or "?"
+        err(f"  {t.get('id', '?')}  {label}")
+    err("Re-run with a full trigger id to disambiguate.")
+    return None
 
 
 def _triggers_remove(creds: dict, args) -> int:
     """`eesel triggers remove <id> [--force]`: DELETE /triggers/{id}.
 
     The id is the trigger's own id (the first column of `eesel triggers list`),
-    accepted as a full id or an unambiguous prefix. Prompts for confirmation
-    unless --force is passed.
+    accepted as a full id or an unambiguous prefix. An ambiguous prefix is
+    refused (candidates listed) rather than deleting an arbitrary match. Prompts
+    for confirmation unless --force is passed.
     """
-    match = _resolve_trigger(creds, args.trigger_id)
+    match = resolve_event_trigger_strict(creds, args.trigger_id)
     if match is None:
-        err(f"No event/webhook trigger matches '{args.trigger_id}'.")
-        info("Run `eesel triggers list` to see triggers (the first column is the id).")
         return 1
     trigger_id = match.get("id")
     label = match.get("trigger_key") or trigger_id
