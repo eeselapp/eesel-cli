@@ -63,18 +63,20 @@
 <h1>Verify — ENG-4700 · CLI namespace consolidation</h1>
 <div class="sub">
   PR <a href="https://github.com/eeselapp/eesel-cli/pull/21">eeselapp/eesel-cli #21</a> ·
-  base <code>main</code> (93d6765) · HEAD <code>fe3aa8e</code> ·
-  independent re-verify · tested live against a local dev stack (server :8080)
+  base <code>main</code> (93d6765) · HEAD <code>2a7c38a</code> ·
+  independent re-verify · tested live against a local dev stack (server :8080) ·
+  <b style="color:var(--grn)">finding 1 fixed + re-verified</b>
 </div>
 
 <div class="verdict">
-  <h2>Verdict: <span style="color:var(--amb)">Works — two fixes before merge</span></h2>
+  <h2>Verdict: <span style="color:var(--amb)">Works — one fix before merge</span></h2>
   <div>The namespace consolidation is genuinely solid: the headline new capability — the <em>write</em> half of
   the CLI — works end-to-end against a live server, the unified verbs are consistent, destructive commands refuse
-  ambiguity, and every read path still works. But this pass found <b>two real defects the prior review missed</b>:
-  one advertised command is broken, and two <code>set --config</code> paths silently destroy config. Neither is
-  catastrophic, both are small fixes. One earlier flag (a wrong-token bug) was chased down and <b>cleared as a false
-  alarm</b> against the server.</div>
+  ambiguity, and every read path still works. This pass found two real defects the prior review missed;
+  <b style="color:var(--grn)">finding 1 (<code>agents add</code> broken) is now fixed and re-verified live</b>.
+  The one remaining is finding 2: two <code>set --config</code> paths silently <em>replace</em> config rather than
+  patch it — a small fix, left for a deliberate product call. One earlier flag (a wrong-token bug) was chased down
+  and <b>cleared as a false alarm</b> against the server.</div>
 
   <div class="kv"><b>What changes for users:</b> every command group now speaks one verb vocabulary
   (<code>list / show / add / set / remove</code>; <code>create</code> for agents); the CLI gains the
@@ -86,18 +88,18 @@
   works — verified live. One read command's <em>human</em> output shifted (an <code>[on]/[off]</code> column was
   inserted into <code>agents list</code>) — see finding 4.</div>
 
-  <div class="kv"><b>Watch this:</b> <span style="color:var(--red)">①</span> <code>eesel agents add</code> is wired
-  into the parser but dispatches to nothing — it exits 1, prints nothing, creates no agent (confirmed live).
-  <span style="color:var(--amb)">②</span> <code>skills set --config</code> / <code>actions set --config</code>
-  <em>replace</em> the whole config object (wholesale), not patch it — a data-loss footgun, and the CLI's own
-  comment claims the opposite.</div>
+  <div class="kv"><b>Watch this:</b> <span style="color:var(--amb)">②</span> <code>skills set --config</code> /
+  <code>actions set --config</code> <em>replace</em> the whole config object (wholesale), not patch it — a data-loss
+  footgun, and the CLI's own comment claims the opposite. (<span style="color:var(--grn)">① <code>agents add</code>
+  now fixed</span> — see below.)</div>
 
   <div class="row">
     <span class="chip ok">535 unit tests green</span>
     <span class="chip ok">agent lifecycle live ✓</span>
     <span class="chip ok">strict resolution live ✓</span>
     <span class="chip ok">read paths live ✓</span>
-    <span class="chip no">① agents add broken</span>
+    <span class="chip ok">536 tests green</span>
+    <span class="chip ok">① agents add fixed + re-verified</span>
     <span class="chip warn">② set --config clobbers</span>
     <span class="chip ok">billing-limit token: false alarm, cleared</span>
   </div>
@@ -140,7 +142,7 @@ fully adopt the triad is <code>documents</code> (finding 5).</p>
     <td>✅ Pass. Created an agent, edited instructions only, <code>show</code> reflected the edit (name preserved), removed it, <code>list</code> confirmed gone. Verified by read-back, not status code.</td></tr>
 <tr><td>One shared verb namespace; old verbs kept as <b>hidden</b> aliases</td>
     <td><span class="ev live">LIVE</span></td>
-    <td>⚠️ Mostly pass. <code>--help</code> is clean across groups; hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read</code>…) still work. <b>One break: <code>agents add</code> is registered but does nothing</b> (finding 1).</td></tr>
+    <td>✅ Pass (after the fix). <code>--help</code> is clean across groups; hidden aliases (<code>edit→set</code>, <code>connect/disconnect</code>, <code>document</code>, <code>read</code>…) still work. <code>agents add</code> was a registered-but-dead alias; <b>now fixed and re-verified live</b> (finding 1).</td></tr>
 <tr><td>Destructive commands use <b>strict</b> resolution (refuse ambiguity, never act on arbitrary first match)</td>
     <td><span class="ev live">LIVE</span></td>
     <td>✅ Pass for an ambiguous id-prefix: <code>agents remove "b" --force</code> listed both matches and deleted nothing (count 4→4). Caveats: an <em>empty</em> prefix isn't treated as "matches all → refuse" (finding 3); <code>documents remove</code> does no resolution at all (finding 5).</td></tr>
@@ -155,7 +157,7 @@ fully adopt the triad is <code>documents</code> (finding 5).</p>
     <td>⚠️ Pass functionally — <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> reads all returned live. But <code>agents list</code>'s <em>human</em> output gained a status column, shifting columns (finding 4).</td></tr>
 <tr><td>Unit suite green</td>
     <td><span class="ev test">TEST</span></td>
-    <td>✅ 535 passed in 4.1s. Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract). No test covers <code>agents add</code> — which is why finding 1 slipped through.</td></tr>
+    <td>✅ 536 passed in 4.6s (+1: a new test locks the <code>agents add</code> alias). Tests mock the HTTP layer (cover request-building + parsing + resolution, not the wire contract).</td></tr>
 <tr><td>Connect a live helpdesk integration (real OAuth)</td>
     <td><span class="ev no">NOT RUN</span></td>
     <td>Command exists (<code>integrations add</code>); a real OAuth round-trip needs a third party. Per ENG-4700 the bar is "command exists + endpoint reachable," which holds.</td></tr>
@@ -171,21 +173,19 @@ fully adopt the triad is <code>documents</code> (finding 5).</p>
 <summary>🔍 Panel findings — 5 real (1 bug, 1 footgun, 3 lower) · 1 false alarm cleared · breaks for a human</summary>
 <div class="body">
 
-<div class="f block">
-<h4><span class="tag block">FIX BEFORE MERGE</span> 1 · <code>eesel agents add</code> is a registered verb that silently does nothing <span class="ev live">LIVE</span></h4>
-<div class="meta"><code>eesel:5131</code> (parser registers <code>add</code> as a hidden alias of <code>create</code>) · <code>eesel:1624–1706</code> (<code>cmd_agents</code> has no <code>add</code> branch) · confidence: certain</div>
-<code>agents add</code> is registered as a hidden alias and inherits <code>func=cmd_agents</code>, so it parses and sets
-<code>args.agents_cmd="add"</code>. But <code>cmd_agents</code> dispatches <code>list/use/unset/show/instructions/create/set/edit/remove</code>
-— there's <b>no <code>add</code> case</b>, so it falls through to <code>return 1</code>. Every other noun's <code>add</code>
-(integrations, mcp, documents, triggers, schedules) dispatches correctly; agents is the lone miss, and no test covers it.
-Confirmed live:
-<pre>$ eesel agents add --name "ZZ-add-test"
-                                 # no output, exit 1, no agent created
-$ eesel agents create --name "ZZ-create-test"
-✓ Created agent 'ZZ-create-test' (8b919943-…)   # exit 0</pre>
-This is exactly the cross-group inconsistency the PR exists to eliminate — a user reaching for the universal
-<code>add</code> verb on agents gets a silent failure (worse than "did you mean?", which an <em>unregistered</em>
-verb would trigger). <b>Fix:</b> one line — route <code>add</code> to the create path: <code>if sub in ("create","add"): return _agents_create(...)</code>; add a test.
+<div class="f ok">
+<h4><span class="tag ok">RESOLVED</span> 1 · <code>eesel agents add</code> was a registered verb that silently did nothing — now dispatches to create <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
+<div class="meta">was: <code>eesel:5131</code> registered <code>add</code> as a hidden alias of <code>create</code>, but <code>cmd_agents</code> had no <code>add</code> branch → fell through to <code>return 1</code> · fixed in <code>2a7c38a</code> · confidence: certain</div>
+The alias parsed and set <code>args.agents_cmd="add"</code>, but the dispatcher only handled
+<code>create</code> — so <code>add</code> fell through to <code>return 1</code>: exit 1, no output, no agent. Every other
+noun's <code>add</code> worked; agents was the lone miss, and no test covered it. <b>Fix:</b> routed <code>add</code> to
+the create path (<code>if sub in ("create","add")</code>) and added a test that asserts <code>agents add</code> POSTs the
+same body as <code>create</code>. Re-verified live:
+<pre>$ eesel agents add --name "ZZ-add-fix-test" --instructions "verify add alias"
+✓ Created agent 'ZZ-add-fix-test' (a4a30021-…)   # exit 0
+$ eesel agents list | grep ZZ-add-fix-test
+   a4a30021-a34  [on]   ZZ-add-fix-test              # read-back confirms; cleaned up after</pre>
+Suite: 536 passing (+1).
 </div>
 
 <div class="f warn">
@@ -273,7 +273,7 @@ deliberately omitting <code>billing-limit</code> from the HS256 list was right. 
 <summary>🙋 Needs a human</summary>
 <div class="body">
 <ul>
-<li><b>[ ] Fix <code>agents add</code> (finding 1).</b> One-line dispatch to the create path (or drop the alias so a typo gets "did you mean?" instead of silent failure). Add a test — none covers it today. Pass = <code>eesel agents add --name X</code> creates an agent and exits 0.</li>
+<li><b>[x] Fix <code>agents add</code> (finding 1) — done.</b> Routed to the create path in <code>2a7c38a</code>, locked with a test, re-verified live (<code>agents add --name X</code> creates an agent, read-back confirms, exit 0).</li>
 <li><b>[ ] Decide replace-vs-merge for <code>skills set</code> / <code>actions set --config</code> (finding 2).</b> A merge (PATCH) endpoint exists right beside the replace one the CLI uses; the CLI comment claims merge but does replace. Either switch to PATCH + fix the comment, or make the read-back warn on dropped keys. Pass = a partial <code>--config</code> doesn't silently drop other stored fields (verify by read-back of the full object).</li>
 <li><b>[ ] Ratify the three back-compat breaks with no alias.</b> <code>triggers fire</code> → <code>schedules fire</code> (removed); bare <code>eesel triggers</code> now lists event triggers, not scheduled ones; <code>triggers --all</code> removed. All are documented in the README only — a non-interactive script never sees the note. Decide deliberately: leave as-is, add redirecting aliases, or emit a stderr migration hint.</li>
 <li><b>[ ] Prod chat path.</b> Verify <code>eesel chat</code> → <code>sandbox/start</code> with the minted workspace token actually works against production (can't browser-login from here). Pass = a real prod chat returns a streamed reply.</li>
