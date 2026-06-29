@@ -2557,17 +2557,26 @@ def _integrations_add(args, creds: dict) -> int:
 
     integration_id = result.get("integration_id") or result.get("id")
     identifier = result.get("identifier")
-    ok(f"Connected '{key}'" + (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else ""))
+    suffix = (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else "")
 
+    # A `redirect_url` means the server stored only the setup fields (e.g.
+    # subdomain) and still needs an external OAuth authorization round-trip to
+    # obtain access/refresh tokens. The integration exists but is NOT yet
+    # connected — it will not sync until OAuth completes. Don't report it as
+    # "Connected": a half-created shell that reads as success is the trap that
+    # leaves agent-driven flows thinking the job is done.
     redirect_url = result.get("redirect_url")
     if redirect_url:
         if no_input:
-            err("This connector needs an interactive OAuth step, but --no-input was given.")
+            err(f"Created '{key}'{suffix}, but it is not connected — this connector needs an interactive OAuth step and --no-input was given.")
             info("Re-run with --token <access-token> to authorize without a browser.")
             return 1
-        info("This connector needs an external authorization step to finish.")
-        info(f"Open this URL in your browser to complete setup:\n  {redirect_url}")
-        info("Completing the OAuth flow is out of scope for the CLI — finish it in the browser.")
+        info(f"Created '{key}'{suffix} — pending authorization, not yet connected (won't sync until OAuth completes).")
+        info(f"Open this URL in your browser to finish authorizing:\n  {redirect_url}")
+        info("The browser OAuth step can't be completed headlessly; alternatively re-run with --token <access-token>.")
+        return 0
+
+    ok(f"Connected '{key}'{suffix}")
     return 0
 
 

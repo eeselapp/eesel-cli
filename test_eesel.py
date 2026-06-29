@@ -3951,6 +3951,8 @@ class TestIntegrationsAdd:
         assert captured["body"]["agent_id"] == "agent-test-456"
         out = capsys.readouterr()
         assert "int-new-1" in out.err
+        # No redirect_url came back, so the connector is fully authorized: report it as connected.
+        assert "✓ Connected 'zendesk'" in out.err
 
     def test_connect_alias_routes_to_add(self, fake_creds, monkeypatch, capsys):
         captured = {}
@@ -4009,7 +4011,11 @@ class TestIntegrationsAdd:
         err = capsys.readouterr().err
         assert rc == 0
         assert "https://auth.example.com/oauth?x=1" in err
-        assert "out of scope" in err
+        # A redirect_url means the integration is a credential-less shell, not
+        # connected. The output must not claim success, or agent-driven flows
+        # will treat the half-created integration as done.
+        assert "✓ Connected" not in err
+        assert "pending authorization" in err
 
     def test_invalid_config_json_exits(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("should not POST on bad JSON"))
