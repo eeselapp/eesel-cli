@@ -61,17 +61,17 @@
 <h1>Verify — ENG-4700 · CLI namespace consolidation</h1>
 <div class="sub">
   PR <a href="https://github.com/eeselapp/eesel-cli/pull/21">eeselapp/eesel-cli #21</a> ·
-  base <code>main</code> (93d6765) · reviewed at HEAD <code>44d3e28</code> ·
-  <b style="color:var(--grn)">Both safety blockers now resolved (B1 pushed · B2 fixed in <code>44d3e28</code>)</b>
+  base <code>main</code> (93d6765) · reviewed + fixed up to HEAD <code>4a87359</code> ·
+  <b style="color:var(--grn)">All 5 findings resolved</b>
 </div>
 
 <div class="verdict" style="border-left-color:var(--grn)">
-  <h2>Verdict: <span style="color:var(--grn)">Safety blockers cleared</span> — 3 smaller fixes remain</h2>
+  <h2>Verdict: <span style="color:var(--grn)">Ready to merge</span> — all findings resolved</h2>
   <div>The namespace consolidation is genuinely solid and the headline new capability (the
-  <em>write</em> half of the CLI) works end-to-end against a live dev server. <b>Both safety blockers
-  (B1, B2) are now fixed and verified</b> — see their entries below. Three smaller items remain
-  (a prod-only token bug, a README inversion, one did-you-mean gap); none block merging the namespace,
-  but they're worth landing.</div>
+  <em>write</em> half of the CLI) works end-to-end against a live dev server. <b>All five findings —
+  the two safety blockers plus the three should-fix items — are now fixed, tested, and verified.</b>
+  See each entry below. Two sign-off items for a human remain (a deliberate breaking rename to ratify,
+  and the prod chat path that can't be exercised from here).</div>
 
   <div class="kv"><b>What changes for users:</b> every command group now speaks one verb vocabulary
   (<code>list / show / add / set / remove</code>, <code>create</code> for agents); the CLI gains the
@@ -82,17 +82,17 @@
   <div class="kv"><b>What must not change (and didn't):</b> all read/list paths across every group
   still work — verified live against localhost:8080.</div>
 
-  <div class="kv"><b>Watch this:</b> the 3 remaining should-fix items —
-  <code>tasks analytics</code> wrong token (prod 401), README "edit vs set" inverted, and the
-  <code>integrations actions</code> did-you-mean gap. All small; details in the panel below.</div>
+  <div class="kv"><b>Watch this:</b> nothing blocking. The one judgment call left for a human is the
+  deliberate <code>triggers fire</code> → <code>schedules fire</code> rename (breaks old scripts silently) —
+  see Needs-a-human.</div>
 
   <div class="row">
-    <span class="chip ok">532 unit tests green</span>
+    <span class="chip ok">535 unit tests green</span>
     <span class="chip ok">full agent lifecycle live ✓</span>
     <span class="chip ok">strict resolution live ✓</span>
-    <span class="chip ok">B1 resolved (pushed)</span>
-    <span class="chip ok">B2 fixed + verified live</span>
-    <span class="chip no">3 should-fix remain</span>
+    <span class="chip ok">B1 + B2 resolved</span>
+    <span class="chip ok">findings 3–5 fixed</span>
+    <span class="chip ok">all 5 findings resolved</span>
   </div>
   <div class="legend">Evidence grades below:
     <span class="ev live">LIVE</span> watched it run against the server ·
@@ -139,14 +139,14 @@ its tests, and its README.</p>
     <td><span class="ev read">READ</span> (binary <code>--help</code>)</td>
     <td>⚠️ Consistent. One leak on the PR branch only: <code>schedules --help</code> shows <code>delete,run</code> (fixed by the unpushed commit — Blocker 1).</td></tr>
 <tr><td>"Did you mean?" on unknown subcommands, <b>everywhere</b></td>
-    <td><span class="ev read">READ</span></td>
-    <td>⚠️ Works at root, every group, and nested (<code>settings notifications</code>) — <b>except</b> <code>integrations &lt;int&gt; actions &lt;typo&gt;</code> (Finding 5).</td></tr>
+    <td><span class="ev live">LIVE</span></td>
+    <td>✅ Pass at root, every group, nested (<code>settings notifications</code>), and — after the Finding 5 fix — <code>integrations &lt;int&gt; actions &lt;typo&gt;</code> (verified live).</td></tr>
 <tr><td>Read/list paths across all groups unchanged (the "must not change" half)</td>
     <td><span class="ev live">LIVE</span></td>
     <td>✅ Pass. <code>workspace/billing/mcp/skills/documents/triggers/schedules/integrations/tasks</code> read paths all returned live.</td></tr>
 <tr><td>Unit suite green</td>
     <td><span class="ev test">TEST</span></td>
-    <td>✅ 532 passed (was 531; +1 for the B2 ambiguity guard). Tests mock the HTTP layer (so they cover request-building + parsing + resolution, not the wire contract).</td></tr>
+    <td>✅ 535 passed (was 531; +4 across the B2 guard, the analytics-token lock, and two normalizer cases). Tests mock the HTTP layer (so they cover request-building + parsing + resolution, not the wire contract).</td></tr>
 <tr><td>Connect a live helpdesk integration (real OAuth)</td>
     <td><span class="ev no">NOT RUN</span></td>
     <td>CLI command exists (<code>integrations add</code>); a real OAuth round-trip needs a third party. Per ENG-4700 the bar is "command exists + endpoint reachable," which holds.</td></tr>
@@ -159,7 +159,7 @@ its tests, and its README.</p>
 
 <!-- ================= PANEL ================= -->
 <details open>
-<summary>🔍 Panel findings — 5 real · B1 + B2 resolved · 3 should-fix remain</summary>
+<summary>🔍 Panel findings — 5 real · all resolved (B1, B2 + findings 3–5)</summary>
 <div class="body">
 
 <div class="f info" style="border-color:var(--grn)">
@@ -190,40 +190,35 @@ Removal by full id still works; a new unit test (<code>test_remove_ambiguous_pre
 locks the behaviour. Suite: 532 passing.
 </div>
 
-<div class="f warn">
-<h4><span class="tag warn">FIX</span> 3 · <code>tasks analytics</code> sends the wrong token — dies in prod <span class="ev read">READ</span></h4>
-<div class="meta"><code>eesel:3220</code>, <code>fetch_task_analytics</code> · confidence: High (code + server auth confirmed; not reproduced in prod)</div>
-The call uses <code>token=creds["token"]</code>; every sibling tasks call (<code>fetch_tasks</code> :3178,
-<code>count_tasks</code> :3195, <code>fetch_task_history</code> :3247) uses <code>token=workspace_token(creds)</code>.
-The route <code>POST /workspace/tasks/analytics</code> is <code>@workspace_authenticated</code> (HS256 workspace
-JWT); a prod Auth0 login holds an RS256 token these routes reject, so the analytics call 401s while the rest
-of <code>tasks</code> works. <b>Invisible in dev</b> (the dev token <em>is</em> the HS256 workspace token — confirmed
-working live: "total tasks: 90"). The docstring even claims it "takes the same auth as the rest of the tasks
-commands" — it doesn't. Prod CLI auth is broadly tracked by ENG-4715, but this is an independent inconsistency
-the existing helper already solves.
-<br><b>Fix:</b> <code>token=workspace_token(creds)</code> (one line); correct the docstring.
+<div class="f info" style="border-color:var(--grn)">
+<h4><span class="tag ok">RESOLVED</span> 3 · <code>tasks analytics</code> sent the wrong token (prod 401) — now uses the workspace token <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
+<div class="meta">fixed in <code>1313d84</code>, <code>eesel:3220</code> · confidence: High (not reproducible in prod from here)</div>
+The call used <code>token=creds["token"]</code> while every sibling <code>/workspace/tasks</code> call uses
+<code>workspace_token(creds)</code>. The route is <code>@workspace_authenticated</code> (HS256); a prod Auth0
+login holds an RS256 token these routes reject, so analytics would 401 in prod while the rest of <code>tasks</code>
+worked — invisible in dev (the dev token <em>is</em> the workspace token).
+<b>Fix:</b> one-line change to <code>workspace_token(creds)</code>; docstring is now accurate. Still works live in dev
+("total tasks: 90"), and a new test (<code>test_uses_workspace_token_not_raw_login_token</code>) locks it.
 </div>
 
-<div class="f warn">
-<h4><span class="tag warn">FIX</span> 4 · README "edit vs set" box is inverted — points users at the hidden alias <span class="ev read">READ</span></h4>
-<div class="meta"><code>README.md</code>, <code>### edit vs set</code> section · confidence: High (reproduced vs binary)</div>
-The box says <code>edit</code> is canonical for <code>--config</code>/replace ops and <code>set</code> is for single
-fields. The binary is the opposite: <code>set</code> is the visible/canonical verb for <code>--config</code> ops
-(agents, mcp, <code>integrations actions</code>, skills) and <code>edit</code> is the <em>hidden</em> alias
-(<code>hide_subcommands(…, "edit")</code> at eesel:5341/5383/5487/5133). The whole PR exists to establish one
-canonical vocabulary; the headline doc explaining it contradicts the binary.
-<br><b>Fix:</b> swap the rule of thumb — canonical is <code>set</code> for everything; <code>edit</code> is back-compat only.
+<div class="f info" style="border-color:var(--grn)">
+<h4><span class="tag ok">RESOLVED</span> 4 · README "edit vs set" was inverted — now matches the binary <span class="ev read">READ</span></h4>
+<div class="meta">fixed in <code>4a87359</code>, <code>README.md</code></div>
+The box said <code>edit</code> was canonical for <code>--config</code> ops; the binary makes <code>set</code>
+canonical and <code>edit</code> a hidden alias. <b>Fix:</b> rewrote the section so <code>set</code> reads as the
+one canonical write verb (replaces a config object <em>or</em> writes a named field) and <code>edit</code> is
+documented purely as a hidden back-compat alias.
 </div>
 
-<div class="f warn">
-<h4><span class="tag warn">FIX</span> 5 · "Did you mean?" misses the <code>integrations &lt;int&gt; actions</code> sub-namespace <span class="ev read">READ</span></h4>
-<div class="meta"><code>eesel</code> ~5614, <code>_normalize_integrations_argv</code> · confidence: High (reproduced)</div>
-A typo'd action verb (<code>eesel integrations zendesk actions enabl reply</code>) dies with the root-level
-<code>unrecognized arguments</code> + top-level usage, no suggestion. Root cause: when the first positional
-isn't a known action verb, the argv normalizer prepends <code>list</code>, so the typo becomes a positional
-arg to <code>list</code> and never reaches the <code>actions</code> subparser's suggestion handler. Every other
-group suggests correctly. This is the one place the "everywhere" goal isn't met.
-<br><b>Fix:</b> in the normalizer, pass an unknown non-flag verb through to the <code>actions</code> parser instead of defaulting to <code>list</code>.
+<div class="f info" style="border-color:var(--grn)">
+<h4><span class="tag ok">RESOLVED</span> 5 · "Did you mean?" now fires for <code>integrations &lt;int&gt; actions &lt;typo&gt;</code> <span class="ev live">LIVE</span> <span class="ev test">TEST</span></h4>
+<div class="meta">fixed in <code>1313d84</code>, <code>_normalize_integrations_argv</code></div>
+The argv normalizer defaulted an unknown first positional to <code>list</code>, burying a typo'd verb as an
+unexpected argument. <b>Fix:</b> only default to <code>list</code> when there's no verb at all; a present-but-unknown
+verb is passed through so the <code>actions</code> subparser raises a suggesting error. Verified live:
+<pre>$ eesel integrations zendesk actions enabl reply
+… invalid choice: 'enabl' (choose from 'list','show','enable','set','edit','disable') Did you mean 'enable'?</pre>
+Bare <code>actions</code> still lists; valid verbs unaffected. Two new normalizer tests lock the behaviour.
 </div>
 
 <h4 style="margin-top:18px;color:var(--mut)">Safety squad — one line each (presence is the point)</h4>
@@ -248,8 +243,8 @@ group suggests correctly. This is the one place the "everywhere" goal isn't met.
 <summary>🙋 Needs a human</summary>
 <div class="body">
 <ul>
-<li><b>[x] Push the branch — done.</b> <code>d6b2614</code> (B1) and <code>44d3e28</code> (B2) are now on the PR; <code>schedules --help</code> shows <code>{list,add,remove,fire}</code> with no leaked aliases.</li>
-<li><b>[ ] Land the 3 should-fix items</b> (Findings 3–5): one-line token fix in <code>tasks analytics</code>, the README "edit vs set" swap, and the <code>integrations actions</code> did-you-mean normalizer. Say the word and I'll do them next.</li>
+<li><b>[x] Push the branch — done.</b> <code>d6b2614</code> (B1) and <code>88dfe7b</code> (B2) are on the PR; <code>schedules --help</code> shows <code>{list,add,remove,fire}</code> with no leaked aliases.</li>
+<li><b>[x] Land findings 3–5 — done.</b> Fixed in <code>1313d84</code> (analytics token + actions did-you-mean) and <code>4a87359</code> (README), each with a locking test where applicable.</li>
 <li><b>[ ] Ratify the <code>triggers fire</code> → <code>schedules fire</code> rename.</b> It silently breaks any script calling the old command (a help-only migration note doesn't reach a non-interactive script). For an internal/early CLI this may be fine — but it's a public-surface commitment per ENG-4700, so decide deliberately: leave as-is, add a redirecting alias, or emit a non-zero stderr hint.</li>
 <li><b>[ ] Prod chat path.</b> Verify <code>eesel chat</code> → <code>sandbox/start</code> with the minted workspace token actually works against production (can't browser-login from here). Pass = a real prod chat returns a streamed reply.</li>
 </ul>
