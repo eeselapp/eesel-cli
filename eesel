@@ -1507,6 +1507,13 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
             sess["messages"].pop()
         save_session(sess)
         return ""
+    except urllib.error.URLError as e:
+        # The server isn't reachable at all (connection refused, DNS failure,
+        # timeout) — no HTTP response to surface. Exit cleanly like the shared
+        # http_* helpers rather than letting the connection error traceback
+        # escape. The user message was only appended in memory, so the on-disk
+        # session is left untouched by exiting before save_session.
+        sys.exit(f"POST {url} failed (server reachable?): {e}")
 
     task_id = start_resp.get("taskId", sess["task_id"])
     sess["task_id"] = task_id
@@ -1577,6 +1584,10 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
     except urllib.error.HTTPError as e:
         err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
         return ""
+    except urllib.error.URLError as e:
+        # Server unreachable mid-stream — exit cleanly like the shared http_*
+        # helpers instead of leaking the connection error traceback.
+        sys.exit(f"GET {url} failed (server reachable?): {e}")
 
     return "".join(text_buffers[tid] for tid in text_order).strip()
 
@@ -1986,6 +1997,18 @@ def cmd_sessions(args) -> int:
 def cmd_triggers(args) -> int:
     """`eesel triggers`: event/webhook triggers (the ones that fire themselves on
     an external event). Scheduled jobs live under `eesel schedules`."""
+    # `eesel triggers --all` used to list every trigger across all agents. That
+    # is now the default for `eesel triggers list`, and scheduled jobs moved to
+    # `eesel schedules`. Fail closed with a pointer rather than silently doing
+    # the wrong thing.
+    if getattr(args, "all", False):
+        err(
+            "`triggers --all` was removed. `eesel triggers list` already lists "
+            "every event/webhook trigger in the workspace; scheduled jobs live "
+            "under `eesel schedules list`."
+        )
+        return 2
+
     creds = require_creds()
     sub = args.triggers_cmd or "list"
 
@@ -5383,11 +5406,20 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
     choices = visible or list(sub_action.choices)
     original_error = parser.error
 
-    def error(message: str, _orig=original_error, _choices=choices) -> None:
+    # A parser can carry a `_eesel_relocations` map of {old-subcommand: hint} for
+    # subcommands that moved to a different command group. When the moved name is
+    # given, point at the new home instead of a generic "did you mean" — e.g.
+    # `eesel triggers fire` now lives at `eesel schedules fire`.
+    relocations = getattr(parser, "_eesel_relocations", None) or {}
+
+    def error(message: str, _orig=original_error, _choices=choices, _reloc=relocations) -> None:
         if "invalid choice" in message:
             bad = message.split("invalid choice: ", 1)[1].split(" ", 1)[0].strip("'\"")
-            near = difflib.get_close_matches(bad, _choices, n=1)
-            hint = f" Did you mean {near[0]!r}?" if near else f" Choose from: {', '.join(_choices)}."
+            if bad in _reloc:
+                hint = f" {_reloc[bad]}"
+            else:
+                near = difflib.get_close_matches(bad, _choices, n=1)
+                hint = f" Did you mean {near[0]!r}?" if near else f" Choose from: {', '.join(_choices)}."
             message = message + hint
         _orig(message)
 
@@ -5740,6 +5772,16 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     )
     sp.add_argument("--json", action="store_true", help="Emit the raw trigger payload")
     sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>trigger_key<TAB>agent` row per trigger")
+    # `--all` was removed when scheduled jobs split out into `eesel schedules`.
+    # Kept as a hidden, recognized flag purely so an old script passing it lands
+    # on a redirect message (handled in cmd_triggers) instead of a bare
+    # "unrecognized arguments" error with no pointer to where listing-all went.
+    sp.add_argument("--all", action="store_true", help=argparse.SUPPRESS)
+    # `fire` moved to `eesel schedules fire`. Redirect on the invalid-choice
+    # error path rather than dead-ending an old `eesel triggers fire <id>` call.
+    sp._eesel_relocations = {
+        "fire": "Scheduled jobs moved to `eesel schedules` — run `eesel schedules fire <id>`.",
+    }
     t_sub = sp.add_subparsers(dest="triggers_cmd")
     t_ls = t_sub.add_parser("list", help="List all event/webhook triggers (status shown as a column)")
     t_ls.add_argument("--json", action="store_true", help="Emit the raw trigger payload")

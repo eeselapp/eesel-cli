@@ -2639,6 +2639,79 @@ class TestSubcommandSuggestions:
         args = eesel.build_parser().parse_args(["sessions", "list"])
         assert args.sessions_cmd == "list"
 
+    def test_triggers_fire_points_at_schedules(self, capsys):
+        # `fire` moved from `triggers` to `schedules`. An old `triggers fire <id>`
+        # call should redirect there, not dead-end on a bare "invalid choice".
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
+        err = capsys.readouterr().err
+        assert "eesel schedules fire" in err
+
+    def test_relocated_name_skips_generic_did_you_mean(self, capsys):
+        # A relocation hint replaces the generic suggestion for that name.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
+        err = capsys.readouterr().err
+        assert "Did you mean" not in err
+
+    def test_triggers_typo_still_suggests_nearest(self, capsys):
+        # Non-relocated typos under `triggers` keep the generic suggestion.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "lst"])
+        assert "Did you mean 'list'?" in capsys.readouterr().err
+
+
+class TestTriggersAllRemoved:
+    def test_all_flag_redirects_and_fails_closed(self, fake_creds, capsys):
+        # `triggers --all` was removed (listing-all is now the default for
+        # `triggers list`). It must fail closed with a pointer, never silently
+        # do the wrong thing.
+        args = eesel.build_parser().parse_args(["triggers", "--all"])
+        rc = args.func(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "triggers --all" in err
+        assert "eesel schedules list" in err
+
+    def test_all_flag_hidden_from_help(self):
+        # The flag is kept parseable only to power the redirect; it stays out of
+        # the help text so it isn't advertised as usable.
+        triggers = _subparsers_action(eesel.build_parser()).choices["triggers"]
+        assert "--all" not in triggers.format_help()
+
+
+class TestChatConnectionFailure:
+    """A server that isn't reachable at all (connection refused / DNS / timeout)
+    must give the same clean one-line "server reachable?" exit the shared http_*
+    helpers give — not a raw connection-error traceback."""
+
+    def _sess(self):
+        return {
+            "id": "s1",
+            "agent_id": "agent-test-456",
+            "workspace_id": "ws-test-123",
+            "task_id": "t1",
+            "messages": [],
+        }
+
+    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as excinfo:
+            eesel.send_message(fake_creds, self._sess(), "hello")
+        assert "server reachable?" in str(excinfo.value.code)
+
+    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as excinfo:
+            eesel.stream_reply(fake_creds, "task1", None)
+        assert "server reachable?" in str(excinfo.value.code)
+
 
 class TestArgParser:
     def test_parser_builds(self):
