@@ -1696,7 +1696,9 @@ def cmd_agents(args) -> int:
         # reachable under the `agents` noun too. The top-level `eesel
         # instructions` is kept as a convenience alias for the same view.
         return cmd_instructions(args)
-    if sub == "create":
+    if sub in ("create", "add"):
+        # `add` is a hidden alias for `create` so the universal `add` verb
+        # (used to bring in every other noun) also works for agents.
         return _agents_create(args, creds)
     if sub in ("set", "edit"):
         # `edit` is the prior name, kept as a hidden alias for `set`.

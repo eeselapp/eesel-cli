@@ -1488,6 +1488,24 @@ class TestAgentsCreateCommand:
         }
         assert "created-id-999" in capsys.readouterr().err  # ok() writes to stderr
 
+    def test_add_alias_creates_agent_like_create(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `agents add` is the hidden alias for `create`; it must dispatch to the
+        # same create path (not silently no-op) so the universal `add` verb works
+        # for agents too.
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "add", "--name", "QA Bot", "--instructions", "you are a test agent"))
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents")
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "you are a test agent",
+            "is_active": True,
+        }
+        assert "created-id-999" in capsys.readouterr().err
+
 
 class TestAgentsEditFieldsCommand:
     AGENTS = [
