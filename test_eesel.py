@@ -1406,6 +1406,10 @@ def _capture_requests(monkeypatch, response=None, *, default=None):
             return response
         if method in ("PUT", "POST", "PATCH") and isinstance(body, dict):
             written[url] = {**written.get(url, {}), **body}
+            # A real PATCH returns the merged config, so the caller can read its
+            # write back from the response without a separate GET.
+            if method == "PATCH":
+                return written[url]
         if method == "GET" and url in written:
             return written[url]
         return fallback
@@ -4997,16 +5001,28 @@ class TestSkillsRemove:
 
 
 class TestSkillsEdit:
-    def test_set_puts_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
-        # `set` is canonical; verify it does the config PUT.
+    def test_set_patches_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `set` is canonical; it PATCHes (merges) the config so a partial write
+        # doesn't drop the skill's other keys.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
         rc = eesel.cmd_skills(
             _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3}')
         )
         assert rc == 0
-        assert calls[0]["method"] == "PUT"
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
         assert calls[0]["body"] == {"threshold": 3}
+
+    def test_set_does_not_send_a_replacing_put(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Guard against a regression to PUT, which replaces the whole config and
+        # would silently drop fields the user didn't pass.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        eesel.cmd_skills(
+            _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3}')
+        )
+        assert all(c["method"] != "PUT" for c in calls)
 
     def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
         parser = eesel.build_parser()
@@ -5014,14 +5030,14 @@ class TestSkillsEdit:
         visible = [a.dest for a in sk_sub._choices_actions]
         assert "set" in visible and "edit" not in visible
 
-    def test_edit_puts_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_edit_patches_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
         rc = eesel.cmd_skills(
             _skills_parse("skills", "edit", "agent-abc123", "triage", "--config", '{"threshold": 3, "label": "urgent"}')
         )
         assert rc == 0
-        assert calls[0]["method"] == "PUT"
+        assert calls[0]["method"] == "PATCH"
         assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
         assert calls[0]["body"] == {"threshold": 3, "label": "urgent"}
 

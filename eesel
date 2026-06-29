@@ -2862,11 +2862,15 @@ def _actions_enable(args, creds: dict) -> int:
 
 
 def _actions_edit(args, creds: dict) -> int:
-    """Configure an action's settings (e.g. permission mode) via its config.
+    """Set an action's config (e.g. permission mode).
 
-    Writes the given JSON config to the action. The same POST also enables the
-    action if it wasn't already, so editing a not-yet-enabled action turns it on
-    with these settings in one step.
+    `--config` writes the action's full config and replaces what's stored — the
+    server keeps only the permission keys (`permission_mode` /
+    `require_human_approval`) when they're absent, so pass every other setting
+    you want to keep in the same call. (Unlike `skills set`, the tools endpoint
+    has no partial-merge, so a one-field write drops the action's other settings.)
+    The same POST also enables the action if it wasn't already, so editing a
+    not-yet-enabled action turns it on with these settings in one step.
     """
     agent = _resolve_actions_agent(creds, getattr(args, "agent", None))
     if not agent:
@@ -4460,11 +4464,11 @@ def cmd_skills(args) -> int:
         # `edit` is the prior name, kept as a hidden alias for `set`.
         config = parse_config_object(args.config)
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}/config"
-        http_request("PUT", url, token=creds["token"], body=config)
-        # Read the config back rather than trusting the 200: confirm each field
-        # we sent now holds the value we sent. The server may merge other keys,
-        # so we check only the keys we wrote, not the whole object.
-        saved = http_request("GET", url, token=creds["token"])
+        # PATCH merges the given keys into the existing config; PUT would replace
+        # the whole object and drop any field this call didn't mention. The
+        # response is the merged config — confirm each field we sent holds the
+        # value we sent.
+        saved = http_request("PATCH", url, token=creds["token"], body=config)
         if isinstance(saved, dict):
             mismatched = [k for k, v in config.items() if saved.get(k) != v]
             if mismatched:
@@ -5360,7 +5364,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
             if _verb == "set" else argparse.SUPPRESS,
         )
         a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
-        a_ed.add_argument("--config", required=True, help="Settings as a JSON object, e.g. '{\"permission_mode\": \"ask\"}'")
+        a_ed.add_argument("--config", required=True, help="The action's full config as a JSON object (replaces what's stored; permission keys are kept if omitted), e.g. '{\"permission_mode\": \"ask\"}'")
         _agent_arg(a_ed)
 
     a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
@@ -5514,7 +5518,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         )
         sk_ed.add_argument("agent", help=_AGENT_HELP)
         sk_ed.add_argument("skill_id", help="Skill id to configure")
-        sk_ed.add_argument("--config", required=True, help="The new config as a JSON object, e.g. '{\"key\": \"value\"}'")
+        sk_ed.add_argument("--config", required=True, help="Config keys to set, as a JSON object (merged into the skill's existing config), e.g. '{\"key\": \"value\"}'")
     hide_subcommands(sk_sub, "edit")  # `edit` is the hidden alias for `set`
     sp.set_defaults(func=cmd_skills)
 
