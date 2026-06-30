@@ -6910,13 +6910,15 @@ class TestPathScopeResolver:
     def test_skills_show_pos_scoped(self):
         assert self.n("agents", "blog", "skills", "show", "translation") == ["skills", "show", "blog", "translation"]
 
-    def test_triggers_schedules_pass_through_untouched(self):
+    def test_triggers_schedules_are_not_scoped_and_error_clearly(self):
         # `triggers`/`schedules` list is workspace-wide (no agent arg), so they
-        # are NOT agent-scoped children — the resolver must leave them alone
-        # rather than inject an agent the handler would reject. Their per-agent
-        # path form arrives with the `automations` unification.
-        assert self.n("agents", "blog", "triggers", "list") == ["agents", "blog", "triggers", "list"]
-        assert self.n("agents", "blog", "schedules", "list") == ["agents", "blog", "schedules", "list"]
+        # are NOT agent-scoped children. Rather than reshape them, the resolver
+        # exits with an error naming the noun (it does not inject an agent the
+        # handler would reject). Their per-agent path form arrives with the
+        # `automations` unification.
+        for noun in ("triggers", "schedules"):
+            with pytest.raises(SystemExit):
+                self.n("agents", "blog", noun, "list")
 
     # ── chat at agent scope ──
     def test_chat_flag_scoped(self):
@@ -6986,10 +6988,10 @@ class TestNamingRenames:
 
 
 class TestPathScopeParsesEndToEnd:
-    """Regression for the gap a verify pass caught: the resolver's reshaped argv
-    must actually PARSE (argparse accepts it), not merely equal a tuple. A noun
-    in the registry whose handler doesn't accept the injected agent would parse
-    to rc=2 here."""
+    """The reshaped argv must actually PARSE (argparse accepts it), not merely
+    equal an expected tuple — a scoped noun whose flat handler doesn't accept the
+    injected agent would still build a list here but fail to parse (rc=2). This
+    asserts the reshape and the flat parsers stay in sync."""
 
     def _parses(self, *argv):
         # Mirror main(): path-scope reshape, then the integrations actions reshape.
@@ -7049,10 +7051,10 @@ class TestPathScopeDiscoverable:
 
 class TestPathScopeVerbScoping:
     """A 'flag' noun only injects --agent for verbs whose flat parser accepts it
-    (documents/tasks have verbs that don't). Verbs that don't must fall through
-    untouched — a clean argparse error, never a mis-injected --agent. Regression
-    for the verify finding that documents remove/export/acl and tasks show/cost
-    hard-errored with 'unrecognized arguments: --agent'."""
+    (documents/tasks have verbs that don't). A verb the flat parser can't scope by
+    agent must NOT get a mis-injected --agent; instead it exits with an error that
+    names the verb (not the agent id), so a scoped `documents acl` / `tasks show`
+    fails clearly rather than reshaping into a command the handler would reject."""
 
     def n(self, *argv):
         return eesel._normalize_path_scope_argv(list(argv))
@@ -7063,17 +7065,69 @@ class TestPathScopeVerbScoping:
         assert self.n("agents", "blog", "tasks", "count") == ["tasks", "count", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "analytics") == ["tasks", "analytics", "--agent", "blog"]
 
-    def test_non_accepting_verbs_fall_through_untouched(self):
+    def test_non_accepting_verbs_exit_naming_the_verb(self, capsys):
+        # A verb the flat parser can't scope by agent exits (code 2) and the error
+        # names the verb, never injecting --agent for the handler to choke on.
         for verb in ("remove", "export", "acl"):
-            argv = ["agents", "blog", "documents", verb, "x"]
-            assert self.n(*argv) == argv, f"documents {verb} must not inject --agent"
+            with pytest.raises(SystemExit) as exc:
+                self.n("agents", "blog", "documents", verb, "x")
+            assert exc.value.code == 2
+            assert f"`{verb}` is not an agent-scoped `documents` verb" in capsys.readouterr().err
         for verb in ("show", "cost"):
-            argv = ["agents", "blog", "tasks", verb, "x"]
-            assert self.n(*argv) == argv, f"tasks {verb} must not inject --agent"
+            with pytest.raises(SystemExit):
+                self.n("agents", "blog", "tasks", verb, "x")
+            assert f"`{verb}` is not an agent-scoped `tasks` verb" in capsys.readouterr().err
 
-    def test_those_fall_through_forms_do_not_smuggle_agent_flag(self):
-        # Belt-and-suspenders: the reshaped argv for a non-accepting verb never
-        # contains "--agent" (the exact symptom the verify pass caught).
-        for argv in (["agents", "blog", "documents", "remove", "k"],
-                     ["agents", "blog", "tasks", "cost", "t1"]):
-            assert "--agent" not in self.n(*argv)
+
+class TestPathScopeBareNounListsConsistently:
+    """A bare `agents <id> <noun>` (no verb) lists, the same way on every scoped
+    noun — so the grammar isn't "skills lists but tasks errors". The verb defaults
+    to `list`; a following flag (`--json`) keeps that default."""
+
+    def n(self, *argv):
+        return eesel._normalize_path_scope_argv(list(argv))
+
+    def test_flag_mode_nouns_default_to_list(self):
+        assert self.n("agents", "blog", "tasks") == ["tasks", "list", "--agent", "blog"]
+        assert self.n("agents", "blog", "documents") == ["documents", "list", "--agent", "blog"]
+        assert self.n("agents", "blog", "integrations") == ["integrations", "list", "--agent", "blog"]
+
+    def test_pos_mode_noun_defaults_to_list(self):
+        assert self.n("agents", "blog", "skills") == ["skills", "list", "blog"]
+
+    def test_default_list_keeps_a_trailing_flag(self):
+        assert self.n("agents", "blog", "tasks", "--json") == ["tasks", "list", "--json", "--agent", "blog"]
+
+
+class TestPathScopeUnknownHeadErrors:
+    """`agents <id> <something>` where <something> isn't an agent verb or scoped
+    noun exits with an error that names the bad token — not the flat parser's
+    `invalid choice: '<agent-id>'`, which blamed the agent id."""
+
+    def n(self, *argv):
+        return eesel._normalize_path_scope_argv(list(argv))
+
+    def test_not_yet_scoped_noun_names_itself(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self.n("agents", "blog", "triggers", "list")
+        assert exc.value.code == 2
+        out = capsys.readouterr().err
+        assert "`triggers` is not an agent command" in out
+        # names the noun, and points at the workspace-level command for it
+        assert "use the top-level `eesel triggers`" in out
+
+    def test_typo_suggests_the_real_noun(self, capsys):
+        with pytest.raises(SystemExit):
+            self.n("agents", "blog", "integratons", "list")
+        assert "Did you mean `integrations`?" in capsys.readouterr().err
+
+    def test_add_without_a_pool_errors_clearly(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self.n("agents", "blog", "remove")
+        assert exc.value.code == 2
+        assert "needs an integration to remove" in capsys.readouterr().err
+
+    def test_a_trailing_flag_head_is_left_for_argparse(self):
+        # A flag (not a word) after the agent is ambiguous; leave it untouched
+        # rather than erroring, so argparse handles it as before.
+        assert self.n("agents", "blog", "--json") == ["agents", "blog", "--json"]

@@ -6196,9 +6196,10 @@ _ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "set", "edit")
 # *normalized* into the flat command forms the cmd_* handlers already implement
 # (mirrors _normalize_integrations_argv, generalized to the agent scope). The
 # flat forms stay valid as hidden aliases, so nothing that scripts the old
-# spelling breaks. This is the resolver + registry from the namespace plan: the
-# registry below says, per agent-scoped child noun, how the flat form receives
-# the agent; the resolver walks the path and reshapes.
+# spelling breaks. The table below says, per agent-scoped child noun, how the
+# flat form receives the agent; the function walks the path and reshapes. (This
+# is the lightweight form of the namespace plan's resolver — a reshape over the
+# existing handlers, not a separate dispatch engine.)
 
 # The flat verbs the `agents` command already owns. When the token after
 # `agents` is one of these, the invocation is already in flat form — leave it.
@@ -6213,9 +6214,9 @@ _AGENTS_FLAT_VERBS = frozenset(
 #     means every verb does, so any following token is reshaped — required for
 #     `integrations`, where the token after the noun is often an integration
 #     *type* (`zd`), not a verb. A finite set means ONLY those verbs are reshaped;
-#     any other verb falls through untouched, so it gets a normal argparse error
-#     instead of a mis-injected `--agent` the handler would reject. (Keep each set
-#     in sync with the flat parsers; TestPathScopeParsesEndToEnd guards it.)
+#     any other verb is reported as an invalid verb for that noun (naming the
+#     verb), rather than mis-injecting `--agent` or blaming the agent id. (Keep
+#     each set in sync with the flat parsers; TestPathScopeParsesEndToEnd guards it.)
 # `triggers`/`schedules` are deliberately absent: their `list` is workspace-wide
 # (no agent argument). They get a real per-agent path form when triggers+schedules
 # are unified under `automations`. `notifications` and the deprecated `tools`
@@ -6226,6 +6227,36 @@ _AGENT_SCOPED_CHILDREN = {
     "tasks": ("flag", frozenset({"list", "count", "analytics", "export"})),
     "skills": ("pos", None),
 }
+
+# Heads valid directly after `agents <id>`: the agent's own verbs plus the
+# agent-scoped child nouns. Used to give a targeted error (with a "did you mean")
+# when the token after the agent is neither — instead of the flat parser blaming
+# the agent id.
+_AGENT_SCOPE_HEADS = ("show", "set", "add", "remove", "chat", *_AGENT_SCOPED_CHILDREN)
+
+
+def _agent_scope_error(agent: str, bad: str, *, kind: str, valid) -> None:
+    """Report a bad token after `agents <id>` against the token itself, then exit.
+
+    Without this the bad token reaches the flat `agents` parser, which reports
+    `invalid choice: '<agent-id>'` — pointing at the agent id rather than the word
+    the user actually got wrong. `kind="command"` means `bad` sat where a noun or
+    verb belongs (right after the agent); otherwise `kind` is the noun whose verb
+    `bad` was. `valid` is the acceptable tokens, used for the list and a difflib
+    "did you mean".
+    """
+    valid = list(valid)
+    near = difflib.get_close_matches(bad, valid, n=1)
+    hint = f" Did you mean `{near[0]}`?" if near else ""
+    if kind == "command":
+        err(f"`{bad}` is not an agent command. After `eesel agents {agent}` use one of: "
+            f"{', '.join(valid)}.{hint}")
+        if bad in ("triggers", "schedules", "notifications"):
+            info(f"`{bad}` isn't an agent-scoped path yet — use the top-level "
+                 f"`eesel {bad}` for now.")
+    else:
+        err(f"`{bad}` is not an agent-scoped `{kind}` verb. Try: {', '.join(valid)}.{hint}")
+    sys.exit(2)
 
 
 def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
@@ -6239,9 +6270,10 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
     - `set <field> <value> …`     → `agents set <id> --<field> <value> …`
     - `show …`                    → `agents show <id> …`          (carries flags)
     - `add|remove <pool>`         → `integrations add|remove <pool> --agent <id>` (grant/revoke)
-    - `<child-noun> …`            → the child's flat form, scoped to <id>
+    - `<child-noun> [<verb>] …`   → the child's flat form, scoped to <id>
+                                    (verb defaults to `list`, uniform across nouns)
     - `chat …`                    → `chat … --agent <id>`
-    - anything else               → unchanged (argparse raises a suggesting error)
+    - anything else               → a targeted error naming the bad token
     """
     if not argv or argv[0] != "agents":
         return argv
@@ -6292,30 +6324,38 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
     # Grant / revoke a shared integration at the agent scope (`agents X add zd`).
     # Reuses the existing integrations connect/disconnect endpoints with the
     # agent supplied by the path instead of a flag.
-    if head in ("add", "remove") and len(tail) >= 2 and not tail[1].startswith("-"):
-        return ["integrations", head, tail[1]] + tail[2:] + ["--agent", agent]
+    if head in ("add", "remove"):
+        if len(tail) >= 2 and not tail[1].startswith("-"):
+            return ["integrations", head, tail[1]] + tail[2:] + ["--agent", agent]
+        err(f"`agents {agent} {head}` needs an integration to {head} — "
+            f"e.g. `eesel agents {agent} {head} zendesk`.")
+        sys.exit(2)
 
     if head in _AGENT_SCOPED_CHILDREN:
         mode, verbs = _AGENT_SCOPED_CHILDREN[head]
         child = tail[1:]                          # the child's own `verb [args]`
-        if mode == "flag":
-            # Only inject `--agent` for a verb whose flat parser accepts it; for
-            # any other verb leave argv untouched (a clean argparse error beats a
-            # mis-injected `--agent`). `verbs is None` → reshape every token
-            # (integrations, where the token may be an integration type).
-            if verbs is not None and (not child or child[0] not in verbs):
-                return argv
-            return [head] + child + ["--agent", agent]
-        # "pos": flat form is `<noun> <verb> <id> [args]`; default verb is list.
+        # Default the verb to `list` when none is given, so a bare
+        # `agents <id> <noun>` lists — the same on every scoped noun.
         if not child or child[0].startswith("-"):
             child = ["list"] + child
         if verbs is not None and child[0] not in verbs:
-            return argv
+            # A verb the flat parser can't scope by agent (e.g. `documents acl`,
+            # `tasks show`). Name the verb, instead of letting the flat `agents`
+            # parser report `invalid choice: '<agent-id>'` and blame the id.
+            _agent_scope_error(agent, child[0], kind=head, valid=sorted(verbs))
+        if mode == "flag":
+            return [head] + child + ["--agent", agent]
+        # "pos": flat form is `<noun> <verb> <id> [args]`.
         return [head, child[0], agent] + child[1:]
 
     if head == "chat":
         return ["chat"] + tail[1:] + ["--agent", agent]
 
+    # `agents <id> <something-else>`: not an agent verb or scoped noun. A flag
+    # (`--json`) is left for argparse; a word — a typo, or a not-yet-scoped noun
+    # like `triggers` — gets a targeted error that names it.
+    if not head.startswith("-"):
+        _agent_scope_error(agent, head, kind="command", valid=_AGENT_SCOPE_HEADS)
     return argv
 
 
@@ -6350,7 +6390,23 @@ def _normalize_integrations_argv(argv: list[str]) -> list[str]:
     if tail and tail[0] in ("-h", "--help"):
         # `integrations zendesk actions --help` → show the actions help.
         return argv[: i + 1] + ["actions", integration] + tail
-    first_positional = next((tok for tok in tail if not tok.startswith("-")), None)
+    # Find the first positional (the actions verb), skipping flags AND the value
+    # of `--agent`. The path-scope reshape appends `--agent <id>` here, and a
+    # naive scan would mistake that id for the verb (argparse then rejects the id
+    # as an invalid actions verb). `--agent=<id>` is a single token, so only the
+    # space-separated form needs the value skip.
+    first_positional, skip_next = None, False
+    for tok in tail:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--agent":
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        first_positional = tok
+        break
     if first_positional is None:
         # No verb at all (bare `actions`, or only flags) → default to `list`.
         tail = ["list"] + tail
