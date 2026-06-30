@@ -152,13 +152,22 @@ eesel integrations --json           # raw payload
 eesel integrations --secrets        # also show access tokens etc. (sysadmin only)
 
 # The integrations group is agent-scoped: connection status is computed against
-# an agent, and `add` connects the integration for one. It defaults to the
+# an agent, and `connect` connects the integration for one. It defaults to the
 # active agent / $EESEL_AGENT; --agent overrides that for a single command.
 eesel integrations --agent <agent>                       # list, scoped to one agent
-eesel integrations show <id> [--agent <agent>]           # one integration's detail + sync status
-eesel integrations add <type> [--config '{...}'] [--token <tok>] [--agent <agent>]   # connect (alias: connect)
-eesel integrations sync <id> [--type help-center] [--agent <agent>]                  # trigger a data sync
-eesel integrations remove <id> [--agent <agent>]         # disconnect (alias: disconnect; -f to skip the prompt)
+eesel integrations available [--agent <agent>]           # the connectable catalog: key, category, connect options
+eesel integrations show <id> [--agent <agent>]           # one integration's detail + latest sync run
+
+# `connect <key>` drives off the connector's connection options (see `available`).
+# `--option <type>` picks one (required when a connector has several):
+#   - a "submit" option connects directly — pass its fields with --field key=value
+#   - a "redirect" option opens the dashboard OAuth URL in your browser and hands
+#     off (like `eesel login`); the CLI does not wait for the flow to finish.
+eesel integrations connect <key> --option quick_start --field subdomain=acme [--agent <agent>]   # direct connect
+eesel integrations connect <key> --option oauth [--agent <agent>]                                # browser OAuth hand-off
+eesel integrations sync <id> [--type help-center] [--agent <agent>]                  # trigger a data sync (Zendesk only)
+eesel integrations sync-status [<id>] [--agent <agent>]                              # sync-run status + progress (all, or one integration's)
+eesel integrations remove <id> [--agent <agent>]         # disconnect (-f to skip the prompt)
 
 # Actions (formerly `tools`) are scoped under their integration; --agent picks
 # whose action set to read/write (default: the active agent)
@@ -214,9 +223,11 @@ scripts should use `set`.
 
 Some renamed commands keep **hidden back-compat aliases** so existing scripts
 don't break: `eesel tools [agent]` still works (now `eesel integrations <x>
-actions`) and `eesel agents add` aliases `eesel agents create`. They're hidden
-from `--help`; prefer the canonical spellings. Manually firing a scheduled job
-is `eesel schedules fire <id>` (the old `eesel triggers fire` has been removed).
+actions`), `eesel agents add` aliases `eesel agents create`, and on the
+integrations group `add` aliases `connect` and `disconnect` aliases `remove`.
+They're hidden from `--help`; prefer the canonical spellings. Manually firing a
+scheduled job is `eesel schedules fire <id>` (the old `eesel triggers fire` has
+been removed).
 
 ## Cost
 
