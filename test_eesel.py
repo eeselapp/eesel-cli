@@ -676,6 +676,87 @@ class TestDocumentCommand:
         assert "POST.md" in out
         assert "files/other-agent/random.md" not in out
 
+    def test_document_list_json_emits_agent_scoped_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {
+                "documents": [
+                    {"id": "doc-1", "key": "files/agent-test-456/a.md", "name": "a.md"},
+                    {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
+                ]
+            },
+        )
+        args = type(
+            "Args",
+            (),
+            {"document_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "json": True},
+        )()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Only the current agent's document survives the scope filter.
+        assert [d["id"] for d in payload] == ["doc-1"]
+
+    def test_document_list_agent_flag_scopes_to_resolved_agent(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # --agent (id, id-prefix, or name) overrides the active agent for the
+        # listing scope, in memory only — it never rewrites the saved active agent.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "agent-test-456", "name": "Default Bot"},
+            {"agent_id": "other-agent", "name": "Other Bot"},
+        ])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--agent must not persist the active agent"))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"documents": [
+            {"id": "doc-1", "key": "files/agent-test-456/a.md", "name": "a.md"},
+            {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
+        ]})
+        args = type("Args", (), {
+            "document_cmd": "list", "prefix": None, "search": None,
+            "limit": 100, "offset": 0, "json": True, "agent": "Other Bot",
+        })()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Only the --agent target's document survives the scope filter.
+        assert [d["id"] for d in payload] == ["doc-2"]
+
+    def test_document_list_unknown_agent_errors_before_fetch(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not fetch on an unresolved --agent"))
+        args = type("Args", (), {
+            "document_cmd": "list", "prefix": None, "search": None,
+            "limit": 100, "offset": 0, "json": False, "agent": "nope",
+        })()
+        with pytest.raises(SystemExit):
+            eesel.cmd_document(args)
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
+    def test_document_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per document:
+        # id<TAB>key<TAB>name, scoped to the current agent. The human view's
+        # two-space column padding is absent, confirming the human formatter was
+        # bypassed.
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {
+                "documents": [
+                    {"id": "doc-1", "key": "files/agent-test-456/a.md", "name": "a.md"},
+                    {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
+                ]
+            },
+        )
+        args = type(
+            "Args",
+            (),
+            {"document_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "plain": True},
+        )()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert lines == ["doc-1\tfiles/agent-test-456/a.md\ta.md"]
+
     def test_document_export_by_document_key_downloads_file(self, tmp_config, fake_creds, tmp_path, monkeypatch):
         # cli resolves the key to a document id via GET /documents (agent-scoped),
         # mints a signed link via /documents/{id}/export-link, then downloads it.
@@ -1053,6 +1134,265 @@ class TestHttpFetch:
         assert out.read_bytes() == b"DATA"
 
 
+class TestDocumentsAdd:
+    def _args(self, **over):
+        base = {"document_cmd": "add", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
+        base.update(over)
+        return type("Args", (), base)()
+
+    def test_posts_title_content_source_type_and_agent_then_prints_key(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"id": "doc-99", "key": "files/agent-test-456/my-doc.md", "name": "My Doc"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._args(content="hello world"))
+        assert rc == 0
+        assert calls == [
+            (
+                "POST",
+                "http://localhost:8080/documents",
+                {"title": "My Doc", "content": "hello world", "source_type": "files", "agent_id": "agent-test-456"},
+            )
+        ]
+        # The key is printed to stdout so it can be captured by a script.
+        assert capsys.readouterr().out.strip() == "files/agent-test-456/my-doc.md"
+
+    def test_reads_content_from_file(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured.update(body or {})
+            return {"key": "files/agent-test-456/from-file.md"}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        content_file = tmp_path / "body.md"
+        content_file.write_text("# From a file\n")
+        rc = eesel.cmd_document(self._args(content_file=str(content_file)))
+        assert rc == 0
+        assert captured["content"] == "# From a file\n"
+
+    def test_falls_back_to_id_when_no_key(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"id": "doc-only-id"})
+        rc = eesel.cmd_document(self._args(content="x"))
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "doc-only-id"
+
+
+class TestDocumentsRemove:
+    # `remove` resolves each argument against the documents that actually exist
+    # before deleting anything, so the tests stand up a small document set.
+    DOCS = [
+        {"id": "doc-a", "key": "files/a.md"},
+        {"id": "doc-b", "key": "files/b.md"},
+    ]
+
+    def _args(self, keys, force=False):
+        return type("Args", (), {"document_cmd": "remove", "keys": keys, "force": force, "agent": None})()
+
+    def test_removes_resolved_keys_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"message": "Documents deleted successfully"}
+
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/a.md", "files/b.md"]))
+        assert rc == 0
+        assert calls == [
+            ("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md", "files/b.md"]})
+        ]
+
+    def test_resolves_an_id_to_its_key(self, tmp_config, fake_creds, monkeypatch):
+        # A document id is a valid address; it resolves to that document's key,
+        # which is what the DELETE body carries.
+        calls = []
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, k.get("body"))) or {})
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["doc-a"]))
+        assert rc == 0
+        assert calls == [("DELETE", {"keys": ["files/a.md"]})]
+
+    def test_force_flag_skips_confirmation(self, tmp_config, fake_creds, monkeypatch):
+        calls = []
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, url, k.get("body"))) or {})
+
+        def boom(prompt):
+            raise AssertionError("confirm() must not be called when --force is passed")
+
+        monkeypatch.setattr(eesel, "confirm", boom)
+        rc = eesel.cmd_document(self._args(["files/a.md"], force=True))
+        assert rc == 0
+        assert calls == [("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md"]})]
+
+    def test_aborts_without_confirmation(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when the user declines")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        rc = eesel.cmd_document(self._args(["files/a.md"]))
+        assert rc == 1
+
+    def test_unknown_key_refuses_and_deletes_nothing(self, tmp_config, fake_creds, monkeypatch):
+        # A typo'd / nonexistent key must refuse the whole command (deleting
+        # nothing) rather than POST the unresolved key and report a fabricated
+        # "Removed N" for a key the server silently ignored.
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when an argument matches no document")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/typo.md"]))
+        assert rc == 1
+
+    def test_one_bad_key_among_good_ones_refuses_all(self, tmp_config, fake_creds, monkeypatch):
+        # All-or-nothing: a single unmatched argument blocks the batch, so a
+        # partial silent delete can't happen behind a fabricated success.
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("must not DELETE when any argument is unmatched")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args(["files/a.md", "files/nope.md"]))
+        assert rc == 1
+
+    def test_blank_key_refuses(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
+
+        def boom(method, url, **k):
+            raise AssertionError("a blank key must not delete anything")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        rc = eesel.cmd_document(self._args([""], force=True))
+        assert rc == 1
+
+
+class TestBlankTargetRefusal:
+    """A blank/whitespace target must match nothing across every resolver. An
+    empty string is a prefix of every id, so without the guard a blank target
+    would match every row — and on a single-row workspace that lone match would
+    resolve as 'unique' and let a destructive `remove` act with no real target
+    given. The strict resolvers refuse only on 0 or 2+ matches, so the guard has
+    to live in the matchers."""
+
+    AGENTS = [{"agent_id": "agent-one", "name": "Only Agent"}]
+    INTEGRATIONS = [{"id": "int-one", "integrationType": "zendesk"}]
+    JOBS = [{"id": "job-one", "config": {"title": "Nightly"}}]
+    TRIGGERS = [{"id": "trig-one", "trigger_key": "ticket.created"}]
+    SERVERS = [{"id": "mcp-one", "name": "Notion"}]
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_matchers_return_nothing_for_blank(self, blank):
+        assert eesel.match_agents(self.AGENTS, blank) == []
+        assert eesel.match_integrations(self.INTEGRATIONS, blank) == []
+        assert eesel.match_scheduled_jobs(self.JOBS, blank) == []
+        assert eesel.match_event_triggers(self.TRIGGERS, blank) == []
+        assert eesel.match_mcp_servers(self.SERVERS, blank) == []
+
+    def test_a_real_prefix_still_matches_the_sole_row(self):
+        # Sanity: the guard only rejects blanks — a real id-prefix on a
+        # single-row workspace still resolves.
+        assert len(eesel.match_agents(self.AGENTS, "agent")) == 1
+        assert len(eesel.match_event_triggers(self.TRIGGERS, "trig")) == 1
+
+    def test_strict_resolvers_refuse_blank(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "")
+        assert agent is None and candidates == []
+        assert eesel.resolve_integration_strict(self.INTEGRATIONS, "") is None
+
+
+class TestDocumentsAcl:
+    AGENTS = [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+
+    def _get_args(self, agent):
+        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": agent, "json": False})()
+
+    def _set_args(self, agent, prefixes):
+        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "set", "agent": agent, "prefix": prefixes})()
+
+    def test_show_prints_key_prefixes(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            return {"key_prefixes": ["files/agent-test-456", "outputs/skills/agent-test-456"]}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_document(self._get_args("Support Bot"))
+        assert rc == 0
+        assert calls == [("GET", "http://localhost:8080/agents/agent-test-456/knowledge-acl", None)]
+        out = capsys.readouterr().out
+        assert "files/agent-test-456" in out
+        assert "outputs/skills/agent-test-456" in out
+
+    def test_show_json_emits_prefix_array(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"key_prefixes": ["files/agent-test-456", "outputs/skills/agent-test-456"]},
+        )
+        args = type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": "Support Bot", "json": True})()
+        rc = eesel.cmd_document(args)
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == ["files/agent-test-456", "outputs/skills/agent-test-456"]
+
+    def test_set_prints_server_readback_not_put_echo(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # The PUT response echoes the request (plus an auto-injected own-files
+        # prefix), but the server normalizes on store: a bare `files` is dropped
+        # and duplicates collapsed. `set` must report the GET readback, not the
+        # PUT echo, or it would overstate the access actually granted.
+        calls = []
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            if method == "PUT":
+                # Echo: request prefixes verbatim + the auto-injected own prefix.
+                return {"key_prefixes": body["key_prefixes"] + ["files/agent-test-456"]}
+            # GET readback: the normalized stored set — bare `files` dropped.
+            return {"key_prefixes": ["files/shared", "files/agent-test-456"]}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        # User asks for a broad bare `files` plus a specific prefix.
+        rc = eesel.cmd_document(self._set_args("agent-test-456", ["files", "files/shared"]))
+        assert rc == 0
+        # PUT to write, then GET to read back what the server actually stored.
+        assert [c[0] for c in calls] == ["PUT", "GET"]
+        assert calls[0][2] == {"key_prefixes": ["files", "files/shared"]}
+        out_lines = capsys.readouterr().out.split()
+        # The normalized readback is printed; the dropped bare `files` is not.
+        assert "files/shared" in out_lines
+        assert "files/agent-test-456" in out_lines
+        assert "files" not in out_lines
+
+    def test_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+
+        def boom(*a, **k):
+            raise AssertionError("must not hit the API when the agent can't be resolved")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        rc = eesel.cmd_document(self._get_args("does-not-exist"))
+        assert rc == 1
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Misc
 # ──────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1430,645 @@ class TestResolveAgent:
         # An exact id match wins even if another id shares the prefix.
         agents = [{"agent_id": "ag", "name": "Short"}, {"agent_id": "ag-long", "name": "Long"}]
         assert eesel.resolve_agent(agents, "ag")["name"] == "Short"
+
+    def test_first_match_on_ambiguous_prefix(self):
+        # `use` keeps its first-match behaviour even when a prefix is ambiguous.
+        agents = [{"agent_id": "agent-1", "name": "One"}, {"agent_id": "agent-2", "name": "Two"}]
+        assert eesel.resolve_agent(agents, "agent-")["name"] == "One"
+
+
+class TestResolveAgentStrict:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},  # duplicate name
+    ]
+
+    def test_unique_match_returns_agent_and_no_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc123")
+        assert agent["name"] == "Support Bot"
+        assert candidates == []
+
+    def test_unique_prefix_match(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc")
+        assert agent["name"] == "Support Bot"
+        assert candidates == []
+
+    def test_ambiguous_prefix_refuses_and_lists_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-def")
+        assert agent is None
+        assert {a["agent_id"] for a in candidates} == {"agent-def456", "agent-def789"}
+
+    def test_ambiguous_name_refuses(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "Blog Writer")
+        assert agent is None
+        assert len(candidates) == 2
+
+    def test_no_match_returns_none_and_empty(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "nope")
+        assert agent is None
+        assert candidates == []
+
+    def test_exact_id_is_unique_even_when_prefix_of_another(self):
+        agents = [{"agent_id": "ag", "name": "Short"}, {"agent_id": "ag-long", "name": "Long"}]
+        agent, candidates = eesel.resolve_agent_strict(agents, "ag")
+        assert agent["name"] == "Short"
+        assert candidates == []
+
+    def test_same_agent_not_double_counted_on_prefix_and_name(self):
+        # An agent matching both by id-prefix and name must count once, so a
+        # genuinely unique target isn't mistaken for ambiguous.
+        agents = [{"agent_id": "abc", "name": "abc"}]
+        agent, candidates = eesel.resolve_agent_strict(agents, "abc")
+        assert agent["name"] == "abc"
+        assert candidates == []
+
+
+class TestBuildAgentCreateBody:
+    def test_created_live_with_instructions(self):
+        body = eesel.build_agent_create_body("ws-1", "QA Bot", "be helpful")
+        assert body == {"workspace_id": "ws-1", "name": "QA Bot", "prompt": "be helpful", "is_active": True}
+
+    def test_instructions_optional_default_empty(self):
+        # Instructions are optional; the `prompt` wire field is sent as "".
+        body = eesel.build_agent_create_body("ws-1", "QA Bot")
+        assert body == {"workspace_id": "ws-1", "name": "QA Bot", "prompt": "", "is_active": True}
+
+    def test_always_live(self):
+        # New agents are live; there is no inactive create path.
+        assert eesel.build_agent_create_body("ws-1", "QA Bot", "p")["is_active"] is True
+
+
+class TestBuildAgentUpdateBody:
+    def test_empty_when_nothing_passed(self):
+        assert eesel.build_agent_update_body() == {}
+
+    def test_only_name(self):
+        assert eesel.build_agent_update_body(name="Renamed") == {"name": "Renamed"}
+
+    def test_instructions_map_to_prompt_field(self):
+        assert eesel.build_agent_update_body(instructions="new text") == {"prompt": "new text"}
+
+    def test_both_fields(self):
+        body = eesel.build_agent_update_body(name="N", instructions="P")
+        assert body == {"name": "N", "prompt": "P"}
+
+
+def _capture_requests(monkeypatch, response=None, *, default=None):
+    """Replace http_request with a recorder; returns the list of calls made.
+
+    A read-back GET (the pattern write commands use to confirm a 200 actually
+    applied) returns the fields last written to the same URL, so a write +
+    read-back round-trip reflects what the real server would hand back. Pass an
+    explicit ``response`` to override this for a specific test, or ``default`` to
+    change the stub returned for a write that has no recorded read-back.
+    """
+    calls = []
+    written: dict = {}
+    fallback = default if default is not None else {"agent_id": "created-id-999"}
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        if response is not None:
+            return response
+        if method in ("PUT", "POST", "PATCH") and isinstance(body, dict):
+            written[url] = {**written.get(url, {}), **body}
+            # A real PATCH returns the merged config, so the caller can read its
+            # write back from the response without a separate GET.
+            if method == "PATCH":
+                return written[url]
+        if method == "GET" and url in written:
+            return written[url]
+        return fallback
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+def _parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestAgentsListCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot", "is_active": True},
+        {"agent_id": "agent-def456", "name": "Blog Writer", "is_active": False},
+    ]
+
+    def test_list_shows_status_column_for_every_agent(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `list` shows everything with its on/off state as a column; it never
+        # filters down to only the active ones.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "list"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "Blog Writer" in out
+        assert "[on]" in out and "[off]" in out
+
+    def test_list_json_emits_raw_records(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "list", "--json"))
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [a["agent_id"] for a in parsed] == ["agent-abc123", "agent-def456"]
+
+    def test_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per agent:
+        # agent_id<TAB>state<TAB>name. The human view's bracketed status markers
+        # must not appear, confirming the human formatter was bypassed.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "list", "--plain"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert lines == ["agent-abc123\ton\tSupport Bot", "agent-def456\toff\tBlog Writer"]
+        assert "[on]" not in out and "[off]" not in out
+
+
+class TestAgentsCreateCommand:
+    def test_missing_name_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--instructions", "p"))
+        assert rc == 1
+        assert calls == []  # no request sent
+        assert "--name" in capsys.readouterr().err
+
+    def test_create_name_only_succeeds_live_with_empty_instructions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--name", "QA Bot"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents")
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "",
+            "is_active": True,
+        }
+
+    def test_create_posts_expected_body_and_prints_id(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "create", "--name", "QA Bot", "--instructions", "you are a test agent"))
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "you are a test agent",
+            "is_active": True,
+        }
+        assert "created-id-999" in capsys.readouterr().err  # ok() writes to stderr
+
+    def test_add_alias_creates_agent_like_create(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `agents add` is the hidden alias for `create`; it must dispatch to the
+        # same create path (not silently no-op) so the universal `add` verb works
+        # for agents too.
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "add", "--name", "QA Bot", "--instructions", "you are a test agent"))
+        assert rc == 0
+        assert len(calls) == 1
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents")
+        assert calls[0]["body"] == {
+            "workspace_id": "ws-test-123",
+            "name": "QA Bot",
+            "prompt": "you are a test agent",
+            "is_active": True,
+        }
+        assert "created-id-999" in capsys.readouterr().err
+
+
+class TestAgentsEditFieldsCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_instructions_only_sends_prompt(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--instructions", "new text"))
+        # calls[0] is the PUT; a read-back GET follows it.
+        assert calls[0]["body"] == {"prompt": "new text"}
+
+    def test_nothing_to_change_fails(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_ambiguous_target_refuses_without_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "Blog Writer", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+        err = capsys.readouterr().err
+        assert "agent-def456" in err and "agent-def789" in err
+
+    def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "nope", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestAgentsRemoveCommand:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_yes_flag_skips_prompt_and_removes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--force"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+
+    def test_affirmative_confirmation_removes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_removing_active_agent_clears_pointer(self, tmp_config, fake_creds, monkeypatch):
+        # fake_creds stores agent-test-456 as active; remove it and confirm the
+        # stored pointer is cleared.
+        agents = [{"agent_id": "agent-test-456", "name": "Active One"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-test-456", "--force"))
+        assert rc == 0
+        assert eesel.load_creds().get("agent_id") is None
+
+    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch, response={})
+        rc = eesel.cmd_agents(_parse("agents", "remove", "Blog Writer", "--force"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestAgentsShowCommand:
+    AGENTS = [
+        {
+            "agent_id": "agent-abc123",
+            "name": "Support Bot",
+            "agent_type": "help_desk_agent",
+            "is_active": True,
+            "description": "Handles tickets",
+            "prompt": "You are support.",
+        },
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+        {"agent_id": "agent-def789", "name": "Blog Writer"},
+    ]
+
+    def test_prints_detail_from_listing_without_extra_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123"))
+        assert rc == 0
+        assert calls == []  # the listing already carries every field
+        out = capsys.readouterr().out
+        assert "Support Bot" in out
+        assert "help_desk_agent" in out
+        assert "live" in out
+        assert "You are support." in out
+
+    def test_json_outputs_raw_record(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123", "--json"))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["agent_id"] == "agent-abc123"
+
+    def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "show", "Blog Writer"))
+        assert rc == 1
+
+
+def _agents_subparsers():
+    """The `agents` sub-subparsers action, for inspecting which agent
+    subcommands are visible in help vs. hidden."""
+    agents = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"]
+    return _subparsers_action(agents)
+
+
+class TestAgentsVerbNaming:
+    """The agents subcommands follow the CLI's canonical verb set
+    (list/show/create/edit/remove). The old REST-shaped spellings
+    (get/update/delete) and the alternate `set` are removed outright — this is an
+    unreleased command surface, so there are no back-compat aliases for them."""
+
+    AGENTS = [{"agent_id": "agent-abc123", "name": "Support Bot"}]
+
+    def test_canonical_verbs_visible_in_help(self):
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        for verb in ("list", "show", "create", "set", "remove"):
+            assert verb in visible
+
+    def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
+        # `set` is canonical; `edit` keeps working as a hidden alias.
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        assert "edit" not in visible
+        calls = _capture_requests(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Z"))
+        assert rc == 0
+        assert calls[0]["body"] == {"name": "Z"}
+
+    def test_use_and_unset_hidden_from_help(self):
+        visible = [a.dest for a in _agents_subparsers()._choices_actions]
+        metavar = _agents_subparsers().metavar or ""
+        for verb in ("use", "unset"):
+            assert verb not in visible
+            assert verb not in metavar
+
+    def test_removed_verbs_are_not_accepted(self):
+        # The old spellings no longer exist as subcommands at all. (`set` is now
+        # the canonical field-change verb, replacing `edit` — see the alias test.)
+        for verb in ("get", "update", "delete"):
+            with pytest.raises(SystemExit):
+                _parse("agents", verb, "agent-abc123")
+
+    def test_show_renders_detail(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "show", "agent-abc123"))
+        assert rc == 0
+        assert calls == []  # detail comes from the listing, no extra request
+        assert "Support Bot" in capsys.readouterr().out
+
+    def test_edit_updates_fields(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_remove_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_agents(_parse("agents", "remove", "agent-abc123", "--force"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123")
+
+
+class TestAgentEnvOverride:
+    """EESEL_AGENT scopes a single command to one agent without writing to
+    disk. It overrides the stored active agent; a --agent flag still wins
+    because each command applies it after require_creds returns."""
+
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_unset_env_leaves_creds_untouched(self, fake_creds, monkeypatch):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        creds = {"agent_id": "stored-agent", "token": "t"}
+        assert eesel.apply_agent_env_override(creds) is creds
+
+    def test_env_id_overrides_stored_active_agent(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "agent-def456")
+        creds = {"agent_id": "agent-abc123", "token": "t"}
+        out = eesel.apply_agent_env_override(creds)
+        assert out["agent_id"] == "agent-def456"
+        # The override is per-invocation only — the input dict is never mutated.
+        assert creds["agent_id"] == "agent-abc123"
+
+    def test_env_resolves_by_name(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "Blog Writer")
+        out = eesel.apply_agent_env_override({"agent_id": None, "token": "t"})
+        assert out["agent_id"] == "agent-def456"
+
+    def test_unresolvable_env_exits(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "ghost")
+        with pytest.raises(SystemExit):
+            eesel.apply_agent_env_override({"token": "t"})
+        assert "EESEL_AGENT" in capsys.readouterr().err
+
+    def test_ambiguous_env_exits_and_lists_candidates(self, fake_creds, monkeypatch, capsys):
+        # An EESEL_AGENT value that matches more than one agent must fail loudly
+        # with the full ids, not silently scope to an arbitrary first match.
+        dupes = [
+            {"agent_id": "agent-aaa111", "name": "Twin"},
+            {"agent_id": "agent-bbb222", "name": "Twin"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: dupes)
+        monkeypatch.setenv("EESEL_AGENT", "Twin")
+        with pytest.raises(SystemExit):
+            eesel.apply_agent_env_override({"token": "t"})
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "agent-aaa111" in out and "agent-bbb222" in out
+
+    def test_env_does_not_persist_to_disk(self, tmp_config, fake_creds, monkeypatch):
+        # require_creds applies the override in memory; nothing is saved, so the
+        # stored active agent is unchanged for the next command.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "agent-def456")
+        out = eesel.require_creds()
+        assert out["agent_id"] == "agent-def456"
+        assert eesel.load_creds()["agent_id"] == fake_creds["agent_id"]
+
+
+class TestMatchAgents:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_exact_id_short_circuits_to_one(self):
+        assert eesel.match_agents(self.AGENTS, "agent-abc123") == [self.AGENTS[0]]
+
+    def test_ambiguous_prefix_returns_all(self):
+        # "agent-abc" prefixes two agents; both come back so callers can refuse.
+        matches = eesel.match_agents(self.AGENTS, "agent-abc")
+        assert len(matches) == 2
+
+    def test_ambiguous_name_returns_all(self):
+        assert len(eesel.match_agents(self.AGENTS, "Support Bot")) == 2
+
+    def test_no_double_listing_prefix_and_name(self):
+        # An agent matched by prefix is not also re-listed under the name pass.
+        agents = [{"agent_id": "abc", "name": "abc"}]
+        assert eesel.match_agents(agents, "abc") == agents
+
+
+class TestResolveAgentStrict:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+        {"agent_id": "agent-def456", "name": "Blog Writer"},
+    ]
+
+    def test_unique_match_returns_agent_no_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-def456")
+        assert agent["name"] == "Blog Writer"
+        assert candidates == []
+
+    def test_ambiguous_returns_none_with_candidates(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "agent-abc")
+        assert agent is None
+        assert len(candidates) == 2
+
+    def test_no_match_returns_none_empty(self):
+        agent, candidates = eesel.resolve_agent_strict(self.AGENTS, "nope")
+        assert agent is None
+        assert candidates == []
+
+
+class TestResolveAgentOrError:
+    AGENTS = [
+        {"agent_id": "agent-abc123", "name": "Support Bot"},
+        {"agent_id": "agent-abc999", "name": "Support Bot"},
+    ]
+
+    def test_unique_match_returns_agent(self, monkeypatch):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, "agent-abc123")["name"] == "Support Bot"
+
+    def test_ambiguous_lists_candidates_and_returns_none(self, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, "agent-abc") is None
+        errout = capsys.readouterr().err
+        assert "ambiguous" in errout
+        assert "agent-abc123" in errout and "agent-abc999" in errout
+
+    def test_no_target_errors(self, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        assert eesel.resolve_agent_or_error({}, None) is None
+        assert "No agent given" in capsys.readouterr().err
+
+    def test_falls_back_to_env(self, monkeypatch):
+        monkeypatch.setenv("EESEL_AGENT", "agent-abc123")
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        assert eesel.resolve_agent_or_error({}, None)["agent_id"] == "agent-abc123"
+
+
+class TestConfirm:
+    def test_prompt_goes_to_stderr_not_stdout(self, monkeypatch, capsys):
+        # The prompt must not land on stdout, or it would be captured by
+        # `eesel ... > out.txt`.
+        monkeypatch.setattr("builtins.input", lambda: "y")
+        eesel.confirm("Delete everything? [y/N] ")
+        captured = capsys.readouterr()
+        assert "Delete everything?" in captured.err
+        assert captured.out == ""
+
+    def test_yes_variants(self, monkeypatch):
+        for ans in ("y", "yes", "  YES  ", "Y"):
+            monkeypatch.setattr("builtins.input", lambda ans=ans: ans)
+            assert eesel.confirm("?") is True
+
+    def test_anything_else_is_no(self, monkeypatch):
+        for ans in ("", "n", "no", "maybe"):
+            monkeypatch.setattr("builtins.input", lambda ans=ans: ans)
+            assert eesel.confirm("?") is False
+
+    def test_eof_is_no(self, monkeypatch):
+        def boom():
+            raise EOFError
+        monkeypatch.setattr("builtins.input", boom)
+        assert eesel.confirm("?") is False
+
+
+class TestHttpRequestNonJson:
+    class _FakeResp:
+        def __init__(self, body: bytes, status: int = 200):
+            self._body = body
+            self.status = status
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_non_json_200_exits_cleanly(self, monkeypatch):
+        # A proxy/login HTML page served with status 200 must not raise a raw
+        # JSONDecodeError traceback.
+        html = b"<html><body>Gateway timeout</body></html>"
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
+        )
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://proxy/agents")
+        msg = str(exc.value)
+        assert "not JSON" in msg
+        assert "JSONDecodeError" not in msg
+
+    def test_empty_body_returns_empty_dict(self, monkeypatch):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(b"")
+        )
+        assert eesel.http_request("GET", "http://x/y") == {}
+
+    def test_valid_json_still_parsed(self, monkeypatch):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(b'{"ok": true}')
+        )
+        assert eesel.http_request("GET", "http://x/y") == {"ok": True}
+
+
+class TestParseConfigObject:
+    def test_valid_object(self):
+        assert eesel.parse_config_object('{"cron": "0 9 * * *"}') == {"cron": "0 9 * * *"}
+
+    def test_invalid_json_exits_2(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            eesel.parse_config_object("{not json}")
+        assert exc.value.code == 2
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_non_object_exits_2(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            eesel.parse_config_object('["a", "b"]')
+        assert exc.value.code == 2
+        assert "must be a JSON object" in capsys.readouterr().err
+
+    def test_example_in_message_is_customizable(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.parse_config_object("42", example='{"enabled": true}')
+        assert '{"enabled": true}' in capsys.readouterr().err
 
 
 class TestMatchAgents:
@@ -1457,6 +2436,42 @@ def _visible_commands(parser):
     return [a.dest for a in _subparsers_action(parser)._choices_actions]
 
 
+def _all_subparser_actions(parser):
+    """Every subparsers action in the parser tree (root + nested groups)."""
+    import argparse
+
+    out = []
+
+    def walk(p):
+        action = next((a for a in p._actions if isinstance(a, argparse._SubParsersAction)), None)
+        if action is None:
+            return
+        out.append(action)
+        for child in action.choices.values():
+            walk(child)
+
+    walk(parser)
+    return out
+
+
+def test_no_group_leaks_hidden_aliases_into_its_metavar():
+    # A hidden back-compat alias (help=SUPPRESS) must be dropped from BOTH the
+    # visible choice list and the usage-line metavar. argparse builds the metavar
+    # from every registered subparser unless it is pinned, so a group that pins
+    # the choice list but forgets the metavar leaks the alias into `--help` — as
+    # `schedules` once leaked `delete`/`run`. hide_subcommands() does both steps;
+    # this guards every group (and the root) at once so the leak can't return.
+    for action in _all_subparser_actions(eesel.build_parser(staff=False)):
+        metavar = action.metavar or ""
+        if not metavar:
+            continue
+        assert "SUPPRESS" not in metavar
+        inner = metavar.strip("{}")
+        listed = set(inner.split(",")) if inner else set()
+        visible = {a.dest for a in action._choices_actions}
+        assert listed == visible, f"metavar {metavar!r} != visible {sorted(visible)}"
+
+
 def _dev_flag_help(parser):
     login = _subparsers_action(parser).choices["login"]
     return next(a for a in login._actions if a.dest == "dev").help
@@ -1624,6 +2639,79 @@ class TestSubcommandSuggestions:
         args = eesel.build_parser().parse_args(["sessions", "list"])
         assert args.sessions_cmd == "list"
 
+    def test_triggers_fire_points_at_schedules(self, capsys):
+        # `fire` moved from `triggers` to `schedules`. An old `triggers fire <id>`
+        # call should redirect there, not dead-end on a bare "invalid choice".
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
+        err = capsys.readouterr().err
+        assert "eesel schedules fire" in err
+
+    def test_relocated_name_skips_generic_did_you_mean(self, capsys):
+        # A relocation hint replaces the generic suggestion for that name.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
+        err = capsys.readouterr().err
+        assert "Did you mean" not in err
+
+    def test_triggers_typo_still_suggests_nearest(self, capsys):
+        # Non-relocated typos under `triggers` keep the generic suggestion.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["triggers", "lst"])
+        assert "Did you mean 'list'?" in capsys.readouterr().err
+
+
+class TestTriggersAllRemoved:
+    def test_all_flag_redirects_and_fails_closed(self, fake_creds, capsys):
+        # `triggers --all` was removed (listing-all is now the default for
+        # `triggers list`). It must fail closed with a pointer, never silently
+        # do the wrong thing.
+        args = eesel.build_parser().parse_args(["triggers", "--all"])
+        rc = args.func(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "triggers --all" in err
+        assert "eesel schedules list" in err
+
+    def test_all_flag_hidden_from_help(self):
+        # The flag is kept parseable only to power the redirect; it stays out of
+        # the help text so it isn't advertised as usable.
+        triggers = _subparsers_action(eesel.build_parser()).choices["triggers"]
+        assert "--all" not in triggers.format_help()
+
+
+class TestChatConnectionFailure:
+    """A server that isn't reachable at all (connection refused / DNS / timeout)
+    must give the same clean one-line "server reachable?" exit the shared http_*
+    helpers give — not a raw connection-error traceback."""
+
+    def _sess(self):
+        return {
+            "id": "s1",
+            "agent_id": "agent-test-456",
+            "workspace_id": "ws-test-123",
+            "task_id": "t1",
+            "messages": [],
+        }
+
+    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as excinfo:
+            eesel.send_message(fake_creds, self._sess(), "hello")
+        assert "server reachable?" in str(excinfo.value.code)
+
+    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as excinfo:
+            eesel.stream_reply(fake_creds, "task1", None)
+        assert "server reachable?" in str(excinfo.value.code)
+
 
 class TestArgParser:
     def test_parser_builds(self):
@@ -1684,6 +2772,42 @@ class TestArgParser:
         assert args.agents_cmd == "unset"
         assert args.func is eesel.cmd_agents
 
+    def test_tasks_analytics_parses_dates_and_agent(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tasks", "analytics", "--agent", "Bot", "--start-date", "2026-05-01", "--end-date", "2026-05-31"])
+        assert args.cmd == "tasks"
+        assert args.tasks_cmd == "analytics"
+        assert args.agent == "Bot"
+        assert args.start_date == "2026-05-01"
+        assert args.end_date == "2026-05-31"
+        assert args.func is eesel.cmd_tasks
+
+    def test_tasks_export_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tasks", "export", "--agent", "Bot", "--start-date", "2026-05-01"])
+        assert args.cmd == "tasks"
+        assert args.tasks_cmd == "export"
+        assert args.agent == "Bot"
+        assert args.start_date == "2026-05-01"
+        assert args.func is eesel.cmd_tasks
+
+    def test_tasks_read_commands_accept_json(self):
+        # Every read command must expose --json for scripts and agent self-QA.
+        parser = eesel.build_parser()
+        for sub in ("list", "count", "analytics", "show", "cost"):
+            argv = ["tasks", sub]
+            if sub in ("show", "cost"):
+                argv.append("284a6a43-afa7-43f3-88e6-25d1a92cf7d7")
+            argv.append("--json")
+            args = parser.parse_args(argv)
+            assert args.json is True, sub
+
+    def test_tasks_unknown_subcommand_suggests_closest(self, capsys):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["tasks", "lst"])
+        assert "Did you mean 'list'?" in capsys.readouterr().err
+
     def test_instructions_subcommand_parses(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["instructions"])
@@ -1714,6 +2838,127 @@ class TestArgParser:
         args = parser.parse_args(["chat", "hi"])
         assert args.cost is False
 
+    def test_triggers_registry_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "registry"])
+        assert args.cmd == "triggers"
+        assert args.triggers_cmd == "registry"
+        assert args.func is eesel.cmd_triggers
+
+    def test_triggers_add_parses_key_and_config(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "add", "Support Bot", "--key", "zendesk_ticket_created", "--config", "{}"])
+        assert args.triggers_cmd == "add"
+        assert args.agent == "Support Bot"
+        assert args.key == "zendesk_ticket_created"
+        assert args.config == "{}"
+
+    def test_triggers_add_requires_key(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["triggers", "add", "Support Bot"])  # missing --key
+
+    def test_triggers_show_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "show", "trg-1"])
+        assert args.triggers_cmd == "show"
+        assert args.trigger_id == "trg-1"
+        assert args.func is eesel.cmd_triggers
+
+    def test_triggers_remove_parses_force_flag(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["triggers", "remove", "trg-1", "--force"])
+        assert args.triggers_cmd == "remove"
+        assert args.trigger_id == "trg-1"
+        assert args.force is True
+
+    def test_triggers_removed_verbs_no_longer_parse(self):
+        # The REST-derived verbs (`create`/`delete`) were renamed to the canonical
+        # set and must not parse. `fire`/`run` previously lingered as triggers
+        # aliases that no longer dispatched; manually firing a scheduled job now
+        # lives solely under `eesel schedules fire`, so they must not parse here.
+        parser = eesel.build_parser()
+        for argv in (
+            ["triggers", "create", "Support Bot", "--key", "k"],
+            ["triggers", "delete", "trg-1"],
+            ["triggers", "fire", "heartbeat"],
+            ["triggers", "run", "heartbeat"],
+        ):
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_schedules_list_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["schedules", "list"])
+        assert args.cmd == "schedules"
+        assert args.schedules_cmd == "list"
+        assert args.func is eesel.cmd_schedules
+
+    def test_schedules_add_parses_cron_and_flags(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args([
+            "schedules", "add", "Support Bot",
+            "--cron", "0 9 * * *", "--prompt", "Send the morning digest",
+            "--title", "Morning digest", "--timezone", "Europe/London",
+        ])
+        assert args.schedules_cmd == "add"
+        assert args.agent == "Support Bot"
+        assert args.cron == "0 9 * * *"
+        assert args.prompt == "Send the morning digest"
+        assert args.title == "Morning digest"
+        assert args.timezone == "Europe/London"
+
+    def test_schedules_add_requires_cron(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            # missing --cron (--prompt also required, but --cron alone is enough to reject)
+            parser.parse_args(["schedules", "add", "Support Bot", "--prompt", "x"])
+
+    def test_schedules_add_requires_prompt(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            # The server rejects scheduled triggers without a prompt, so the CLI
+            # makes it a required flag and fails before sending the request.
+            parser.parse_args(["schedules", "add", "Support Bot", "--cron", "0 9 * * *"])
+
+    def test_schedules_remove_parses_force_flag(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["schedules", "remove", "sch-1", "-f"])
+        assert args.schedules_cmd == "remove"
+        assert args.job == "sch-1"
+        assert args.force is True
+
+    def test_schedules_fire_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["schedules", "fire", "heartbeat"])
+        assert args.schedules_cmd == "fire"
+        assert args.job == "heartbeat"
+
+    def test_new_schedule_flag_and_trigger_alias(self):
+        # `--trigger` is the old name; both map to the same `schedule` dest.
+        parser = eesel.build_parser()
+        assert parser.parse_args(["new", "--schedule", "heartbeat"]).schedule == "heartbeat"
+        assert parser.parse_args(["new", "--trigger", "heartbeat"]).schedule == "heartbeat"
+
+
+class TestConfirm:
+    def test_yes_variants_return_true(self, monkeypatch):
+        for answer in ("y", "yes", "Y", "YES", " yes "):
+            monkeypatch.setattr("builtins.input", lambda _="", a=answer: a)
+            assert eesel.confirm("ok? ") is True
+
+    def test_no_and_empty_return_false(self, monkeypatch):
+        for answer in ("", "n", "no", "nope"):
+            monkeypatch.setattr("builtins.input", lambda _="", a=answer: a)
+            assert eesel.confirm("ok? ") is False
+
+    def test_eof_returns_false(self, monkeypatch):
+        def boom(_=""):
+            raise EOFError
+
+        monkeypatch.setattr("builtins.input", boom)
+        assert eesel.confirm("ok? ") is False
+
     def test_cost_subcommand_parses(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["cost"])
@@ -1733,6 +2978,16 @@ class TestArgParser:
         assert args.prefix == "outputs/skills"
         assert args.search == "post"
         assert args.limit == 25
+
+    def test_document_subcommands_accept_agent_flag(self):
+        parser = eesel.build_parser()
+        for argv in (
+            ["documents", "list", "--agent", "Bot"],
+            ["documents", "show", "doc-1", "--agent", "Bot"],
+            ["documents", "add", "--title", "T", "--content", "x", "--agent", "Bot"],
+        ):
+            args = parser.parse_args(argv)
+            assert args.agent == "Bot"
 
     def test_document_export_subcommand_parses(self):
         parser = eesel.build_parser()
@@ -1769,6 +3024,102 @@ class TestArgParser:
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["export", "--document-id", "doc-123"])
+
+    def test_documents_plural_is_canonical_noun(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "list"])
+        assert args.cmd == "documents"
+        assert args.document_cmd == "list"
+        assert args.func is eesel.cmd_document
+
+    def test_singular_document_still_parses_as_alias(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["document", "list"])
+        assert args.cmd == "document"
+        assert args.document_cmd == "list"
+        assert args.func is eesel.cmd_document
+
+    def test_singular_document_hidden_from_help(self):
+        # The alias parses but is dropped from the top-level command listing.
+        help_text = eesel.build_parser().format_help()
+        assert "documents" in help_text
+        assert "\n    document " not in help_text
+
+    def test_show_is_documented_synonym_of_read(self):
+        parser = eesel.build_parser()
+        show_args = parser.parse_args(["documents", "show", "doc-1", "--format", "html"])
+        read_args = parser.parse_args(["documents", "read", "doc-1", "--format", "html"])
+        assert show_args.document_cmd == "show"
+        assert read_args.document_cmd == "read"
+        # Both route to the same handler, which treats show/read identically.
+        assert show_args.func is eesel.cmd_document and read_args.func is eesel.cmd_document
+
+    def test_read_hidden_from_documents_help(self):
+        # `read` stays parseable but is not advertised under `documents --help`.
+        documents_action = next(
+            a for a in eesel.build_parser()._subparsers._group_actions[0].choices.values()
+            if a.prog.endswith("documents")
+        )
+        sub_help = documents_action.format_help()
+        assert "show " in sub_help
+        assert "read" not in sub_help.split("optional arguments")[0].replace("==SUPPRESS==", "")
+
+    def test_documents_list_accepts_json(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "list", "--search", "post", "--json"])
+        assert args.document_cmd == "list"
+        assert args.search == "post"
+        assert args.json is True
+
+    def test_documents_add_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "add", "--title", "T", "--content", "C"])
+        assert args.document_cmd == "add"
+        assert args.title == "T"
+        assert args.content == "C"
+        assert args.source_type == "files"
+
+    def test_documents_add_requires_content(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "add", "--title", "T"])
+
+    def test_documents_add_rejects_both_content_sources(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "add", "--title", "T", "--content", "C", "--content-file", "f"])
+
+    def test_documents_search_is_a_list_flag_not_a_verb(self):
+        # A free-text query folds into `list --search`; there is no `search` verb.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "search", "files/abc"])
+
+    def test_documents_remove_parses_multiple_keys_and_force(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "remove", "k1", "k2", "-f"])
+        assert args.document_cmd == "remove"
+        assert args.keys == ["k1", "k2"]
+        assert args.force is True
+
+    def test_documents_acl_show_parses(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "acl", "show", "Support Bot"])
+        assert args.document_cmd == "acl"
+        assert args.acl_cmd == "show"
+        assert args.agent == "Support Bot"
+
+    def test_documents_acl_set_parses_repeatable_prefix(self):
+        parser = eesel.build_parser()
+        args = parser.parse_args(["documents", "acl", "set", "agent-1", "--prefix", "a/", "--prefix", "b/"])
+        assert args.acl_cmd == "set"
+        assert args.agent == "agent-1"
+        assert args.prefix == ["a/", "b/"]
+
+    def test_documents_acl_set_requires_prefix(self):
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "acl", "set", "agent-1"])
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2151,6 +3502,50 @@ class TestTasksList:
         assert seen["filters"] == {"agent": ["agent-test-456"]}
         assert "for this agent" in capsys.readouterr().out
 
+    def test_list_json_emits_raw_rows(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"tasks": [_make_task("7f3a9c21-1234-0000-0000-000000000000")], "hasNextPage": True, "nextPage": 2},
+        )
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["tasks"][0]["task_id"] == "7f3a9c21-1234-0000-0000-000000000000"
+        assert payload["has_next"] is True
+        assert payload["next_page"] == 2
+
+    def test_list_json_empty_is_valid_json(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "hasNextPage": False})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["tasks"] == []
+
+    def test_list_plain_emits_tab_separated_rows(self, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per task:
+        # task_id<TAB>updated<TAB>agent<TAB>source<TAB>label. The full task id is
+        # printed, not the 12-char truncation the human view uses, confirming the
+        # human formatter was bypassed.
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: {"tasks": [_make_task("7f3a9c21-1234-0000-0000-000000000000", agent_name="Support Bot", name="Refund for #1024", channel="helpdesk")], "hasNextPage": False},
+        )
+        rc = eesel.cmd_tasks(_args(tasks_cmd="list", limit=50, page=1, agent=None, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        row = out.strip().splitlines()[0]
+        assert row == "7f3a9c21-1234-0000-0000-000000000000\t2026-05-29 13:40\tSupport Bot\thelpdesk\tRefund for #1024"
+
+    def test_count_json_emits_count(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [], "totalCount": 7})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="count", agent=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["count"] == 7
+        assert payload["agent_id"] is None
+
 
 class TestTasksShow:
     HISTORY = {
@@ -2221,9 +3616,177 @@ class TestTasksShow:
         assert rc == 0
         assert "dev-only" in capsys.readouterr().err
 
+    def test_cost_json_emits_breakdown(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", self._fake(self.HISTORY))
+        monkeypatch.setattr(eesel, "_run_psql", lambda sql: "284a6a43-afa7-43f3-88e6-25d1a92cf7d7||refund chat|0.5|10000|500|0|0|3")
+        rc = eesel.cmd_tasks(_args(tasks_cmd="cost", task_id="284a6a43-afa7-43f3-88e6-25d1a92cf7d7", json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["total_cost"] == 0.5
+        assert len(payload["by_task"]) == 1
+
+
+_ANALYTICS = {
+    "total_tasks": 10,
+    "tasks_by_status": {"completed": 10},
+    "tasks_by_agent": {"agent-test-456": {"name": "Support Bot", "count": 7}, "agent-other": {"name": "Sales Bot", "count": 3}},
+    "tasks_by_channel": {"helpdesk": 6, "chat": 4},
+    "resolution_counts": {"resolved": 6, "escalated": 2, "pending": 2},
+    "csat_distribution": {"great": 4, "good": 3, "fair": 1, "poor": 0},
+}
+
+
+class TestTaskAnalyticsFetch:
+    def test_posts_to_workspace_analytics_with_dates_and_agent(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds, start_date="2026-05-01", end_date="2026-05-31", agent_id="agent-test-456")
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/workspace/tasks/analytics"
+        assert captured["body"]["start_date"] == "2026-05-01"
+        assert captured["body"]["end_date"] == "2026-05-31"
+        # Server filters on a list of agent ids, not a single id.
+        assert captured["body"]["agent_ids"] == ["agent-test-456"]
+
+    def test_omits_empty_filters(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds)
+        # No date range and no agent → an empty body, yielding all-time totals.
+        assert captured["body"] == {}
+
+    def test_uses_workspace_token_not_raw_login_token(self, fake_creds, monkeypatch):
+        # /workspace/tasks/analytics is workspace-authenticated (HS256), so it must
+        # send the exchanged workspace token like the other /workspace/tasks calls.
+        # The raw login token is an RS256 access token in prod and gets 401'd there.
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "WS-EXCHANGED")
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["token"] = token
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.fetch_task_analytics(fake_creds)
+        assert captured["token"] == "WS-EXCHANGED"
+
+
+class TestTaskAnalyticsCommand:
+    def test_summary_prints_resolution_rate_and_breakdowns(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: _ANALYTICS)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "total tasks: 10" in out
+        # 6 resolved out of 8 with a known outcome (resolved + escalated) = 75.0%.
+        assert "resolution rate: 75.0%" in out
+        assert "Support Bot" in out and "Sales Bot" in out
+        assert "helpdesk" in out
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: _ANALYTICS)
+        eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["total_tasks"] == 10
+        assert payload["resolution_counts"]["resolved"] == 6
+
+    def test_empty_range_reports_no_tasks(self, fake_creds, monkeypatch, capsys):
+        empty = {"total_tasks": 0, "resolution_counts": {"resolved": 0, "escalated": 0, "pending": 0}}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: empty)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent=None, start_date=None, end_date=None, json=False))
+        assert rc == 0
+        assert "(no tasks in range)" in capsys.readouterr().err
+
+    def test_agent_filter_resolves_before_request(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if "/agents" in url:
+                return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+            captured["body"] = body
+            return _ANALYTICS
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        # A bare name resolves to its agent id before the analytics request.
+        eesel.cmd_tasks(_args(tasks_cmd="analytics", agent="Support Bot", start_date=None, end_date=None, json=False))
+        assert captured["body"]["agent_ids"] == ["agent-test-456"]
+
+    def test_unknown_agent_returns_error(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: [] if "/agents" in url else _ANALYTICS)
+        rc = eesel.cmd_tasks(_args(tasks_cmd="analytics", agent="nope", start_date=None, end_date=None, json=False))
+        assert rc == 1
+        assert "No agent matches" in capsys.readouterr().err
+
+
+class TestTaskExport:
+    def test_export_posts_filters_to_query_params(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.export_tasks(fake_creds, start_date="2026-05-01", end_date="2026-05-31", agent_id="agent-test-456")
+        assert captured["method"] == "POST"
+        # The server reads the date range and agent from the query string.
+        assert captured["url"].startswith("http://localhost:8080/tasks/export?")
+        assert "start_date=2026-05-01" in captured["url"]
+        assert "end_date=2026-05-31" in captured["url"]
+        assert "agent_id=agent-test-456" in captured["url"]
+        # Additional filters travel in the JSON body.
+        assert captured["body"] == {"filters": {}}
+
+    def test_export_no_filters_has_no_query_string(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.export_tasks(fake_creds)
+        assert captured["url"] == "http://localhost:8080/tasks/export"
+
+    def test_command_reports_export_started(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"message": "Export started"})
+        rc = eesel.cmd_tasks(_args(tasks_cmd="export", agent=None, start_date=None, end_date=None))
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "Export started" in captured.out + captured.err
+        assert "emailed" in captured.err
+
+    def test_command_prints_returned_reference(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"message": "Export started", "job_id": "job-123"})
+        eesel.cmd_tasks(_args(tasks_cmd="export", agent=None, start_date=None, end_date=None))
+        assert "job-123" in capsys.readouterr().out
+
+    def test_command_resolves_agent_filter(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if "/agents" in url:
+                return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+            captured["url"] = url
+            return {"message": "Export started"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        eesel.cmd_tasks(_args(tasks_cmd="export", agent="Support Bot", start_date=None, end_date=None))
+        assert "agent_id=agent-test-456" in captured["url"]
+
 
 # ──────────────────────────────────────────────────────────────────────────
-# Integrations / tools / triggers --all  (read-only inspectors)
+# Integrations / tools / triggers list  (read-only inspectors)
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -2348,10 +3911,16 @@ class TestTriggerHelpers:
         assert {r["id"] for r in rows} == {"t1", "t2"}
         assert {r["agent_name"] for r in rows} == {"Bot", "Bot2"}
 
-    def test_fetch_all_scheduled_is_subset(self, fake_creds, monkeypatch):
+    def test_fetch_all_scheduled_jobs_is_subset(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
-        scheduled = eesel.fetch_all_scheduled_triggers(fake_creds)
+        scheduled = eesel.fetch_all_scheduled_jobs(fake_creds)
         assert [t["id"] for t in scheduled] == ["sch-1"]
+
+    def test_fetch_all_event_triggers_excludes_scheduled(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        events = eesel.fetch_all_event_triggers(fake_creds)
+        assert "sch-1" not in {t["id"] for t in events}
+        assert all(t.get("trigger_key") != "eesel_scheduled" for t in events)
 
     def test_one_agent_failure_does_not_blank_list(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
@@ -2511,6 +4080,24 @@ class TestIntegrationsCommand:
         # Secrets stay hidden by default.
         assert "tok-SECRET-xyz" not in cap.out
 
+    def test_list_plain_emits_tab_separated_rows(self, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per integration:
+        # id<TAB>type<TAB>connection<TAB>subdomain. A None id / missing subdomain
+        # renders as an empty field, not the literal "None". The human view's
+        # column padding is absent, confirming the human formatter was bypassed.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        rc = eesel.cmd_integrations(_args(json=False, plain=True, secrets=False))
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Split on newlines only — the last column may be an empty field whose
+        # trailing tab a str.strip() would swallow.
+        lines = out.splitlines()
+        assert lines == [
+            "int-zendesk-1\tzendesk\tFULL\tacme.zendesk.com",
+            "\tai_actions\tFULL\t",
+        ]
+        assert "None" not in out
+
     def test_secrets_revealed_for_sysadmin(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
         monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
@@ -2527,11 +4114,40 @@ class TestIntegrationsCommand:
         assert "tok-SECRET-xyz" not in cap.out
         assert "restricted" in cap.err
 
-    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_json_redacts_secrets_for_non_sysadmin(self, fake_creds, monkeypatch, capsys):
+        # --json goes through the same --secrets+sysadmin gate as the table view,
+        # so a non-sysadmin sees masked tokens but still gets the full structure
+        # (ids, types, non-sensitive properties like subdomain).
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
         eesel.cmd_integrations(_args(json=True, secrets=False))
-        payload = json.loads(capsys.readouterr().out)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
         assert payload[0]["integrationType"] == "zendesk"
+        assert "tok-SECRET-xyz" not in out
+        # The masked entry is present (just its value redacted), and non-secret
+        # properties survive.
+        props = {p["key"]: p["value"] for p in payload[0]["properties"]}
+        assert props["zendesk_conversations_access_token"] == "***"
+        assert props["subdomain"] == "acme"
+
+    def test_json_reveals_secrets_for_sysadmin_with_secrets_flag(self, fake_creds, monkeypatch, capsys):
+        # With --secrets on a sysadmin account, --json emits the raw payload,
+        # tokens included — mirroring the table view's reveal path.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
+        eesel.cmd_integrations(_args(json=True, secrets=True))
+        out = capsys.readouterr().out
+        assert "tok-SECRET-xyz" in out
+
+    def test_json_secrets_flag_denied_for_non_sysadmin_keeps_redaction(self, fake_creds, monkeypatch, capsys):
+        # A non-sysadmin passing --secrets is warned and still gets redacted JSON.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
+        eesel.cmd_integrations(_args(json=True, secrets=True))
+        cap = capsys.readouterr()
+        assert "tok-SECRET-xyz" not in cap.out
+        assert "restricted" in cap.err
 
     def test_empty(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
@@ -2539,21 +4155,528 @@ class TestIntegrationsCommand:
         assert rc == 0
         assert "(no integrations)" in capsys.readouterr().err
 
+    def test_bare_command_defaults_to_list(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        # No integrations_cmd attribute at all → dispatcher falls back to list.
+        rc = eesel.cmd_integrations(_args(json=False, secrets=False))
+        assert rc == 0
+        assert "zendesk" in capsys.readouterr().out
 
-class TestToolsCommand:
+
+class TestIntegrationsAgentScope:
+    """`--agent` overrides the active agent for the whole integrations group."""
+
+    _AGENTS = [
+        {"agent_id": "agent-test-456", "name": "Default Bot"},
+        {"agent_id": "agent-other-789", "name": "Other Bot"},
+    ]
+
+    def test_agent_flag_overrides_active_agent_for_list(self, fake_creds, monkeypatch):
+        # The active agent is agent-test-456; --agent must scope the fetch to the
+        # resolved agent instead, without persisting the change.
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+
+        def fake_fetch(creds, agent_id=None):
+            seen["agent_id"] = agent_id
+            return []
+
+        monkeypatch.setattr(eesel, "fetch_integrations", fake_fetch)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="Other Bot"))
+        assert rc == 0
+        assert seen["agent_id"] == "agent-other-789"
+
+    def test_agent_flag_scopes_add_payload(self, fake_creds, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["body"] = body
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch)
+        rc = eesel.cmd_integrations(
+            _add_args(integrations_cmd="add", key="zendesk", config=None, agent="agent-other-789")
+        )
+        assert rc == 0
+        # The resolved --agent, not the stored active agent, is folded in.
+        assert captured["body"]["agent_id"] == "agent-other-789"
+
+    def test_unknown_agent_errors_before_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+        # If resolution fails the command must abort before touching the network.
+        monkeypatch.setattr(
+            eesel, "fetch_integrations",
+            lambda *a, **k: pytest.fail("should not fetch when --agent is unresolvable"),
+        )
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="nope"))
+        assert rc == 1
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
+    def test_ambiguous_agent_errors_with_candidates(self, fake_creds, monkeypatch, capsys):
+        # Both ids share the "agent-" prefix; a prefix that matches more than one
+        # agent is refused rather than resolved to an arbitrary one.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="list", json=False, secrets=False, agent="agent-"))
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err
+
+
+def _add_args(**kw):
+    """args for `integrations add`/`connect` with token/no-input defaulted off."""
+    kw.setdefault("token", None)
+    kw.setdefault("no_input", False)
+    return _args(**kw)
+
+
+def _stub_status(monkeypatch, status="full", integration_id="int-new-1"):
+    """Stub the post-connect status re-fetch (GET /integrations) so `add` tests
+    don't hit the network. The create response carries no status, so the command
+    reads it back from the workspace integrations."""
+    monkeypatch.setattr(
+        eesel, "fetch_integrations",
+        lambda creds, agent_id=None: [{"id": integration_id, "connectionStatus": status}],
+    )
+
+
+class TestIntegrationsAdd:
+    def test_posts_config_as_setup_payload_with_active_agent(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = body
+            return 201, {"integration_id": "int-new-1", "identifier": "acme.zendesk.com"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "full")
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config='{"subdomain": "acme"}'))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/integrations/zendesk"
+        # The user's config plus the active agent id are sent as the setup payload.
+        assert captured["body"]["subdomain"] == "acme"
+        assert captured["body"]["agent_id"] == "agent-test-456"
+        out = capsys.readouterr()
+        assert "int-new-1" in out.err
+        # The re-fetched connection status is "full", so report it as connected.
+        assert "✓ Connected 'zendesk'" in out.err
+
+    def test_connect_alias_routes_to_add(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["url"] = url
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "full")
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="connect", key="zendesk", config=None))
+        assert rc == 0
+        assert captured["url"] == "http://localhost:8080/integrations/zendesk"
+
+    def test_unreadable_status_with_token_reports_unverified_not_connected(self, fake_creds, monkeypatch, capsys):
+        # The token is folded into the payload, but when the status can't be read
+        # back (no matching integration returned) a supplied token is not proof of
+        # a live connection — the server may have stored a bad token. Report the
+        # integration as created with an unverified status rather than "Connected".
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["body"] = body
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None, token="tok-headless"))
+        assert rc == 0
+        # The token is still folded into the payload for the headless connect path.
+        assert captured["body"]["access_token"] == "tok-headless"
+        err = capsys.readouterr().err
+        assert "✓ Connected" not in err
+        assert "connection status could not be verified" in err
+
+    def test_unreadable_status_without_token_reports_unverified(self, fake_creds, monkeypatch, capsys):
+        # With no token and an unreadable status, the command must not fall through
+        # to a bare "Connected" — it reports created-but-unverified.
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "int-new-1"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None))
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "✓ Connected" not in err
+        assert "connection status could not be verified" in err
+
+    def test_no_input_fails_when_connection_is_not_full(self, fake_creds, monkeypatch, capsys):
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "int-2"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "partial", integration_id="int-2")
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="hubspot", config=None, no_input=True))
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "--no-input" in err
+        # It steers the user to the headless path instead of a browser flow.
+        assert "--token" in err
+
+    def test_surfaces_server_400_guidance(self, fake_creds, monkeypatch, capsys):
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 400, {"error": "Invalid credentials for integration 'zendesk'", "details": "subdomain is required"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config=None))
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "Invalid credentials for integration 'zendesk'" in err
+        assert "subdomain is required" in err
+
+    def test_prints_authorize_url_when_not_connected(self, fake_creds, monkeypatch, capsys):
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "int-2", "identifier": "acme"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "partial", integration_id="int-2")
+        monkeypatch.setattr(
+            eesel, "_oauth_authorize_url",
+            lambda creds, key, identifier: f"https://dashboard.eesel.ai/api/integrations/{key}/oauth/start?zendeskSubdomain={identifier}",
+        )
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config='{"subdomain": "acme"}'))
+        err = capsys.readouterr().err
+        assert rc == 0
+        # Partial means the integration is a credential-less shell, not connected.
+        # The output must not claim success, and must point at the live OAuth URL.
+        assert "✓ Connected" not in err
+        assert "not yet connected" in err
+        assert "https://dashboard.eesel.ai/api/integrations/zendesk/oauth/start?zendeskSubdomain=acme" in err
+
+    def test_status_none_reports_connected_not_oauth_pending(self, fake_creds, monkeypatch, capsys):
+        # Some connectors have no auth concept and sit at "none" when working
+        # (e.g. website crawls). "none" must report as connected, not trigger the
+        # OAuth-pending path — only "partial" means set-up-but-not-authorized.
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            return 201, {"integration_id": "web-1", "identifier": "example.com"}
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        _stub_status(monkeypatch, "none", integration_id="web-1")
+        monkeypatch.setattr(eesel, "_oauth_authorize_url", lambda *a, **k: pytest.fail("must not seek OAuth for a 'none' connector"))
+        rc = eesel.cmd_integrations(_add_args(integrations_cmd="add", key="website", config='{"website_url": "https://example.com"}'))
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert "✓ Connected 'website'" in err
+        assert "not yet connected" not in err
+
+    def test_oauth_authorize_url_learns_identifier_param_from_definition(self, fake_creds, monkeypatch):
+        # The OAuth-start endpoint comes from the connection option whose
+        # handler_type is "redirect". Its identifier parameter name is integration-
+        # specific, so it's learned from another option that templates the
+        # identifier as `<param>={{integrationIdentifier}}`. The path is resolved
+        # against the dashboard host (not the API host) and the active agent id
+        # is appended.
+        definition = {
+            "integration": {
+                "connection_options": [
+                    {"type": "quick_start", "handler_type": "submit", "endpoint": "/integrations/zendesk/quick_start"},
+                    {"type": "oauth", "handler_type": "redirect", "endpoint": "/api/integrations/zendesk/oauth/start?createIntegration=true"},
+                    {"type": "messenger", "handler_type": "redirect", "endpoint": "/api/integrations/zendesk-conversations/oauth/start?zendeskSubdomain={{integrationIdentifier}}&agentId={{agentId}}"},
+                ]
+            }
+        }
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **kw: definition)
+        url = eesel._oauth_authorize_url(fake_creds, "zendesk", "acme")
+        # Dashboard host, the oauth/start endpoint, the learned identifier param,
+        # the preserved createIntegration flag, and the active agent id.
+        assert url.startswith("http://localhost:3000/api/integrations/zendesk/oauth/start?")
+        assert "zendeskSubdomain=acme" in url
+        assert "createIntegration=true" in url
+        assert "agentId=agent-test-456" in url
+        # Unresolved template params from the messenger option must not leak in.
+        assert "{{" not in url
+
+    def test_connection_status_after_connect_reads_back_status(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "fetch_integrations",
+            lambda creds, agent_id=None: [
+                {"id": "other", "connectionStatus": "full"},
+                {"id": "int-2", "connectionStatus": "partial"},
+            ],
+        )
+        assert eesel._connection_status_after_connect(fake_creds, "int-2") == "partial"
+        # No matching id → None, so the caller falls back to payload inference.
+        assert eesel._connection_status_after_connect(fake_creds, "missing") is None
+
+    def test_invalid_config_json_exits(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("should not POST on bad JSON"))
+        with pytest.raises(SystemExit):
+            eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config="{not json"))
+
+    def test_config_must_be_object(self, fake_creds):
+        with pytest.raises(SystemExit):
+            eesel.cmd_integrations(_add_args(integrations_cmd="add", key="zendesk", config="[1, 2, 3]"))
+
+
+class TestIntegrationsSync:
+    def test_posts_sync_type_for_resolved_integration(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = body
+            return 202, {"message": "sync triggered"}
+
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_request)
+        # Resolve by integration type "zendesk" → its id int-zendesk-1.
+        rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="zendesk", type="tickets"))
+        assert rc == 0
+        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1/trigger-sync"
+        assert captured["body"] == {"sync_type": "tickets"}
+        assert "sync triggered" in capsys.readouterr().err
+
+    def test_rejects_unknown_sync_type(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("should not POST"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="zendesk", type="everything"))
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Invalid --type" in err
+        assert "help-center" in err
+
+    def test_unresolvable_id_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="nope", type="macros"))
+        assert rc == 1
+        assert "No connected integration matches" in capsys.readouterr().err
+
+    def test_skipped_when_already_in_progress(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(
+            eesel,
+            "http_request_allow_error",
+            lambda *a, **k: (200, {"skipped": True, "reason": "a 'tickets' sync is already in progress for this integration", "existing_run_id": "run-9"}),
+        )
+        rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="int-zendesk-1", type="tickets"))
+        assert rc == 0
+        assert "already in progress" in capsys.readouterr().err
+
+    def test_surfaces_server_error(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(
+            eesel,
+            "http_request_allow_error",
+            lambda *a, **k: (400, {"error": "only zendesk integrations support trigger-sync"}),
+        )
+        rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="int-zendesk-1", type="tickets"))
+        assert rc == 1
+        assert "only zendesk integrations support trigger-sync" in capsys.readouterr().err
+
+
+class TestIntegrationsShow:
+    def test_shows_detail_with_connection_and_sync_status(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            return "Triggered Sync"
+
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", fake_request)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="show", id="int-zendesk-1", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Sync status is fetched from the per-integration sync endpoint.
+        assert captured["method"] == "GET"
+        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1/sync"
+        assert "zendesk" in out
+        assert "FULL" in out  # connection status as a field
+        assert "Triggered Sync" in out  # sync status as a field
+
+    def test_unresolvable_id_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="show", id="missing", json=False))
+        assert rc == 1
+        assert "No connected integration matches" in capsys.readouterr().err
+
+    def test_sync_status_unsupported_degrades_gracefully(self, fake_creds, monkeypatch, capsys):
+        # Connectors that don't support triggered syncs error on the sync GET;
+        # `show` swallows that and reports no sync status rather than failing.
+        def boom(*a, **k):
+            raise SystemExit("GET .../sync → 400")
+
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", boom)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="show", id="int-zendesk-1", json=False))
+        assert rc == 0
+        assert "FULL" in capsys.readouterr().out
+
+    def test_json_includes_sync_status(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: "running")
+        eesel.cmd_integrations(_args(integrations_cmd="show", id="int-zendesk-1", json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["integrationType"] == "zendesk"
+        assert payload["syncStatus"] == "running"
+
+    def test_json_redacts_secrets(self, fake_creds, monkeypatch, capsys):
+        # `show` has no --secrets flag, so its --json output always masks tokens.
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: "running")
+        eesel.cmd_integrations(_args(integrations_cmd="show", id="int-zendesk-1", json=True))
+        out = capsys.readouterr().out
+        assert "tok-SECRET-xyz" not in out
+        props = {p["key"]: p["value"] for p in json.loads(out)["properties"]}
+        assert props["zendesk_conversations_access_token"] == "***"
+
+
+class TestIntegrationsRemove:
+    def test_removes_resolved_integration_with_force(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake_request(method, url, *, token=None, body=None, timeout=60):
+            captured["method"] = method
+            captured["url"] = url
+            return {}
+
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", fake_request)
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
+        assert "Disconnected" in capsys.readouterr().err
+
+    def test_disconnect_alias_routes_to_remove(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        rc = eesel.cmd_integrations(_args(integrations_cmd="disconnect", id="int-zendesk-1", force=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
+
+    def test_prompts_and_aborts_on_no(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE when aborted"))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="int-zendesk-1", force=False))
+        assert rc == 1
+        assert "Aborted" in capsys.readouterr().err
+
+    def test_unresolvable_id_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an unknown id"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="nope", force=True))
+        assert rc == 1
+        assert "No connected integration matches" in capsys.readouterr().err
+
+    def test_ambiguous_type_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two integrations of the same type: `remove zendesk` must refuse and
+        # list candidates rather than disconnect an arbitrary one.
+        rows = [
+            {"id": "int-zd-1", "integrationType": "zendesk", "identifier": "acme"},
+            {"id": "int-zd-2", "integrationType": "zendesk", "identifier": "beta"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: rows)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous integration"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "int-zd-1" in out and "int-zd-2" in out
+
+
+class TestResolveIntegration:
+    def test_matches_by_exact_id_then_prefix_then_type(self):
+        rows = [
+            {"id": "int-abc-123", "integrationType": "zendesk"},
+            {"id": "int-def-456", "integrationType": "intercom"},
+        ]
+        assert eesel.resolve_integration(rows, "int-abc-123")["integrationType"] == "zendesk"
+        assert eesel.resolve_integration(rows, "int-def")["integrationType"] == "intercom"
+        assert eesel.resolve_integration(rows, "zendesk")["id"] == "int-abc-123"
+        assert eesel.resolve_integration(rows, "nope") is None
+
+    def test_strict_refuses_ambiguous_type_and_lists_candidates(self, capsys):
+        # Two integrations of the same type: the strict (destructive) resolver
+        # must refuse rather than disconnect an arbitrary one.
+        rows = [
+            {"id": "int-zd-1", "integrationType": "zendesk", "identifier": "acme"},
+            {"id": "int-zd-2", "integrationType": "zendesk", "identifier": "beta"},
+        ]
+        assert eesel.resolve_integration_strict(rows, "zendesk") is None
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "int-zd-1" in out and "int-zd-2" in out
+
+    def test_strict_returns_unique_match(self):
+        rows = [
+            {"id": "int-abc-123", "integrationType": "zendesk"},
+            {"id": "int-def-456", "integrationType": "intercom"},
+        ]
+        assert eesel.resolve_integration_strict(rows, "zendesk")["id"] == "int-abc-123"
+
+
+class TestHttpRequestAllowError:
+    def test_returns_status_and_parsed_body_on_error(self, monkeypatch):
+        import urllib.error
+        import io
+
+        def raise_http_error(*a, **k):
+            raise urllib.error.HTTPError(
+                url="http://x/integrations/zendesk",
+                code=400,
+                msg="Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(b'{"error": "subdomain is required"}'),
+            )
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", raise_http_error)
+        status, body = eesel.http_request_allow_error("POST", "http://x/integrations/zendesk", token="t", body={})
+        assert status == 400
+        assert body["error"] == "subdomain is required"
+
+
+class TestIntegrationActionsList:
+    """`eesel integrations <integration> actions list` (and show)."""
+
     def _agents(self):
         return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
 
-    def test_lists_active_agent_tools(self, fake_creds, monkeypatch, capsys):
+    def test_lists_actions_scoped_to_integration(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         out = capsys.readouterr().out
         assert rc == 0
+        # Only the zendesk action is shown; the ai_actions doc_search is filtered out.
         assert "Leave internal note" in out and "WRITE" in out and "ask" in out
-        assert "Search docs" in out and "READ" in out and "always_allow" in out
-        # integration column shows the resolved key.
-        assert "zendesk" in out
+        assert "Search docs" not in out
+
+    def test_list_shows_tool_key_column(self, fake_creds, monkeypatch, capsys):
+        # The key the write verbs (show/enable/disable/set) require must be
+        # visible in the table, not only under --json.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
+        cap = capsys.readouterr()
+        assert "zendesk_leave_internal_note" in cap.out
+        assert "key" in cap.err  # header line goes to stderr
+
+    def test_show_resolves_display_name(self, fake_creds, monkeypatch, capsys):
+        # `show` accepts the human display name, not just the tool_key.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="Leave internal note", agent=None, json=False))
+        cap = capsys.readouterr()
+        assert rc == 0
+        assert "zendesk_leave_internal_note" in (cap.out + cap.err)
 
     def test_resolves_named_agent(self, fake_creds, monkeypatch, capsys):
         captured = {}
@@ -2566,7 +4689,7 @@ class TestToolsCommand:
             return []
 
         monkeypatch.setattr(eesel, "fetch_tools", fake_tools)
-        eesel.cmd_tools(_args(agent="Sales Bot", json=False))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent="Sales Bot", json=False))
         assert captured["aid"] == "agent-other-999"
 
     def test_no_active_agent_errors(self, fake_creds, monkeypatch, capsys):
@@ -2576,71 +4699,103 @@ class TestToolsCommand:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
             {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Bot2"}])
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: pytest.fail("should not fetch"))
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         assert rc == 1
         assert "No active agent" in capsys.readouterr().err
 
-    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_json_emits_scoped_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
-        eesel.cmd_tools(_args(agent=None, json=True))
+        eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=True))
         payload = json.loads(capsys.readouterr().out)
-        assert payload[0]["tool_key"] == "zendesk_leave_internal_note"
+        # Filtered to the named integration.
+        assert [t["tool_key"] for t in payload] == ["zendesk_leave_internal_note"]
 
-    def test_empty_tools(self, fake_creds, monkeypatch, capsys):
+    def test_empty_actions(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: [])
-        rc = eesel.cmd_tools(_args(agent=None, json=False))
+        rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         assert rc == 0
-        assert "no tools" in capsys.readouterr().err
+        assert "no 'zendesk' actions" in capsys.readouterr().err
+
+    def test_show_one_action(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="zendesk_leave_internal_note", agent=None, json=False))
+        cap = capsys.readouterr()
+        combined = cap.out + cap.err
+        assert rc == 0
+        assert "Leave internal note" in combined and "int-zendesk-1" in combined and "ask" in combined
+
+    def test_show_missing_action_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="show", integration="zendesk", action="nope", agent=None, json=False))
+        assert rc == 1
+        assert "No 'nope' action" in capsys.readouterr().err
 
 
-class TestTriggersAll:
-    def test_all_groups_scheduled_on_top_then_by_integration(self, fake_creds, monkeypatch, capsys):
+class TestTriggersList:
+    """`eesel triggers list` shows event/webhook triggers only, grouped by
+    integration. Scheduled jobs are excluded — they live under `eesel
+    schedules`."""
+
+    def test_list_groups_event_triggers_by_integration(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert rc == 0
-        # scheduled group renders first, with the existing cron/title format.
-        assert "scheduled (1)" in out and "Heartbeat" in out and "cron=0 9 * * *" in out
+        # The scheduled job is not part of the triggers view.
+        assert "scheduled" not in out and "Heartbeat" not in out
         # zendesk group (resolved via integration map) + intercom (prefix fallback).
         assert "zendesk (1)" in out and "zendesk_ticket_created" in out and "WEBHOOK" in out
         assert "intercom (1)" in out and "intercom_conversation_replied" in out
-        # config shown inline for non-scheduled triggers.
+        # config shown inline for event triggers.
         assert '"foo": "bar"' in out
-        assert out.index("scheduled (1)") < out.index("zendesk (1)")
 
-    def test_all_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+    def test_list_json_emits_raw_event_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
         monkeypatch.setattr(eesel, "fetch_integrations", lambda *a, **k: pytest.fail("json path must not fetch integrations"))
-        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=True))
+        eesel.cmd_triggers(_args(triggers_cmd="list", json=True))
         payload = json.loads(capsys.readouterr().out)
-        assert {t["id"] for t in payload} == {"sch-1", "zd-1", "ic-1"}
+        # Only event triggers — the scheduled job (sch-1) is excluded.
+        assert {t["id"] for t in payload} == {"zd-1", "ic-1"}
 
-    def test_all_degrades_when_integrations_unreachable(self, fake_creds, monkeypatch, capsys):
+    def test_list_plain_emits_tab_separated_rows(self, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per event
+        # trigger: id<TAB>state<TAB>trigger_key<TAB>agent. The integration
+        # grouping headers and config blobs of the human view are absent,
+        # confirming the human formatter was bypassed.
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda *a, **k: pytest.fail("plain path must not fetch integrations"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", json=False, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert set(lines) == {
+            "zd-1\ton\tzendesk_ticket_created\tBot",
+            "ic-1\ton\tintercom_conversation_replied\tBot",
+        }
+        # No grouping headers and no inline config from the human view.
+        assert "zendesk (1)" not in out and "config:" not in out
+
+    def test_list_degrades_when_integrations_unreachable(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
 
         def boom(*a, **k):
             raise SystemExit("GET /integrations → 401")
 
         monkeypatch.setattr(eesel, "fetch_integrations", boom)
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert rc == 0
         # zendesk integration_id can't be resolved to a type → prefix label used.
         assert "zendesk (1)" in out and "intercom (1)" in out
 
-    def test_default_list_still_scheduled_only(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
-        rc = eesel.cmd_triggers(_args(triggers_cmd="list", all=False, json=False))
-        out = capsys.readouterr().out
-        assert rc == 0
-        assert "Heartbeat" in out
-        # Non-scheduled triggers are not listed by the default view.
-        assert "zendesk_ticket_created" not in out
-
-    def test_all_redacts_secrets_in_config(self, fake_creds, monkeypatch, capsys):
+    def test_list_redacts_secrets_in_config(self, fake_creds, monkeypatch, capsys):
         triggers = [{
             "id": "ic-1", "type": "WEBHOOK", "trigger_key": "intercom_conversation_replied",
             "config": {"access_token": "tok-LEAK", "app_id": "abc"},
@@ -2648,8 +4803,1782 @@ class TestTriggersAll:
         }]
         monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: triggers)
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: [])
-        eesel.cmd_triggers(_args(triggers_cmd="list", all=True, json=False))
+        eesel.cmd_triggers(_args(triggers_cmd="list", json=False))
         out = capsys.readouterr().out
         assert "tok-LEAK" not in out
         assert '"access_token": "***"' in out
         assert "abc" in out  # non-secret config still shown
+
+
+class TestSchedulesList:
+    def test_list_shows_scheduled_jobs_only(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="list", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Heartbeat" in out and "cron=0 9 * * *" in out
+        # Event triggers are not listed by the schedules view.
+        assert "zendesk_ticket_created" not in out
+
+    def test_list_json_emits_scheduled_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        eesel.cmd_schedules(_args(schedules_cmd="list", json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert {t["id"] for t in payload} == {"sch-1"}
+
+    def test_list_empty_hints_at_add(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: [])
+        rc = eesel.cmd_schedules(_args(schedules_cmd="list", json=False))
+        assert rc == 0
+        assert "no scheduled jobs" in capsys.readouterr().err
+
+
+class TestTriggersRegistry:
+    _REGISTRY = [
+        {"trigger_id": "eesel_scheduled", "integration_key": "eesel", "name": "Scheduled", "description": "Run on a cron schedule"},
+        {"trigger_id": "zendesk_ticket_created", "integration_key": "zendesk", "name": "Ticket created", "description": "A new ticket"},
+    ]
+
+    def test_registry_calls_endpoint_and_lists_keys(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"] = method, url
+            return {"triggers": list(self._REGISTRY)}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="registry", json=False))
+        assert rc == 0
+        assert captured["method"] == "GET"
+        assert captured["url"] == "http://localhost:8080/triggers/registry"
+        cap = capsys.readouterr()
+        # The registry's trigger_id is the key the user passes to `add --key`.
+        assert "zendesk_ticket_created" in cap.out
+        # The scheduled-job type is filtered out — it's created via `eesel schedules add`.
+        assert "eesel_scheduled" not in cap.out
+
+    def test_registry_json_excludes_scheduled_type(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"triggers": list(self._REGISTRY)})
+        rc = eesel.cmd_triggers(_args(triggers_cmd="registry", json=True))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        # Only event trigger types; the scheduled-job sentinel is filtered out.
+        assert {t["trigger_id"] for t in payload} == {"zendesk_ticket_created"}
+
+    def test_registry_empty(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"triggers": []})
+        rc = eesel.cmd_triggers(_args(triggers_cmd="registry", json=False))
+        assert rc == 0
+        assert "no trigger types" in capsys.readouterr().err
+
+
+class TestTriggersAdd:
+    def _agents(self):
+        return [{"agent_id": "agent-test-456", "name": "Support Bot", "agent_type": "support"}]
+
+    def test_add_posts_trigger_key_and_config(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"trigger": {"id": "trg-new-1", "trigger_key": "zendesk_ticket_created"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='{"foo": "bar"}'))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
+        assert captured["body"] == {"trigger_key": "zendesk_ticket_created", "config": {"foo": "bar"}}
+        err_out = capsys.readouterr().err
+        assert "trg-new-1" in err_out
+
+    def test_add_defaults_config_to_empty_object(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return {"trigger": {"id": "trg-new-2"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="agent-test-456", key="public_chat", config=None))
+        assert rc == 0
+        # Server rejects a null config, so an omitted --config must become {}.
+        assert captured["body"] == {"trigger_key": "public_chat", "config": {}}
+
+    def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="nope", key="zendesk_ticket_created", config=None))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config="{not json"))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_add_non_object_config_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="add", agent="Support Bot", key="zendesk_ticket_created", config='["a", "b"]'))
+        assert rc == 1
+        assert sent["called"] is False
+
+
+class TestTriggersShow:
+    def test_show_finds_trigger_by_id(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "zd-1" in out
+        assert "zendesk_ticket_created" in out
+        assert "WEBHOOK" in out
+
+    def test_show_resolves_by_id_prefix(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="ic", json=False))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "intercom_conversation_replied" in out
+
+    def test_show_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=True))
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["id"] == "zd-1"
+
+    def test_show_redacts_secrets(self, fake_creds, monkeypatch, capsys):
+        triggers = [{
+            "id": "zd-1", "type": "WEBHOOK", "trigger_key": "zendesk_ticket_created",
+            "config": {"access_token": "tok-LEAK", "app_id": "abc"},
+            "integration_id": None, "agent_id": "a1", "agent_name": "Bot",
+        }]
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: triggers)
+        eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="zd-1", json=False))
+        out = capsys.readouterr().out
+        assert "tok-LEAK" not in out and '"access_token": "***"' in out
+
+    def test_show_unknown_id_errors(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_all_triggers", lambda creds: list(_ALL_TRIGGERS))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="show", trigger_id="nope", json=False))
+        assert rc == 1
+        assert "No event/webhook trigger matches" in capsys.readouterr().err
+
+
+class TestTriggersRemove:
+    # `remove` resolves its id argument (full id or prefix) against the
+    # workspace-wide trigger list before issuing the DELETE, so each test seeds
+    # that list with the row it targets.
+    def _seed(self, monkeypatch, *ids):
+        rows = [{"id": i, "trigger_key": "eesel", "agent_name": "A"} for i in ids]
+        monkeypatch.setattr(eesel, "fetch_all_event_triggers", lambda creds: rows)
+
+    def test_remove_with_force_skips_confirm(self, fake_creds, monkeypatch, capsys):
+        self._seed(monkeypatch, "trg-1")
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"] = method, url
+            return {"message": "Trigger removed"}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--force must skip confirm"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-1", force=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/triggers/trg-1"
+        assert "Removed trigger trg-1" in capsys.readouterr().err
+
+    def test_remove_prompts_and_proceeds_on_yes(self, fake_creds, monkeypatch):
+        self._seed(monkeypatch, "trg-2")
+        captured = {}
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-2", force=False))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/trg-2"}
+
+    def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
+        self._seed(monkeypatch, "trg-3")
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-3", force=False))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_remove_resolves_prefix_to_full_id(self, fake_creds, monkeypatch):
+        # A prefix resolves to the full id client-side; the DELETE carries the
+        # full id, never the raw prefix (which the server has no row for → 500).
+        self._seed(monkeypatch, "trg-aaaa-1111", "trg-bbbb-2222")
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-aaaa", force=True))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/triggers/trg-aaaa-1111")
+
+    def test_remove_unknown_id_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        self._seed(monkeypatch, "trg-aaaa-1111")
+        calls = _capture_requests(monkeypatch)
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="nope", force=True))
+        assert rc == 1
+        assert calls == []  # no DELETE fired for a non-matching id
+        assert "No event/webhook trigger matches" in capsys.readouterr().err
+
+    def test_remove_ambiguous_prefix_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two triggers whose ids share the given prefix: removing must refuse and
+        # list the candidates rather than delete an arbitrary first match. This is
+        # the same strict-resolution guard the destructive schedules/agents/mcp
+        # paths use; --force does not override it.
+        self._seed(monkeypatch, "trg-shared-1111", "trg-shared-2222")
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous trigger"))
+        rc = eesel.cmd_triggers(_args(triggers_cmd="remove", trigger_id="trg-shared", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "trg-shared-1111" in out and "trg-shared-2222" in out
+
+
+class TestSchedulesFire:
+    def _match(self):
+        return {"id": "sch-1", "agent_name": "Support Bot", "config": {"title": "Heartbeat"}}
+
+    def test_fire_fires_scheduled_job(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"] = method, url
+            return {"scheduled_at": "2026-06-24T09:00:00+00:00", "external_reference": "schedule_sch-1_x"}
+
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="heartbeat"))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/triggers/sch-1/fire"
+        assert "Fired 'Heartbeat'" in capsys.readouterr().err
+
+    def test_run_alias_still_fires(self, fake_creds, monkeypatch, capsys):
+        # `run` is a backward-compat alias for `fire`.
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: self._match())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
+        rc = eesel.cmd_schedules(_args(schedules_cmd="run", job="heartbeat"))
+        assert rc == 0
+        assert "Fired 'Heartbeat'" in capsys.readouterr().err
+
+    def test_fire_no_match_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: None)
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="nope"))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_fire_ambiguous_job_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # A title substring matching two jobs must refuse and list candidates
+        # rather than fire an arbitrary first match.
+        jobs = [
+            {"id": "sch-aa", "config": {"title": "Daily report"}, "agent_name": "Bot"},
+            {"id": "sch-bb", "config": {"title": "Weekly report"}, "agent_name": "Bot"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: jobs)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not fire an ambiguous job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="fire", job="report"))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "sch-aa" in out and "sch-bb" in out
+
+
+class TestSchedulesAdd:
+    def _agents(self):
+        return [{"agent_id": "agent-test-456", "name": "Support Bot", "agent_type": "support"}]
+
+    def test_add_builds_config_from_flags_and_sends_scheduled_key(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"], captured["url"], captured["body"] = method, url, body
+            return {"trigger": {"id": "sch-new-1"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel.cmd_schedules(_args(
+            schedules_cmd="add", agent="Support Bot",
+            cron="0 9 * * *", prompt="Send the morning digest",
+            title="Morning digest", timezone="Europe/London", config=None,
+        ))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/triggers"
+        assert captured["body"] == {
+            "trigger_key": "eesel_scheduled",
+            "config": {
+                "cron": "0 9 * * *", "prompt": "Send the morning digest",
+                "title": "Morning digest", "timezone": "Europe/London",
+            },
+        }
+        assert "sch-new-1" in capsys.readouterr().err
+
+    def test_add_flags_win_over_config_json(self, fake_creds, monkeypatch):
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["body"] = body
+            return {"trigger": {"id": "sch-new-2"}}
+
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", fake)
+        # --config sets cron, but the dedicated --cron flag must override it.
+        rc = eesel.cmd_schedules(_args(
+            schedules_cmd="add", agent="agent-test-456",
+            cron="30 8 * * 1", prompt="Weekly review", title=None, timezone=None,
+            config='{"cron": "0 0 * * *", "extra": "kept"}',
+        ))
+        assert rc == 0
+        assert captured["body"]["config"]["cron"] == "30 8 * * 1"
+        assert captured["body"]["config"]["prompt"] == "Weekly review"
+        assert captured["body"]["config"]["extra"] == "kept"
+
+    def test_add_unknown_agent_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="add", agent="nope", cron="0 9 * * *", title=None, timezone=None, config=None))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_add_invalid_json_config_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="add", agent="Support Bot", cron="0 9 * * *", title=None, timezone=None, config="{not json"))
+        assert rc == 1
+        assert sent["called"] is False
+
+
+class TestSchedulesRemove:
+    def test_remove_with_force_skips_confirm(self, fake_creds, monkeypatch, capsys):
+        captured = {}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-1", "config": {"title": "Daily"}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        monkeypatch.setattr(eesel, "confirm", lambda *a, **k: pytest.fail("--force must skip confirm"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-1", force=True))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-1"}
+        assert "Removed scheduled job sch-1" in capsys.readouterr().err
+
+    def test_remove_aborts_when_not_confirmed(self, fake_creds, monkeypatch):
+        sent = {"called": False}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-2", "config": {}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: sent.__setitem__("called", True))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="sch-2", force=False))
+        assert rc == 1
+        assert sent["called"] is False
+
+    def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-3", "config": {}, "agent_name": "Bot"})
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
+        rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", force=True))
+        assert rc == 0
+        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-3"}
+
+    def test_remove_unmatched_job_errors_cleanly(self, fake_creds, monkeypatch, capsys):
+        # A non-matching value (e.g. a title with a space) must NOT be sent to the
+        # server verbatim — it is resolved first, so an unmatched job is a clean
+        # error, never an unhandled URL-construction exception.
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: [])
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not call the server on an unmatched job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="No Such Job", force=True))
+        assert rc == 1
+        assert "No scheduled job matches 'No Such Job'" in capsys.readouterr().err
+
+    def test_remove_ambiguous_job_refuses_without_request(self, fake_creds, monkeypatch, capsys):
+        # Two jobs whose titles both contain the target: removing must refuse and
+        # list the candidates rather than delete an arbitrary first match.
+        jobs = [
+            {"id": "sch-aa", "config": {"title": "Daily report"}, "agent_name": "Bot"},
+            {"id": "sch-bb", "config": {"title": "Weekly report"}, "agent_name": "Bot"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: jobs)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE an ambiguous job"))
+        rc = eesel.cmd_schedules(_args(schedules_cmd="remove", job="report", force=True))
+        assert rc == 1
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "sch-aa" in out and "sch-bb" in out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Skills
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_SKILLS_AGENTS = [
+    {"agent_id": "agent-abc123", "name": "Support Bot"},
+    {"agent_id": "agent-def456", "name": "Blog Writer"},
+]
+
+
+def _capture_skill_requests(monkeypatch, response=None):
+    """Recorder for skills tests — same write/read-back simulation as
+    `_capture_requests`, but a write with no recorded read-back falls back to the
+    skills endpoints' `{"status": "ok"}` shape instead of an agent stub."""
+    return _capture_requests(monkeypatch, response, default={"status": "ok"})
+
+
+def _skills_parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestSkillsList:
+    def test_list_shows_all_skills_with_status_column(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            assert method == "GET"
+            # Must ask for every installed skill, not just the enabled ones.
+            assert "/agents/agent-abc123/skills" in url
+            assert "filter=all" in url
+            return [
+                {"id": "triage", "name": "Triage", "description": "Sort tickets", "enabled": True},
+                {"id": "summarize", "name": "Summarize", "description": "Recap threads", "enabled": False},
+            ]
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "Support Bot"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        # Disabled skills are listed too, with their state shown as a column.
+        assert "triage" in out and "[on]" in out
+        assert "summarize" in out and "[off]" in out
+
+    def test_list_uses_env_agent_when_positional_omitted(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setenv("EESEL_AGENT", "agent-abc123")
+        captured = {}
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return []
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list"))
+        assert rc == 0
+        assert "/agents/agent-abc123/skills" in captured["url"]
+
+    def test_list_no_agent_and_no_env_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list"))
+        assert rc == 1
+        assert calls == []
+        assert "No agent given" in capsys.readouterr().err
+
+    def test_list_empty_prints_hint(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [])
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123"))
+        assert rc == 0
+        assert "no skills installed" in capsys.readouterr().err
+
+
+class TestSkillsAvailable:
+    """`skills available` lists the marketplace catalog an agent can install
+    from — the ids `skills add` accepts, so a valid <skill_id> is discoverable
+    without leaving the CLI."""
+
+    def test_available_requests_available_filter_and_lists_ids(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        captured = {}
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["url"] = url
+            return [
+                {"id": "simulation", "name": "Simulate", "description": "Run past tickets"},
+                {"id": "translation", "name": "Translate", "description": "Localize replies"},
+            ]
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        rc = eesel.cmd_skills(_skills_parse("skills", "available", "agent-abc123"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "filter=available" in captured["url"]  # the catalog, not installed
+        assert "simulation" in out and "translation" in out
+
+    def test_available_plain_emits_id_and_name(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [{"id": "simulation", "name": "Simulate"}])
+        rc = eesel.cmd_skills(_skills_parse("skills", "available", "agent-abc123", "--plain"))
+        assert rc == 0
+        assert "simulation\tSimulate" in capsys.readouterr().out
+
+    def test_list_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        payload = [{"id": "triage", "name": "Triage", "description": "Sort", "enabled": True}]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: payload)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123", "--json"))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: [
+                {"id": "triage", "name": "Triage", "enabled": True},
+                {"id": "summarize", "name": "Summarize", "enabled": False},
+            ],
+        )
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123", "--plain"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "triage\ton\tTriage" in out
+        assert "summarize\toff\tSummarize" in out
+
+    def test_list_unknown_agent_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "ghost"))
+        assert rc == 1
+        # fetch_agents was stubbed; no skills request should have fired.
+        assert calls == []
+        assert "No agent matches" in capsys.readouterr().err
+
+
+class TestSkillsShow:
+    def test_show_prints_matching_skill(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(
+            eesel,
+            "http_request",
+            lambda *a, **k: [
+                {"id": "triage", "name": "Triage", "enabled": True},
+                {"id": "summarize", "name": "Summarize", "enabled": False},
+            ],
+        )
+        rc = eesel.cmd_skills(_skills_parse("skills", "show", "agent-abc123", "summarize"))
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert out["id"] == "summarize" and out["enabled"] is False
+
+    def test_show_unknown_skill_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [{"id": "triage"}])
+        rc = eesel.cmd_skills(_skills_parse("skills", "show", "agent-abc123", "ghost"))
+        assert rc == 1
+        assert "No skill 'ghost'" in capsys.readouterr().err
+
+
+class TestSkillsAdd:
+    def test_add_posts_empty_body(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch, response={"agent_id": "agent-abc123", "skill_id": "triage"})
+        rc = eesel.cmd_skills(_skills_parse("skills", "add", "agent-abc123", "triage"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage")
+        assert calls[0]["body"] == {}
+        err = capsys.readouterr().err
+        assert "Installed skill 'triage'" in err
+        assert "eesel skills list" in err  # readback hint
+
+    def test_add_resolves_agent_by_name(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "add", "Blog Writer", "triage"))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/agents/agent-def456/skills/triage")
+
+
+class TestSkillsRemove:
+    def test_yes_flag_skips_prompt_and_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "remove", "agent-abc123", "triage", "-f"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage")
+
+    def test_affirmative_confirmation_deletes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "remove", "agent-abc123", "triage"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(_skills_parse("skills", "remove", "agent-abc123", "triage"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestSkillsEdit:
+    def test_set_patches_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `set` is canonical; it PATCHes (merges) the config so a partial write
+        # doesn't drop the skill's other keys.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(
+            _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3}')
+        )
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
+        assert calls[0]["body"] == {"threshold": 3}
+
+    def test_set_does_not_send_a_replacing_put(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Guard against a regression to PUT, which replaces the whole config and
+        # would silently drop fields the user didn't pass.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        eesel.cmd_skills(
+            _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3}')
+        )
+        assert all(c["method"] != "PUT" for c in calls)
+
+    def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
+        parser = eesel.build_parser()
+        sk_sub = _subparsers_action(_subparsers_action(parser).choices["skills"])
+        visible = [a.dest for a in sk_sub._choices_actions]
+        assert "set" in visible and "edit" not in visible
+
+    def test_edit_patches_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        rc = eesel.cmd_skills(
+            _skills_parse("skills", "edit", "agent-abc123", "triage", "--config", '{"threshold": 3, "label": "urgent"}')
+        )
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
+        assert calls[0]["body"] == {"threshold": 3, "label": "urgent"}
+
+    def test_edit_rejects_invalid_json_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Malformed --config exits with the shared parse_config_object contract
+        # (code 2) before any request is sent.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "{not json"))
+        assert exc.value.code == 2
+        assert calls == []
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_edit_rejects_non_object_json(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
+        calls = _capture_skill_requests(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
+        assert exc.value.code == 2
+        assert calls == []
+        assert "must be a JSON object" in capsys.readouterr().err
+
+
+class TestSkillsArgParser:
+    def test_list_parses(self):
+        args = _skills_parse("skills", "list", "my-agent")
+        assert args.cmd == "skills"
+        assert args.skills_cmd == "list"
+        assert args.agent == "my-agent"
+        assert args.func is eesel.cmd_skills
+
+    def test_list_agent_is_optional(self):
+        args = _skills_parse("skills", "list")
+        assert args.skills_cmd == "list"
+        assert args.agent is None
+
+    def test_add_requires_skill_id(self):
+        with pytest.raises(SystemExit):
+            _skills_parse("skills", "add", "my-agent")  # missing skill_id
+
+    def test_remove_yes_flag_parses(self):
+        args = _skills_parse("skills", "remove", "my-agent", "skill-1", "-f")
+        assert args.skills_cmd == "remove"
+        assert args.force is True
+
+    def test_show_parses(self):
+        args = _skills_parse("skills", "show", "my-agent", "skill-1")
+        assert args.skills_cmd == "show"
+        assert args.skill_id == "skill-1"
+
+    def test_edit_requires_config(self):
+        with pytest.raises(SystemExit):
+            _skills_parse("skills", "edit", "my-agent", "skill-1")  # missing --config
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MCP servers
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _mcp_capture(monkeypatch, response=None):
+    """Replace http_request with a recorder; returns the list of calls made.
+
+    Default response carries an id so create can echo it; pass response={} for
+    the endpoints whose return value the CLI ignores (toggle/delete/edit)."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response if response is not None else {"id": "mcp-new-999"}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+def _mcp_parse(*argv):
+    return eesel.build_parser(staff=False).parse_args(list(argv))
+
+
+class TestMcpAddBody:
+    def test_url_maps_to_base_url(self):
+        body = eesel._mcp_create_body("Srv", "https://mcp.example.com")
+        assert body == {"name": "Srv", "base_url": "https://mcp.example.com"}
+
+    def test_config_merged_but_name_and_url_win(self):
+        body = eesel._mcp_create_body(
+            "Srv",
+            "https://real",
+            {"auth_type": "bearer", "auth_token": "tok", "name": "ignored", "base_url": "ignored"},
+        )
+        assert body == {
+            "auth_type": "bearer",
+            "auth_token": "tok",
+            "name": "Srv",
+            "base_url": "https://real",
+        }
+
+
+class TestMcpUpdateBody:
+    def test_empty_when_nothing_passed(self):
+        assert eesel._mcp_update_body() == {}
+
+    def test_name_only(self):
+        assert eesel._mcp_update_body(name="Renamed") == {"name": "Renamed"}
+
+    def test_url_maps_to_base_url(self):
+        assert eesel._mcp_update_body(url="https://new") == {"base_url": "https://new"}
+
+    def test_both(self):
+        assert eesel._mcp_update_body(name="N", url="https://u") == {
+            "name": "N",
+            "base_url": "https://u",
+        }
+
+
+class TestResolveMcpServer:
+    SERVERS = [
+        {"id": "srv-abc123", "name": "Alpha"},
+        {"id": "srv-def456", "name": "Beta"},
+    ]
+
+    def test_exact_id(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "srv-abc123")["name"] == "Alpha"
+
+    def test_id_prefix(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "srv-def")["name"] == "Beta"
+
+    def test_exact_name(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "Alpha")["id"] == "srv-abc123"
+
+    def test_no_match_returns_none(self):
+        assert eesel.resolve_mcp_server(self.SERVERS, "nope") is None
+
+    def test_strict_resolver_refuses_ambiguous_prefix(self, fake_creds, monkeypatch, capsys):
+        # Two servers sharing an id prefix: the write/destructive resolver must
+        # refuse and list candidates rather than act on an arbitrary one.
+        servers = [
+            {"id": "srv-shared-1", "name": "One"},
+            {"id": "srv-shared-2", "name": "Two"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        assert eesel._resolve_one_mcp_server(fake_creds, "srv-shared") is None
+        out = capsys.readouterr().err
+        assert "ambiguous" in out
+        assert "srv-shared-1" in out and "srv-shared-2" in out
+
+
+class TestMcpListCommand:
+    def test_lists_servers_with_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        servers = [
+            {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True},
+            {"id": "srv-def456", "name": "Beta", "base_url": "https://b", "is_active": False},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Alpha" in out and "https://a" in out and "[on]" in out
+        assert "Beta" in out and "[off]" in out
+
+    def test_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        servers = [{"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True}]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list", "--json"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert json.loads(out) == servers
+
+    def test_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # `--plain` emits one decoration-free, tab-separated row per server:
+        # id<TAB>state<TAB>name<TAB>url. The human view's bracketed status
+        # markers are absent, confirming the human formatter was bypassed.
+        servers = [
+            {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True},
+            {"id": "srv-def456", "name": "Beta", "base_url": "https://b", "is_active": False},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: servers)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list", "--plain"))
+        assert rc == 0
+        out = capsys.readouterr().out
+        lines = out.strip().splitlines()
+        assert lines == [
+            "srv-abc123\ton\tAlpha\thttps://a",
+            "srv-def456\toff\tBeta\thttps://b",
+        ]
+        assert "[on]" not in out and "[off]" not in out
+
+    def test_empty_list(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: [])
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "list"))
+        assert rc == 0
+        assert "no MCP servers" in capsys.readouterr().err
+
+    def test_bare_mcp_defaults_to_list(self):
+        # `eesel mcp` with no subcommand dispatches to the list view.
+        args = _mcp_parse("mcp")
+        assert args.func is eesel.cmd_mcp
+        assert args.mcp_cmd == "list"
+
+    def test_fetch_hits_workspace_scoped_path(self, tmp_config, fake_creds, monkeypatch):
+        calls = _mcp_capture(monkeypatch, response={"mcp_servers": []})
+        eesel.fetch_mcp_servers(fake_creds)
+        assert calls[0]["method"] == "GET"
+        assert "/workspaces/ws-test-123/mcp-servers" in calls[0]["url"]
+
+
+class TestMcpAddCommand:
+    def test_posts_base_url_and_prints_id(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "add", "--name", "Alpha", "--url", "https://a"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers")
+        assert calls[0]["body"] == {"name": "Alpha", "base_url": "https://a"}
+        assert "mcp-new-999" in capsys.readouterr().err  # ok() writes to stderr
+
+    def test_config_json_is_merged(self, tmp_config, fake_creds, monkeypatch):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(
+            _mcp_parse("mcp", "add", "--name", "Alpha", "--url", "https://a",
+                       "--config", '{"auth_type": "bearer", "auth_token": "tok"}')
+        )
+        assert rc == 0
+        assert calls[0]["body"] == {
+            "auth_type": "bearer",
+            "auth_token": "tok",
+            "name": "Alpha",
+            "base_url": "https://a",
+        }
+
+    def test_invalid_config_json_fails_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _mcp_capture(monkeypatch)
+        rc = eesel.cmd_mcp(
+            _mcp_parse("mcp", "add", "--name", "A", "--url", "https://a", "--config", "{not json}")
+        )
+        assert rc == 1
+        assert calls == []
+        assert "valid JSON" in capsys.readouterr().err
+
+
+class TestMcpShowCommand:
+    SERVERS = [
+        {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a",
+         "is_active": True, "auth_type": "bearer", "has_auth_token": True},
+    ]
+
+    def test_shows_one_servers_detail(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "show", "srv-abc123"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "srv-abc123" in out and "https://a" in out and "bearer" in out
+
+    def test_json_emits_raw_server(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "show", "srv-abc123", "--json"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert json.loads(out) == self.SERVERS[0]
+
+    def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "show", "nope"))
+        assert rc == 1
+
+
+class TestMcpEditCommand:
+    SERVERS = [
+        {"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True},
+        {"id": "srv-def456", "name": "Beta", "base_url": "https://b", "is_active": True},
+    ]
+
+    def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--name", "Renamed"))
+        assert rc == 0
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
+        assert calls[0]["body"] == {"name": "Renamed"}
+
+    def test_set_is_canonical_edit_hidden_alias(self, tmp_config, fake_creds, monkeypatch):
+        # `set` is canonical and does the same PUT; `edit` is a hidden alias.
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123", "--name", "Renamed"))
+        assert rc == 0 and calls[0]["body"] == {"name": "Renamed"}
+        m_sub = _subparsers_action(_subparsers_action(eesel.build_parser()).choices["mcp"])
+        visible = [a.dest for a in m_sub._choices_actions]
+        assert "set" in visible and "edit" not in visible
+
+    def test_url_only_sends_base_url(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--url", "https://new"))
+        assert calls[-1]["body"] == {"base_url": "https://new"}
+
+    def test_nothing_to_update_fails(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "nope", "--name", "X"))
+        assert rc == 1
+        assert calls == []
+
+
+class TestMcpToggleCommands:
+    SERVERS = [{"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": False}]
+
+    def test_enable_posts_true(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "enable", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123/toggle")
+        assert calls[0]["body"] == {"is_active": True}
+
+    def test_disable_posts_false(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "disable", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["body"] == {"is_active": False}
+        assert calls[0]["url"].endswith("/toggle")
+
+
+class TestMcpRemoveCommand:
+    SERVERS = [{"id": "srv-abc123", "name": "Alpha", "base_url": "https://a", "is_active": True}]
+
+    def test_force_flag_skips_prompt_and_removes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "remove", "srv-abc123", "--force"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+        assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
+
+    def test_short_f_flag_also_skips_prompt(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "remove", "srv-abc123", "-f"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_affirmative_confirmation_removes(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "remove", "srv-abc123"))
+        assert rc == 0
+        assert calls[0]["method"] == "DELETE"
+
+    def test_negative_confirmation_aborts_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")  # bare Enter
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "remove", "srv-abc123"))
+        assert rc == 1
+        assert calls == []
+
+    def test_unknown_target_errors_without_request(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
+        calls = _mcp_capture(monkeypatch, response={})
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "remove", "nope", "--force"))
+        assert rc == 1
+        assert calls == []
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# workspace — operate on the active workspace (creds["workspace_id"])
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _record_requests(monkeypatch, responses):
+    """Replace http_request with a recorder that returns a response chosen by a
+    `(method, url-substring) -> dict` mapping. The first matching entry wins;
+    unmatched calls return {}. Returns the list of recorded calls."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body, "token": token})
+        for (m, frag), resp in responses.items():
+            if method == m and frag in url:
+                return resp
+        return {}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+class TestWorkspaceShow:
+    WS = {
+        "workspaceId": "ws-test-123",
+        "workspaceName": "Acme",
+        "workspaceOwnerUserId": "auth0|owner",
+        "trialDurationDays": 14,
+        "stripeSubscriptionId": "sub_1",
+        "stripeCustomerId": "cus_1",
+        "onboarding_completed": True,
+        "dataResidency": None,
+        "namespaces": ["ns-1", "ns-2"],
+    }
+
+    def test_show_calls_workspace_endpoint_and_prints_fields(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("GET", "/workspaces/ws-test-123"): self.WS})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="show", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123"
+        out = capsys.readouterr().out
+        assert "workspaceName" in out and "Acme" in out
+        assert "trialDurationDays" in out and "14" in out
+        # The large structural field is omitted from the default view.
+        assert "namespaces" not in out
+
+    def test_show_is_the_default_subcommand(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
+        rc = eesel.cmd_workspace(_args(workspace_cmd=None, json=False))
+        assert rc == 0
+        assert "Acme" in capsys.readouterr().out
+
+    def test_show_json_emits_raw_payload(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/workspaces/"): self.WS})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="show", json=True))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == self.WS
+
+
+class TestWorkspaceSetName:
+    def test_set_name_puts_workspace_name_then_reads_back(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(
+            monkeypatch,
+            {
+                ("PUT", "/workspaces/ws-test-123"): {"message": "Workspace updated successfully"},
+                ("GET", "/workspaces/ws-test-123"): {"workspaceName": "Renamed"},
+            },
+        )
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="name", value="Renamed"))
+        assert rc == 0
+        # First call is the PUT with the workspaceName body; the field name must
+        # match the server's WorkspaceUpdate schema exactly.
+        assert calls[0]["method"] == "PUT"
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123"
+        assert calls[0]["body"] == {"workspaceName": "Renamed"}
+        # Second call reads the workspace back (the PUT returns only a message).
+        assert calls[1]["method"] == "GET"
+        assert "Renamed" in capsys.readouterr().err  # ok() writes to stderr
+
+
+class TestWorkspaceSetBillingLimit:
+    def test_set_billing_limit_posts_value_to_singular_path(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("POST", "/workspace/billing-limit"): {"status": "success"}})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="250"))
+        assert rc == 0
+        # Path is the SINGULAR /workspace/billing-limit; body field is `value`,
+        # and the string positional is coerced to an int.
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == "http://localhost:8080/workspace/billing-limit"
+        assert calls[0]["body"] == {"value": 250}
+        assert "250" in capsys.readouterr().err
+
+    def test_set_billing_limit_rejects_non_integer_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="lots"))
+        assert rc == 1
+        assert calls == []
+        assert "non-negative integer" in capsys.readouterr().err
+
+    def test_set_billing_limit_rejects_negative_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="set", field="billing-limit", value="-5"))
+        assert rc == 1
+        assert calls == []
+        assert "non-negative integer" in capsys.readouterr().err
+
+
+class TestWorkspaceMembers:
+    MEMBERS = [
+        {"user_id": "auth0|owner", "email": "owner@acme.com", "role": "editor", "status": "accepted"},
+        {"user_id": "auth0|m2", "email": "viewer@acme.com", "role": "viewer", "status": "accepted"},
+        {"user_id": None, "email": "invited@acme.com", "role": "editor", "status": "pending"},
+    ]
+
+    def test_members_lists_email_and_role(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(monkeypatch, {("GET", "/members"): {"members": self.MEMBERS}})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
+        assert rc == 0
+        assert calls[0]["url"] == "http://localhost:8080/workspaces/ws-test-123/members"
+        out = capsys.readouterr().out
+        assert "owner@acme.com" in out and "editor" in out
+        assert "viewer@acme.com" in out and "viewer" in out
+        # A non-accepted member surfaces its status.
+        assert "invited@acme.com" in out and "pending" in out
+
+    def test_members_accepts_bare_list_response(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/members"): self.MEMBERS})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
+        assert rc == 0
+        assert "owner@acme.com" in capsys.readouterr().out
+
+    def test_members_empty_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        _record_requests(monkeypatch, {("GET", "/members"): {"members": []}})
+        rc = eesel.cmd_workspace(_args(workspace_cmd="members", json=False))
+        assert rc == 0
+        assert "no members" in capsys.readouterr().err
+
+
+class TestWorkspaceExtendTrial:
+    def test_extend_trial_posts_and_prints_message(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = _record_requests(
+            monkeypatch,
+            {("POST", "/subscription/extend-trial"): {"success": True, "message": "Trial extended successfully"}},
+        )
+        rc = eesel.cmd_workspace(_args(workspace_cmd="extend-trial"))
+        assert rc == 0
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == "http://localhost:8080/subscription/extend-trial"
+        assert calls[0]["body"] == {}
+        assert "Trial extended successfully" in capsys.readouterr().err
+
+
+class TestWorkspaceParser:
+    def _parse(self, *argv):
+        return eesel.build_parser(staff=False).parse_args(list(argv))
+
+    def test_registered_with_show_default(self):
+        args = self._parse("workspace")
+        assert args.func is eesel.cmd_workspace
+        assert args.workspace_cmd is None  # cmd_workspace defaults to "show"
+
+    def test_set_name_takes_field_and_value_positionals(self):
+        args = self._parse("workspace", "set", "name", "New Name")
+        assert args.workspace_cmd == "set"
+        assert args.field == "name"
+        assert args.value == "New Name"
+
+    def test_set_billing_limit_keeps_value_as_string(self):
+        # The value positional is parsed as a string for every field; the
+        # billing-limit handler coerces and validates the integer itself.
+        args = self._parse("workspace", "set", "billing-limit", "300")
+        assert args.workspace_cmd == "set"
+        assert args.field == "billing-limit"
+        assert args.value == "300"
+
+    def test_set_rejects_unknown_field(self):
+        # `field` is constrained by choices, so an unknown field is a parse error.
+        with pytest.raises(SystemExit):
+            self._parse("workspace", "set", "color", "blue")
+
+    def test_members_and_extend_trial_register(self):
+        assert self._parse("workspace", "members").workspace_cmd == "members"
+        assert self._parse("workspace", "extend-trial").workspace_cmd == "extend-trial"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Billing (read-only subscription views)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _record_http(monkeypatch, response):
+    """Replace http_request with a recorder returning `response`. Returns the
+    list of recorded calls so a test can assert method/url."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "body": body})
+        return response
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+class TestBillingCommand:
+    def test_bare_billing_shows_usage(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "numMessages": 12, "maxMessages": 100,
+            "numNamespaces": 3, "maxNamespaces": 5,
+            "numLearningJobs": 1, "maxLearningJobs": 10,
+            "costConsumed": 4.5,
+            "numLightTasks": 2, "numRegularTasks": 1, "numHeavyTasks": 0,
+            "limitReached": False,
+        })
+        # `eesel billing` with no subcommand falls back to `show usage`.
+        rc = eesel.cmd_billing(_args(billing_cmd=None, topic=None, json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"].endswith("/subscription/usage")
+        out = capsys.readouterr().out
+        assert "12 / 100" in out
+        assert "$4.50" in out
+
+    def test_show_license_hits_license_endpoint_and_summarizes(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "isActive": True,
+            "planName": "Team",
+            "subscriptionStatus": "active",
+            "subscriptionSource": "STRIPE",
+            "billingPeriodStart": "2026-06-01T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
+            "features": ["AI_AGENTS", "ANALYTICS"],
+            "pricing": {"lightTaskDollars": 0.01, "regularTaskDollars": 0.05, "heavyTaskDollars": 0.2},
+        })
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="license", json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/license")
+        out = capsys.readouterr().out
+        assert "Team" in out
+        assert "AI_AGENTS, ANALYTICS" in out
+
+    def test_list_invoices_endpoint_and_empty_list(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, [])
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="invoices", json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/invoices")
+        assert "(no invoices)" in capsys.readouterr().err
+
+    def test_list_spend_endpoint_totals_amounts(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, [
+            {"date": "2026-06-01", "amount": 1.5},
+            {"date": "2026-06-02", "amount": 2.25},
+        ])
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="spend", json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/spend-history")
+        out = capsys.readouterr().out
+        assert "$3.75" in out  # total
+
+    def test_show_mode_endpoint(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {
+            "mode": "threshold", "eligible": True, "canSwitchToMonthly": False, "successfulCharges": 2,
+        })
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["url"].endswith("/subscription/billing-mode")
+        assert "threshold" in capsys.readouterr().out
+
+    def test_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, {"mode": "monthly"})
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=True, plain=False))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == {"mode": "monthly"}
+
+    def test_plain_emits_tab_separated_keyvalues(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, {"mode": "monthly", "eligible": True})
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="mode", json=False, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "mode\tmonthly" in out
+
+    def test_list_plain_emits_tab_separated_columns(self, fake_creds, monkeypatch, capsys):
+        _record_http(monkeypatch, [{"date": "2026-06-01", "amount": 1.5}])
+        rc = eesel.cmd_billing(_args(billing_cmd="list", kind="spend", json=False, plain=True))
+        assert rc == 0
+        assert "2026-06-01\t1.5" in capsys.readouterr().out
+
+    def test_unknown_topic_errors(self, fake_creds, monkeypatch, capsys):
+        calls = _record_http(monkeypatch, {})
+        rc = eesel.cmd_billing(_args(billing_cmd="show", topic="bogus", json=False, plain=False))
+        assert rc == 1
+        assert calls == []
+
+    def test_parser_bare_billing_defaults_to_show_usage(self):
+        args = eesel.build_parser(staff=False).parse_args(["billing"])
+        assert args.billing_cmd == "show"
+        assert args.topic == "usage"
+        assert args.func is eesel.cmd_billing
+
+    def test_parser_show_accepts_each_topic(self):
+        for name in ("usage", "license", "mode"):
+            args = eesel.build_parser(staff=False).parse_args(["billing", "show", name])
+            assert args.billing_cmd == "show"
+            assert args.topic == name
+
+    def test_parser_list_accepts_each_kind(self):
+        for name in ("invoices", "spend"):
+            args = eesel.build_parser(staff=False).parse_args(["billing", "list", name])
+            assert args.billing_cmd == "list"
+            assert args.kind == name
+
+    def test_parser_show_rejects_unknown_topic(self):
+        with pytest.raises(SystemExit):
+            eesel.build_parser(staff=False).parse_args(["billing", "show", "invoices"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Settings — agent notification configuration
+# ──────────────────────────────────────────────────────────────────────────
+
+
+_NOTIF_AGENTS = [
+    {"agent_id": "agent-test-456", "name": "Support Bot"},
+    {"agent_id": "agent-zzz999", "name": "Blog Writer"},
+]
+
+_NOTIF_RESPONSE = {
+    "enabled": True,
+    "channel": "slack",
+    "email": {"member_ids": ["u-1", "u-2"]},
+    "slack": {"channel_ids": ["C123"]},
+}
+
+
+class TestSettingsNotificationsShow:
+    def test_show_hits_endpoint_and_prints_summary(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="Support Bot", json=False, plain=False))
+        assert rc == 0
+        assert calls[0]["method"] == "GET"
+        assert calls[0]["url"].endswith("/agents/agent-test-456/notification-settings")
+        out = capsys.readouterr().out
+        assert "slack" in out
+        assert "C123" in out
+        assert "u-1, u-2" in out
+
+    def test_show_json_emits_raw_payload(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="agent-test-456", json=True, plain=False))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == _NOTIF_RESPONSE
+
+    def test_show_plain_emits_tab_separated(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="agent-test-456", json=False, plain=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "enabled\tTrue" in out
+        assert "slack\tC123" in out
+
+    def test_show_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="show", agent="nope", json=False, plain=False))
+        assert rc == 1
+        assert calls == []
+
+
+class TestSettingsNotificationsEnableDisable:
+    def test_enable_patches_enabled_true(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="enable", agent="agent-zzz999", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["url"].endswith("/agents/agent-zzz999/notification-settings")
+        assert calls[0]["body"] == {"enabled": True}
+
+    def test_disable_patches_enabled_false(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="disable", agent="agent-zzz999", json=False))
+        assert rc == 0
+        assert calls[0]["body"] == {"enabled": False}
+
+
+class TestSettingsNotificationsSet:
+    def test_set_patches_only_the_channel_field(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel="email", json=False))
+        assert rc == 0
+        assert calls[0]["method"] == "PATCH"
+        assert calls[0]["body"] == {"channel": "email"}
+
+    def test_set_nothing_fails_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        calls = _record_http(monkeypatch, _NOTIF_RESPONSE)
+        rc = eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel=None, json=False))
+        assert rc == 1
+        assert calls == []
+
+    def test_set_prints_readback(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _NOTIF_AGENTS)
+        _record_http(monkeypatch, _NOTIF_RESPONSE)
+        eesel.cmd_settings(_args(settings_cmd="notifications", notifications_cmd="set", agent="agent-test-456", channel="email", json=False))
+        out = capsys.readouterr().out
+        # The readback reflects the server response shape (nested email/slack).
+        assert "C123" in out
+
+
+class TestSettingsParser:
+    def test_show_parses_agent_positional(self):
+        args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", "show", "my-agent"])
+        assert args.settings_cmd == "notifications"
+        assert args.notifications_cmd == "show"
+        assert args.agent == "my-agent"
+        assert args.func is eesel.cmd_settings
+
+    def test_enable_disable_parse_agent_positional(self):
+        for verb in ("enable", "disable"):
+            args = eesel.build_parser(staff=False).parse_args(["settings", "notifications", verb, "my-agent"])
+            assert args.notifications_cmd == verb
+            assert args.agent == "my-agent"
+
+    def test_set_parses_channel_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(
+            ["settings", "notifications", "set", "my-agent", "--channel", "slack"]
+        )
+        assert args.notifications_cmd == "set"
+        assert args.channel == "slack"
+
+    def test_set_rejects_invalid_channel(self):
+        with pytest.raises(SystemExit):
+            eesel.build_parser(staff=False).parse_args(["settings", "notifications", "set", "a", "--channel", "carrier-pigeon"])
+
+
+class TestParseToolConfig:
+    def test_parses_json_object(self):
+        assert eesel.parse_tool_config('{"permission_mode": "ask"}') == {"permission_mode": "ask"}
+
+    def test_rejects_malformed_json(self):
+        with pytest.raises(ValueError, match="not valid JSON"):
+            eesel.parse_tool_config("{not json}")
+
+    def test_rejects_non_object_top_level(self):
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            eesel.parse_tool_config('"a string"')
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            eesel.parse_tool_config("[1, 2, 3]")
+
+
+class TestIntegrationActionsWrite:
+    """enable / edit / disable on `eesel integrations <integration> actions`."""
+
+    def _agents(self):
+        return [
+            {"agent_id": "agent-test-456", "name": "Support Bot"},
+            {"agent_id": "agent-other-999", "name": "Sales Bot"},
+        ]
+
+    def _setup(self, monkeypatch, response=None):
+        """Stub agents + integrations resolution and capture the write request.
+
+        The integration positional (e.g. 'zendesk') is resolved to its connected
+        instance id via fetch_integrations, so write commands stub it here.
+        """
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        captured = {}
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = body
+            captured["token"] = token
+            return response if response is not None else {}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        return captured
+
+    # ── enable ──────────────────────────────────────────────────────────
+    def test_enable_posts_empty_config_with_resolved_integration_id(self, fake_creds, monkeypatch, capsys):
+        captured = self._setup(monkeypatch, {"tool_id": "t9", "config": {}})
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Sales Bot", action="zendesk_leave_internal_note"))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-other-999/tools/zendesk_leave_internal_note"
+        # Enable sends an empty config; the integration type resolves to its instance id.
+        assert captured["body"] == {"config": {}, "integration_id": "int-zendesk-1"}
+        assert "Enabled" in capsys.readouterr().err
+
+    def test_enable_unresolved_integration_posts_unscoped(self, fake_creds, monkeypatch):
+        # ai_actions has no instance id, so the write proceeds without integration_id.
+        captured = self._setup(monkeypatch)
+        eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="ai_actions", agent="agent-test-456", action="doc_search"))
+        assert captured["body"] == {"config": {}}
+
+    def test_enable_accepts_display_name(self, fake_creds, monkeypatch, capsys):
+        # A human display name resolves to its tool_key for the write.
+        captured = self._setup(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Sales Bot", action="Leave internal note"))
+        assert rc == 0
+        assert captured["url"].endswith("/tools/zendesk_leave_internal_note")
+        assert "Enabled 'zendesk_leave_internal_note'" in capsys.readouterr().err
+
+    def test_enable_unknown_agent_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Ghost", action="k"))
+        assert rc == 1
+        assert "No agent matches" in capsys.readouterr().err
+
+    # ── edit ────────────────────────────────────────────────────────────
+    def test_edit_posts_parsed_config(self, fake_creds, monkeypatch, capsys):
+        captured = self._setup(monkeypatch, {"config": {"permission_mode": "ask"}})
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456",
+            action="zendesk_leave_internal_note", config='{"permission_mode": "ask"}'))
+        assert rc == 0
+        assert captured["method"] == "POST"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
+        assert captured["body"] == {"config": {"permission_mode": "ask"}, "integration_id": "int-zendesk-1"}
+
+    def test_edit_rejects_bad_json_without_request(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config="{bad"))
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_edit_redacts_secrets_in_echoed_config(self, fake_creds, monkeypatch, capsys):
+        self._setup(monkeypatch, {"config": {"access_token": "tok-LEAK", "mode": "ask"}})
+        eesel.cmd_integration_actions(_args(
+            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config='{"mode": "ask"}'))
+        err = capsys.readouterr().err
+        assert "tok-LEAK" not in err
+        assert "***" in err
+
+    # ── disable ─────────────────────────────────────────────────────────
+    def test_disable_with_force_deletes_without_prompt(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: pytest.fail("should not prompt with --force"))
+        captured = self._setup(monkeypatch)
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456",
+            action="zendesk_leave_internal_note", force=True))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        # Resolved integration id is passed as a query param to scope the delete.
+        assert captured["url"].endswith("/tools/zendesk_leave_internal_note?integration_id=int-zendesk-1")
+        assert "Disabled" in capsys.readouterr().err
+
+    def test_disable_affirmative_confirmation_deletes(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
+        captured = self._setup(monkeypatch)
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456", action="k", force=False))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+
+    def test_disable_declined_confirmation_aborts(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not DELETE when declined"))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="agent-test-456", action="k", force=False))
+        assert rc == 1
+        assert "Aborted" in capsys.readouterr().err
+
+
+class TestToolsBackCompatAndForce:
+    def test_tools_is_hidden_backcompat_alias(self):
+        # `eesel tools [agent]` was restructured to `integrations ... actions`,
+        # but the read-only alias is kept (suppressed) for existing scripts.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["tools", "Support Bot"])
+        assert args.func is eesel.cmd_tools
+        assert args.agent == "Support Bot"
+
+    def test_tools_hidden_from_help(self):
+        assert "tools" not in _visible_commands(eesel.build_parser())
+
+    def test_actions_disable_accepts_short_force_flag(self):
+        parser = eesel.build_parser()
+        argv = ["integrations", "actions", "zendesk", "disable", "zendesk_tag_ticket", "-f"]
+        args = parser.parse_args(eesel._normalize_integrations_argv(argv))
+        assert args.force is True
+
+
+class TestNormalizeIntegrationsArgv:
+    def test_bare_integrations_untouched(self):
+        # The integration listing path is left alone.
+        assert eesel._normalize_integrations_argv(["integrations"]) == ["integrations"]
+        assert eesel._normalize_integrations_argv(["integrations", "--json"]) == ["integrations", "--json"]
+
+    def test_actions_without_verb_defaults_to_list(self):
+        # `integrations zendesk actions` → `integrations actions zendesk list`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions"]) == [
+            "integrations", "actions", "zendesk", "list"]
+
+    def test_actions_reorders_integration_before_keyword(self):
+        # The user-facing path puts the integration first; argparse wants it after `actions`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "enable", "reply"]) == [
+            "integrations", "actions", "zendesk", "enable", "reply"]
+
+    def test_actions_explicit_verbs_preserved(self):
+        for verb in ("list", "show", "enable", "disable", "set", "edit"):
+            argv = ["integrations", "zendesk", "actions", verb, "reply"]
+            assert eesel._normalize_integrations_argv(argv) == ["integrations", "actions", "zendesk", verb, "reply"]
+
+    def test_actions_set_canonical_edit_hidden_alias(self):
+        # `set` is the canonical config verb; `edit` is a hidden alias.
+        parser = eesel.build_parser()
+        for verb in ("set", "edit"):
+            args = parser.parse_args(
+                eesel._normalize_integrations_argv(
+                    ["integrations", "zendesk", "actions", verb, "reply", "--config", "{}"]))
+            assert args.actions_cmd == verb
+        integrations = _subparsers_action(parser).choices["integrations"]
+        act_sub = _subparsers_action(integrations).choices["actions"]
+        visible = [a.dest for a in _subparsers_action(act_sub)._choices_actions]
+        assert "set" in visible and "edit" not in visible
+
+    def test_flags_after_verb_kept_in_order(self):
+        assert eesel._normalize_integrations_argv(
+            ["integrations", "zendesk", "actions", "disable", "reply", "--force"]) == [
+            "integrations", "actions", "zendesk", "disable", "reply", "--force"]
+
+    def test_not_actions_path_left_untouched(self):
+        # `integrations <something>` that isn't followed by `actions` is left for
+        # the parser (it'll surface a helpful error).
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk"]) == ["integrations", "zendesk"]
+
+    def test_non_integrations_argv_untouched(self):
+        assert eesel._normalize_integrations_argv(["agents", "list"]) == ["agents", "list"]
+
+    def test_help_reaches_parent_parser(self):
+        # `integrations --help` shows the integrations help, not the actions help.
+        assert eesel._normalize_integrations_argv(["integrations", "--help"]) == ["integrations", "--help"]
+        assert eesel._normalize_integrations_argv(["integrations", "-h"]) == ["integrations", "-h"]
+
+    def test_actions_help_reaches_actions_parser(self):
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "--help"]) == [
+            "integrations", "actions", "zendesk", "--help"]
+
+    def test_actions_unknown_verb_passed_through_for_suggestion(self):
+        # A typo'd verb must NOT be defaulted to `list` (which would bury it as an
+        # unexpected argument to `list`); it's passed through unchanged so the
+        # actions subparser raises a suggesting "invalid choice" error.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "enabl", "reply"]) == [
+            "integrations", "actions", "zendesk", "enabl", "reply"]
+
+    def test_actions_flags_only_defaults_to_list(self):
+        # Only flags after `actions` (no verb at all) still defaults to `list`.
+        assert eesel._normalize_integrations_argv(["integrations", "zendesk", "actions", "--json"]) == [
+            "integrations", "actions", "zendesk", "list", "--json"]
+
+
+class TestChatAgentFlag:
+    def test_parser_accepts_agent(self):
+        args = eesel.build_parser().parse_args(["chat", "hi", "--agent", "Bot"])
+        assert args.agent == "Bot"
+        assert args.func is eesel.cmd_chat
+
+    def test_unmatched_agent_errors_before_chatting(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: pytest.fail("must not chat on an unmatched --agent"))
+        rc = eesel.cmd_chat(_args(agent="nope", message="hi", cost=False, task=None, trigger=None))
+        assert rc == 1
+        assert "No agent matches 'nope'" in capsys.readouterr().err
+
+    def test_agent_flag_does_not_persist_active_agent(self, fake_creds, monkeypatch):
+        # --agent is a stateless, per-command scope: it resolves in memory and
+        # must never rewrite the saved active agent on disk.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "other-agent", "name": "Other"}])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--agent must not persist the active agent"))
+        # Stop after agent resolution so we don't exercise the sandbox/streaming path.
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: (_ for _ in ()).throw(SystemExit("stop")))
+        with pytest.raises(SystemExit):
+            eesel.cmd_chat(_args(agent="Other", message="hi", cost=False, task=None, trigger=None))
+
+    def test_schedule_flag_does_not_persist_active_agent(self, fake_creds, monkeypatch, capsys):
+        # Binding a chat to a scheduled job pins that job's agent for the preview
+        # session only — it must never rewrite the saved active agent on disk, or
+        # every later unrelated command would silently run against the wrong agent.
+        monkeypatch.setattr(
+            eesel, "resolve_scheduled_job",
+            lambda creds, target: {"id": "trig-1", "agent_id": "schedule-agent", "agent_name": "Heartbeat", "config": {"title": "heartbeat"}},
+        )
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "trigger_id": "trig-1", "trigger_title": "heartbeat", "agent_id": creds.get("agent_id")})
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
+        rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
+        assert rc == 0
+
+
+class TestChatTaskFlag:
+    def test_resolves_prefix_to_full_task_id_before_binding(self, fake_creds, monkeypatch, capsys):
+        # A `--task` id-prefix is resolved to the full task id before the session
+        # is pinned — binding the truncated value would create a junk session that
+        # fails the stream with an empty error.
+        full_id = "330c8f22-aaaa-bbbb-cccc-dddddddddddd"
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "fetch_tasks", lambda creds, **k: ([{"task_id": full_id}], None, None))
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: None)
+        created = {}
+
+        def fake_new_session(creds, **k):
+            created.update(k)
+            return {"id": "sess-1", **k}
+
+        monkeypatch.setattr(eesel, "new_session", fake_new_session)
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
+        assert rc == 0
+        # The full resolved id is pinned, not the truncated prefix.
+        assert created["task_id"] == full_id
+
+    def test_ambiguous_prefix_errors_without_binding(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(
+            eesel, "fetch_tasks",
+            lambda creds, **k: ([{"task_id": "330c8f22-aaaa"}, {"task_id": "330c8f22-bbbb"}], None, None),
+        )
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: pytest.fail("must not look up a session before resolving"))
+        monkeypatch.setattr(eesel, "new_session", lambda *a, **k: pytest.fail("must not bind a session on an ambiguous prefix"))
+        rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
+        assert rc == 1
+        assert "ambiguous" in capsys.readouterr().err
