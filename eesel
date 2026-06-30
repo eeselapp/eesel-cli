@@ -4806,6 +4806,10 @@ def cmd_skills(args) -> int:
     if sub is None:
         err("Specify a skills subcommand: list, available, show, add, remove, or set.")
         return 1
+    # `available` is a hidden alias for `list --available`; collapse it here so
+    # the branches below are plain `list` checks, not a three-way boolean split.
+    if sub == "available":
+        sub, args.available = "list", True
 
     agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
@@ -4838,7 +4842,7 @@ def cmd_skills(args) -> int:
             print(fmt.format(str(sid)[:28], state, name, desc))
         return 0
 
-    if sub == "available" or (sub == "list" and getattr(args, "available", False)):
+    if sub == "list" and getattr(args, "available", False):
         # The marketplace catalog scoped to this agent: the skills it can still
         # install. These ids are exactly what `skills add` accepts, so this is
         # how you discover a valid <skill_id> without leaving the CLI. Reached by
@@ -5717,12 +5721,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp_tools.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
     sp_tools.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp_tools.set_defaults(func=cmd_tools)
-    # `tools` is the hidden top-level alias for `integrations <int> actions`.
-    # Only drop it from the choice list here; the root metavar is rebuilt once at
-    # the end of this function, after every top-level command has been added
-    # (unlike a group subparser, the root `sub` is still being populated below,
-    # so `hide_subcommands` — which pins the metavar immediately — can't be used).
-    sub._choices_actions = [a for a in sub._choices_actions if a.dest != "tools"]
+    # `tools` is the hidden top-level alias for `integrations <int> actions`; it's
+    # hidden (with the other top-level aliases) by the single `hide_subcommands`
+    # call at the end of this function, once every command has been added.
 
     # `eesel integrations` lists and manages the workspace's integrations:
     # `available` (the connectable catalog), `connect`, `sync`, `sync-status`,
@@ -6134,6 +6135,8 @@ _AGENTS_FLAT_VERBS = frozenset(
 # `triggers`/`schedules` are deliberately absent: their `list` is workspace-wide
 # (no agent argument), so a path form would hard-error. They get a real
 # per-agent path form when triggers+schedules are unified under `automations`.
+# `notifications` and the deprecated `tools` alias are likewise out of scope for
+# this pass (not in the namespace plan's first cut).
 _AGENT_SCOPED_CHILDREN = {
     "integrations": "flag",
     "documents": "flag",
@@ -6174,7 +6177,9 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
     if head == "set":
         # `agents <id> set name "QA" instructions "…"` → flat flag form. Field
         # tokens become `--field`; the following token is its value. Pre-formed
-        # flags (`--json`) pass through untouched.
+        # flags (`--json`) pass through untouched. An unknown field becomes an
+        # unrecognized `--flag`, so argparse still rejects it (just as a bad flag
+        # rather than a "did you mean" on the field name).
         out = ["agents", "set", agent]
         i, fields = 0, tail[1:]
         while i < len(fields):
