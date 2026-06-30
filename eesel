@@ -1827,11 +1827,16 @@ def cmd_agents(args) -> int:
         ok(f"Cleared active agent ({prev}). Commands that need one will prompt, or accept EESEL_AGENT / a --agent flag.")
         return 0
     if sub == "show":
+        if getattr(args, "show_instructions", False):
+            # `agents <id> show --instructions` is the canonical way to print
+            # just the prompt; route it through the same printer the aliases use.
+            args.agent = args.agent_id
+            return cmd_instructions(args)
         return _agents_get(args, creds)
     if sub == "instructions":
-        # An agent's instructions are an attribute of the agent, so they're
-        # reachable under the `agents` noun too. The top-level `eesel
-        # instructions` is kept as a convenience alias for the same view.
+        # Hidden alias for `agents <id> show --instructions`. An agent's
+        # instructions are an attribute of the agent; the top-level `eesel
+        # instructions` is the same view.
         return cmd_instructions(args)
     if sub in ("create", "add"):
         # `add` is a hidden alias for `create` so the universal `add` verb
@@ -4806,7 +4811,7 @@ def cmd_skills(args) -> int:
         return 1
     agent_id = agent["agent_id"]
 
-    if sub == "list":
+    if sub == "list" and not getattr(args, "available", False):
         skills = fetch_agent_skills(creds, agent_id)
         if getattr(args, "json", False):
             print(json.dumps(skills, indent=2))
@@ -4832,10 +4837,11 @@ def cmd_skills(args) -> int:
             print(fmt.format(str(sid)[:28], state, name, desc))
         return 0
 
-    if sub == "available":
+    if sub == "available" or (sub == "list" and getattr(args, "available", False)):
         # The marketplace catalog scoped to this agent: the skills it can still
         # install. These ids are exactly what `skills add` accepts, so this is
-        # how you discover a valid <skill_id> without leaving the CLI.
+        # how you discover a valid <skill_id> without leaving the CLI. Reached by
+        # the canonical `skills list --available` or the hidden `skills available`.
         skills = fetch_agent_skills(creds, agent_id, filter_="available")
         if getattr(args, "json", False):
             print(json.dumps(skills, indent=2))
@@ -5565,8 +5571,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     show = a_sub.add_parser("show", help="Show one agent's full detail (type, status, instructions)")
     show.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     show.add_argument("--json", action="store_true", help="Print the raw agent record as JSON")
+    # `--instructions` prints just the system prompt (raw, pipe/redirect-friendly)
+    # — the canonical way to read a prompt. `agents instructions` and the
+    # top-level `instructions` are kept as hidden aliases for the same view.
+    show.add_argument("--instructions", action="store_true", dest="show_instructions",
+                      help="Print only the system prompt (raw, pipeable)")
 
-    instr = a_sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")
+    instr = a_sub.add_parser("instructions", help=argparse.SUPPRESS)  # alias for `show --instructions`
     instr.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
 
     create = a_sub.add_parser("create", help="Create a new agent")
@@ -5606,11 +5617,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     use.add_argument("agent_id", nargs="?")
     a_sub.add_parser("unset", help=argparse.SUPPRESS)
 
-    hide_subcommands(a_sub, "use", "unset", "add", "edit")
+    hide_subcommands(a_sub, "use", "unset", "add", "edit", "instructions")
 
     sp.set_defaults(func=cmd_agents)
 
-    sp = sub.add_parser("instructions", help="Show an agent's instructions (its system prompt)")
+    sp = sub.add_parser("instructions", help=argparse.SUPPRESS)  # alias for `agents <id> show --instructions`
     sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
     sp.set_defaults(func=cmd_instructions)
 
@@ -5969,7 +5980,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_ls.add_argument("agent", nargs="?", help=_AGENT_HELP)
     sk_ls.add_argument("--json", action="store_true", help="Emit the raw skills payload")
     sk_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>state<TAB>name` row per skill")
-    sk_av = sk_sub.add_parser("available", help="List installable skills from the marketplace (the ids `skills add` accepts)")
+    # `list --available` shows the installable marketplace catalog instead of the
+    # installed set (catalog and installed are two views of the same noun, not a
+    # separate verb). `skills available` is kept as a hidden alias.
+    sk_ls.add_argument("--available", action="store_true", help="List installable skills from the marketplace instead of installed ones")
+    sk_av = sk_sub.add_parser("available", help=argparse.SUPPRESS)  # alias for `skills list --available`
     sk_av.add_argument("agent", nargs="?", help=_AGENT_HELP)
     sk_av.add_argument("--json", action="store_true", help="Emit the raw catalog payload")
     sk_av.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>name` row per skill")
@@ -5995,7 +6010,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         sk_ed.add_argument("agent", help=_AGENT_HELP)
         sk_ed.add_argument("skill_id", help="Skill id to configure")
         sk_ed.add_argument("--config", required=True, help="Config keys to set, as a JSON object (merged into the skill's existing config), e.g. '{\"key\": \"value\"}'")
-    hide_subcommands(sk_sub, "edit")  # `edit` is the hidden alias for `set`
+    hide_subcommands(sk_sub, "edit", "available")  # hidden aliases: `edit`→`set`, `available`→`list --available`
     sp.set_defaults(func=cmd_skills)
 
     # All workspace commands act on the active workspace (creds["workspace_id"]);

@@ -6839,3 +6839,65 @@ class TestPathScopeResolver:
     # ── chat at agent scope ──
     def test_chat_flag_scoped(self):
         assert self.n("agents", "blog", "chat", "hello") == ["chat", "hello", "--agent", "blog"]
+
+
+class TestNamingRenames:
+    """Phase-1 renames: reads go through `show`/`list`, old verbs stay as hidden
+    aliases. Canonical = `agents <id> show --instructions`, `skills list --available`."""
+
+    def _parse(self, *argv):
+        return eesel.build_parser().parse_args(list(argv))
+
+    # ── #5 instructions → show --instructions ──
+    def test_show_instructions_flag_parses(self):
+        a = self._parse("agents", "show", "blog", "--instructions")
+        assert a.agents_cmd == "show"
+        assert a.show_instructions is True
+
+    def test_show_instructions_routes_to_prompt_printer(self, fake_creds, monkeypatch):
+        called = {}
+
+        def fake_instr(args):
+            called["hit"] = getattr(args, "agent", None)
+            return 0
+
+        monkeypatch.setattr(eesel, "cmd_instructions", fake_instr)
+        a = self._parse("agents", "show", "blog", "--instructions")
+        assert eesel.cmd_agents(a) == 0
+        assert called["hit"] == "blog"  # routed with the id as the agent target
+
+    def test_plain_show_does_not_route_to_prompt(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "cmd_instructions", lambda args: pytest.fail("plain show must not print only the prompt"))
+        monkeypatch.setattr(eesel, "_agents_get", lambda args, creds: 0)
+        a = self._parse("agents", "show", "blog")
+        assert eesel.cmd_agents(a) == 0
+
+    def test_instructions_alias_still_works(self):
+        a = self._parse("instructions", "blog")
+        assert a.func is eesel.cmd_instructions
+
+    # ── #3 available → list --available ──
+    def test_skills_list_available_flag_parses(self):
+        a = self._parse("skills", "list", "blog", "--available")
+        assert a.skills_cmd == "list"
+        assert a.available is True
+
+    def test_skills_list_available_fetches_marketplace(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "resolve_agent_or_error", lambda creds, t: {"agent_id": "a1", "name": "Bot"})
+        monkeypatch.setattr(eesel, "fetch_agent_skills", lambda creds, aid, **kw: seen.update(kw) or [])
+        a = self._parse("skills", "list", "blog", "--available")
+        eesel.cmd_skills(a)
+        assert seen.get("filter_") == "available"  # routed to the catalog, not installed
+
+    def test_skills_plain_list_fetches_installed(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "resolve_agent_or_error", lambda creds, t: {"agent_id": "a1", "name": "Bot"})
+        monkeypatch.setattr(eesel, "fetch_agent_skills", lambda creds, aid, **kw: seen.update({"kw": kw}) or [])
+        a = self._parse("skills", "list", "blog")
+        eesel.cmd_skills(a)
+        assert seen["kw"] == {}  # installed view: no filter_
+
+    def test_skills_available_alias_still_works(self):
+        a = self._parse("skills", "available", "blog")
+        assert a.skills_cmd == "available"
