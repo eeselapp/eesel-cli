@@ -6091,6 +6091,108 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 _ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "set", "edit")
 
 
+# ── Path-as-scope namespace (the "everything is files" command model) ─────────
+# The agreed CLI namespace scopes a command by its position in a resource tree —
+# `eesel agents <id> integrations list` instead of `eesel integrations list
+# --agent <id>`. Rather than re-implement dispatch, the path grammar is
+# *normalized* into the flat command forms the cmd_* handlers already implement
+# (mirrors _normalize_integrations_argv, generalized to the agent scope). The
+# flat forms stay valid as hidden aliases, so nothing that scripts the old
+# spelling breaks. This is the resolver + registry from the namespace plan: the
+# registry below says, per agent-scoped child noun, how the flat form receives
+# the agent; the resolver walks the path and reshapes.
+
+# The flat verbs the `agents` command already owns. When the token after
+# `agents` is one of these, the invocation is already in flat form — leave it.
+_AGENTS_FLAT_VERBS = frozenset(
+    {"list", "show", "instructions", "create", "add", "set", "edit", "remove", "use", "unset"}
+)
+
+# Agent-scoped child nouns → how their flat form takes the agent:
+#   "flag" → append `--agent <id>`            (e.g. `integrations list --agent X`)
+#   "pos"  → agent is the first positional    (e.g. `skills list X`, verb then id)
+# This is the per-noun knowledge that lets one resolver serve every noun.
+_AGENT_SCOPED_CHILDREN = {
+    "integrations": "flag",
+    "documents": "flag",
+    "tasks": "flag",
+    "skills": "pos",
+    "triggers": "pos",
+    "schedules": "pos",
+}
+
+
+def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
+    """Reshape `agents <id> <noun> <verb> …` (path-as-scope) into the flat argv
+    the argparse handlers expect. Returns argv unchanged when it isn't a
+    path-scoped `agents <id> …` invocation (so the flat `agents` parser and every
+    other command are untouched).
+
+    The grammar is `agents <id> <tail>`; `<tail>` is dispatched by its head:
+    - empty                       → `agents show <id>`            (cat the agent)
+    - `set <field> <value> …`     → `agents set <id> --<field> <value> …`
+    - `show …`                    → `agents show <id> …`          (carries flags)
+    - `add|remove <pool>`         → `integrations add|remove <pool> --agent <id>` (grant/revoke)
+    - `<child-noun> …`            → the child's flat form, scoped to <id>
+    - `chat …`                    → `chat … --agent <id>`
+    - anything else               → unchanged (argparse raises a suggesting error)
+    """
+    if not argv or argv[0] != "agents":
+        return argv
+    rest = argv[1:]
+    # `agents`, `agents --json`, `agents -h` → flat agent listing. And if the
+    # first token is a flat verb, it's already the flat form.
+    if not rest or rest[0].startswith("-") or rest[0] in _AGENTS_FLAT_VERBS:
+        return argv
+
+    agent = rest[0]            # the path scope: an agent id, id-prefix, or name
+    tail = rest[1:]
+    if not tail:
+        return ["agents", "show", agent]          # `agents <id>` → show the agent
+    head = tail[0]
+
+    if head == "set":
+        # `agents <id> set name "QA" instructions "…"` → flat flag form. Field
+        # tokens become `--field`; the following token is its value. Pre-formed
+        # flags (`--json`) pass through untouched.
+        out = ["agents", "set", agent]
+        i, fields = 0, tail[1:]
+        while i < len(fields):
+            tok = fields[i]
+            if tok.startswith("-"):
+                out.append(tok)
+                i += 1
+                continue
+            out.append("--" + tok)
+            if i + 1 < len(fields):
+                out.append(fields[i + 1])
+            i += 2
+        return out
+
+    if head == "show":
+        return ["agents", "show", agent] + tail[1:]
+
+    # Grant / revoke a shared integration at the agent scope (`agents X add zd`).
+    # Reuses the existing integrations connect/disconnect endpoints with the
+    # agent supplied by the path instead of a flag.
+    if head in ("add", "remove") and len(tail) >= 2 and not tail[1].startswith("-"):
+        return ["integrations", head, tail[1]] + tail[2:] + ["--agent", agent]
+
+    if head in _AGENT_SCOPED_CHILDREN:
+        child = tail[1:]                          # the child's own `verb [args]`
+        if _AGENT_SCOPED_CHILDREN[head] == "flag":
+            return [head] + child + ["--agent", agent]
+        # "pos": flat form is `<noun> <verb> <id> [args]`; default verb is list.
+        if not child or child[0].startswith("-"):
+            child = ["list"] + child
+        return [head, child[0], agent] + child[1:]
+
+    if head == "chat":
+        return ["chat"] + tail[1:] + ["--agent", agent]
+
+    return argv
+
+
 def _normalize_integrations_argv(argv: list[str]) -> list[str]:
     """Reshape `integrations <integration> actions ...` into the argparse layout.
 
@@ -6142,6 +6244,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser(staff)
     if argv is None:
         argv = sys.argv[1:]
+    # Path-as-scope first (`agents <id> integrations …` → flat + `--agent <id>`),
+    # then the integrations actions reshape runs on its output.
+    argv = _normalize_path_scope_argv(argv)
     argv = _normalize_integrations_argv(argv)
     args = parser.parse_args(argv)
     return args.func(args)

@@ -6765,3 +6765,77 @@ class TestNewAgentScope:
         rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
         assert rc == 0
         assert created["agent_id"] == "sched-agent"  # session pinned to the trigger's agent, in memory only
+
+
+class TestPathScopeResolver:
+    """`agents <id> <noun> <verb> …` (path-as-scope) normalizes into the flat
+    argv the handlers already implement. Flat forms pass through untouched."""
+
+    def n(self, *argv):
+        return eesel._normalize_path_scope_argv(list(argv))
+
+    # ── pass-through: not a path-scoped agents invocation ──
+    def test_bare_agents_unchanged(self):
+        assert self.n("agents") == ["agents"]
+
+    def test_agents_with_flag_unchanged(self):
+        assert self.n("agents", "--json") == ["agents", "--json"]
+
+    def test_flat_verb_unchanged(self):
+        assert self.n("agents", "list") == ["agents", "list"]
+        assert self.n("agents", "show", "blog") == ["agents", "show", "blog"]
+        assert self.n("agents", "set", "blog", "--name", "X") == ["agents", "set", "blog", "--name", "X"]
+
+    def test_non_agents_command_unchanged(self):
+        assert self.n("integrations", "list") == ["integrations", "list"]
+        assert self.n("chat", "hi") == ["chat", "hi"]
+
+    # ── agent's own verbs ──
+    def test_bare_id_becomes_show(self):
+        assert self.n("agents", "blog-bot") == ["agents", "show", "blog-bot"]
+
+    def test_show_carries_flags(self):
+        assert self.n("agents", "blog", "show", "--instructions") == ["agents", "show", "blog", "--instructions"]
+
+    def test_set_one_field(self):
+        assert self.n("agents", "blog", "set", "name", "QA Bot") == ["agents", "set", "blog", "--name", "QA Bot"]
+
+    def test_set_multiple_fields(self):
+        assert self.n("agents", "blog", "set", "name", "QA", "instructions", "Be terse") == \
+            ["agents", "set", "blog", "--name", "QA", "--instructions", "Be terse"]
+
+    # ── grant / revoke at agent scope ──
+    def test_grant_integration(self):
+        assert self.n("agents", "blog", "add", "zendesk") == ["integrations", "add", "zendesk", "--agent", "blog"]
+
+    def test_revoke_integration(self):
+        assert self.n("agents", "blog", "remove", "zendesk") == ["integrations", "remove", "zendesk", "--agent", "blog"]
+
+    # ── child noun descent: "flag" scoping ──
+    def test_integrations_list_flag_scoped(self):
+        assert self.n("agents", "blog", "integrations", "list") == ["integrations", "list", "--agent", "blog"]
+
+    def test_integrations_actions_path(self):
+        # path-scope hands off to _normalize_integrations_argv for the actions reshape
+        assert self.n("agents", "blog", "integrations", "zd", "actions", "enable", "reply") == \
+            ["integrations", "zd", "actions", "enable", "reply", "--agent", "blog"]
+
+    def test_documents_flag_scoped(self):
+        assert self.n("agents", "blog", "documents", "list") == ["documents", "list", "--agent", "blog"]
+
+    # ── child noun descent: "pos" scoping (agent is the first positional) ──
+    def test_skills_list_pos_scoped(self):
+        assert self.n("agents", "blog", "skills", "list") == ["skills", "list", "blog"]
+
+    def test_skills_default_verb_is_list(self):
+        assert self.n("agents", "blog", "skills") == ["skills", "list", "blog"]
+
+    def test_skills_show_pos_scoped(self):
+        assert self.n("agents", "blog", "skills", "show", "translation") == ["skills", "show", "blog", "translation"]
+
+    def test_triggers_pos_scoped(self):
+        assert self.n("agents", "blog", "triggers", "list") == ["triggers", "list", "blog"]
+
+    # ── chat at agent scope ──
+    def test_chat_flag_scoped(self):
+        assert self.n("agents", "blog", "chat", "hello") == ["chat", "hello", "--agent", "blog"]
