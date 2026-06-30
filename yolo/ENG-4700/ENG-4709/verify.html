@@ -1,0 +1,269 @@
+<title>Verify · eesel integrations namespace (ENG-4709)</title>
+<meta name="description" content="Live verification of the eesel CLI integrations command rework — available / connect / sync-status — against a running dev stack.">
+<style>
+  :root{
+    --paper:#f4f6f5; --panel:#fbfcfb; --ink:#191e22; --ink-soft:#586069;
+    --line:#dde2df; --line-soft:#e9edea; --accent:#0e6f66;
+    --blocker:#c2423a; --shouldfix:#b07815; --nit:#5a6b8c; --pass:#2c8a59;
+    --shouldfix-bg:#b0781512; --nit-bg:#5a6b8c12; --pass-bg:#2c8a5914; --blocker-bg:#c2423a12;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.55;font-size:16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:940px;margin:0 auto;padding:clamp(20px,4vw,52px) clamp(16px,4vw,40px) 80px}
+  a{color:var(--accent)}
+  code,.mono{font-family:var(--mono)}
+  h1,h2,h3{text-wrap:balance;margin:0}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-soft);font-weight:600}
+  section{margin-top:30px}
+  .shead{display:flex;align-items:baseline;gap:12px;margin-bottom:12px;border-bottom:1px solid var(--line);padding-bottom:9px}
+  .shead h2{font-size:16px;font-weight:670}
+  .shead .eyebrow{margin-left:auto}
+  p{margin:0 0 10px}
+  .lead{color:var(--ink-soft);font-size:14.5px;max-width:76ch}
+
+  .flow{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin:14px 0 4px;font-size:13px}
+  .flow .box{flex:1 1 0;min-width:220px;border:1px solid var(--line);border-radius:11px;background:var(--panel);padding:13px 15px}
+  .flow .box h4{margin:0 0 6px;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-soft)}
+  .flow .box.now{border-left:3px solid var(--shouldfix)} .flow .box.next{border-left:3px solid var(--pass)}
+  .flow ul{margin:0;padding-left:16px;color:var(--ink-soft)} .flow li{margin:3px 0}
+  .arr{align-self:center;font-family:var(--mono);color:var(--ink-soft);font-size:20px}
+
+  header.top{border:1px solid var(--line);border-radius:14px;background:var(--panel);overflow:hidden;margin-top:18px}
+  .verdict{display:flex;gap:18px;align-items:flex-start;padding:20px 22px;background:linear-gradient(180deg,var(--pass-bg),transparent)}
+  .stamp{flex:0 0 auto;font-family:var(--mono);font-weight:700;font-size:13px;letter-spacing:.04em;color:#fff;background:var(--pass);padding:8px 13px;border-radius:8px;line-height:1.1;display:flex;flex-direction:column;gap:3px;align-items:center;min-width:96px;text-align:center}
+  .stamp small{font-weight:500;font-size:10px;letter-spacing:.1em;opacity:.92}
+  .verdict h1{font-size:clamp(18px,2.3vw,22px);font-weight:680;letter-spacing:-.01em}
+  .verdict p{margin:7px 0 0;color:var(--ink-soft);font-size:14px;max-width:66ch}
+  .meta{display:flex;flex-wrap:wrap;border-top:1px solid var(--line);font-family:var(--mono);font-size:12.5px}
+  .meta div{padding:10px 16px;border-right:1px solid var(--line);flex:1 1 auto}
+  .meta div:last-child{border-right:0}
+  .meta span{display:block;color:var(--ink-soft);font-size:10px;letter-spacing:.1em;text-transform:uppercase;margin-bottom:3px}
+  .meta b{font-weight:600}
+
+  .delta{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;margin:20px 0 0}
+  @media(max-width:760px){.delta{grid-template-columns:1fr}.flow .arr{display:none}}
+  .delta>div{border:1px solid var(--line);border-radius:11px;padding:14px 15px;background:var(--panel)}
+  .delta h3{font-size:12px;font-family:var(--mono);letter-spacing:.04em;margin-bottom:8px;display:flex;align-items:center;gap:7px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .delta p,.delta li{font-size:13px;color:var(--ink-soft)} .delta ul{margin:0;padding-left:16px}
+
+  details{border:1px solid var(--line);border-radius:11px;background:var(--panel);margin-top:13px;overflow:hidden}
+  summary{cursor:pointer;padding:13px 16px;font-weight:620;font-size:14px;list-style:none;display:flex;align-items:center;gap:9px}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";margin-left:auto;font-family:var(--mono);color:var(--ink-soft);font-size:17px}
+  details[open]>summary::after{content:"\2212"}
+  .dbody{padding:2px 16px 16px;font-size:13.5px}
+  .dbody p{color:var(--ink-soft);font-size:13.5px}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  thead th{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-soft);border-bottom:1px solid var(--line)}
+  td.note{color:var(--ink-soft);font-size:12.5px}
+  .chip{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:20px;white-space:nowrap}
+  .c-pass{color:var(--pass);background:var(--pass-bg)} .c-na{color:var(--ink-soft);background:#5860691a}
+  .ev{font-family:var(--mono);font-size:10.5px;color:var(--ink-soft)}
+  .ev.ran{color:var(--pass)}
+  .tree{font-family:var(--mono);font-size:12.5px;background:var(--paper);border:1px solid var(--line);border-radius:9px;padding:13px 15px;overflow-x:auto;line-height:1.7;color:var(--ink-soft)}
+  .tree b{color:var(--ink)} .tree .c{color:#7d8a86}
+  .finding{border-left:3px solid var(--line);padding:3px 0 3px 13px;margin:12px 0}
+  .finding.fixed{border-left-color:var(--pass)} .finding.low{border-left-color:var(--nit)}
+  .finding h4{margin:0 0 3px;font-size:13.5px}
+  .finding .tag{font-family:var(--mono);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;padding:2px 7px;border-radius:5px;margin-right:7px}
+  .tag.fixed{color:var(--pass);background:var(--pass-bg)} .tag.low{color:var(--nit);background:var(--nit-bg)}
+  .finding p{margin:2px 0;font-size:13px}
+  .squad{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:6px}
+  @media(max-width:600px){.squad{grid-template-columns:1fr}}
+  .squad div{border:1px solid var(--line-soft);border-radius:9px;padding:9px 11px;font-size:12.5px;color:var(--ink-soft)}
+  .squad b{font-family:var(--mono);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink)}
+  .human li{margin-bottom:11px;font-size:13.5px}
+  footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);display:flex;flex-wrap:wrap;gap:7px 18px}
+</style>
+
+<div class="wrap">
+
+  <section style="margin-top:0">
+    <div class="shead"><h2>What this change is for</h2><span class="eyebrow">ENG-4709</span></div>
+    <p class="lead">The <code>eesel</code> CLI could already <em>list</em> a workspace's connected integrations, but it
+    couldn't operate on them: no way to see what's connectable, start connecting a new one, or watch a sync — for any
+    of that you had to leave the terminal for the dashboard. This change closes that gap and settles the command names
+    for the integrations group on the ones the ticket specified.</p>
+    <p class="lead" style="font-size:13px">Spec: the <a href="https://linear.app/eesel/issue/ENG-4709">ENG-4709</a>
+    ticket (child of the ENG-4700 CLI audit). This review is the chapter after the build — it checks that what the
+    ticket asked for actually holds against a running server.</p>
+
+    <div class="flow">
+      <div class="box now"><h4>Before</h4>
+        <ul>
+          <li><code>integrations list</code> — see what's connected</li>
+          <li>universal verbs <code>add</code> / <code>show</code> / <code>remove</code></li>
+          <li>no catalog of connectable types</li>
+          <li>no live sync progress; connecting went through one generic endpoint</li>
+        </ul>
+      </div>
+      <div class="arr">&rarr;</div>
+      <div class="box next"><h4>After</h4>
+        <ul>
+          <li><code>available</code> — the connectable catalog + how to connect each</li>
+          <li><code>connect</code> — pick a connection option; direct connect or browser OAuth hand-off</li>
+          <li><code>sync</code> / <code>sync-status</code> — trigger and watch a sync</li>
+          <li><code>add</code> / <code>disconnect</code> kept working but hidden</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <header class="top">
+    <div class="verdict">
+      <div class="stamp">WORKS<small>0 OPEN · 1 DECISION</small></div>
+      <div>
+        <h1>All five acceptance criteria pass against a live server. One bug was found and fixed during this check; one
+        naming decision needs a human to sign off.</h1>
+        <p>Connecting, syncing, and listing all work end-to-end; secrets stay masked; an unreachable or misbehaving
+        server now exits with one clean line instead of a stack trace; and checking a sync's progress never accidentally
+        starts one. The decision for a human isn't a bug — it's whether to keep integrations on its own command names,
+        since it's now the only group that doesn't use the CLI's shared verbs.</p>
+      </div>
+    </div>
+    <div class="meta">
+      <div><span>Change</span><b>PR #22 · ENG-4709</b></div>
+      <div><span>Verified at</span><b>21eb608</b></div>
+      <div><span>Unit tests</span><b>583 passing</b></div>
+      <div><span>Ran against</span><b>live dev stack :8080</b></div>
+    </div>
+  </header>
+
+  <div class="delta">
+    <div>
+      <h3><span class="dot" style="background:var(--accent)"></span>What changes for users</h3>
+      <p>Four commands to set up and watch an integration. <code>available</code> lists what a workspace can connect,
+      and for each, its <em>connection options</em> — the ways to connect it (Zendesk, say, offers OAuth, a quick-start
+      form, or messenger). <code>connect &lt;key&gt; --option &lt;type&gt;</code> picks one: a form option connects
+      directly from fields you pass (<code>--field k=v</code>); an OAuth option opens your browser to finish the login
+      and stops there (it doesn't wait). <code>sync</code> triggers a data refresh; <code>sync-status</code> shows each
+      sync's progress.</p>
+    </div>
+    <div>
+      <h3><span class="dot" style="background:var(--pass)"></span>What must not change (and didn't)</h3>
+      <ul>
+        <li><code>integrations list</code>, bare list, <code>--json</code>, <code>--secrets</code> — output unchanged.</li>
+        <li>Old verbs still work as hidden aliases: <code>add</code> for <code>connect</code>, <code>disconnect</code> for <code>remove</code>.</li>
+        <li>Integration secrets stay masked everywhere, including <code>show --json</code>.</li>
+      </ul>
+    </div>
+    <div>
+      <h3><span class="dot" style="background:var(--shouldfix)"></span>Watch this</h3>
+      <ul>
+        <li>Integrations no longer uses the CLI's shared verbs (<code>add</code> / <code>show</code> / <code>remove</code>, the set every other group uses) — a deliberate call for a human to approve (see PR).</li>
+        <li><code>connect</code> needs <code>--option</code> when a connector has several; an old <code>add --config</code> script now stops with a clear error instead of doing the wrong thing.</li>
+      </ul>
+    </div>
+  </div>
+
+  <details>
+    <summary>🗺️ Footprint — what changed</summary>
+    <div class="dbody">
+      <p>One single-file CLI, its test file, the README, and this review. No new dependencies, no new auth path; every
+      endpoint it calls already exists and is the same one the dashboard uses.</p>
+      <div class="tree">/ <span class="c"># single stdlib Python CLI + tests + docs</span>
+<b>eesel</b>            <span class="c">integrations: + available, + sync-status;</span>
+                  <span class="c">connect now picks a connection option (direct</span>
+                  <span class="c">form vs browser OAuth); show + sync-status read</span>
+                  <span class="c">the list of sync runs, not the endpoint that</span>
+                  <span class="c">starts one; add/disconnect hidden as aliases</span>
+<b>test_eesel.py</b>     <span class="c">583 passing — available, connect (both connect</span>
+                  <span class="c">paths, option choice, field parsing),</span>
+                  <span class="c">sync-status, show's sync source, hidden aliases</span>
+<b>README.md</b>        <span class="c">integrations section rewritten to the new verbs</span>
+
+<span class="c">~360 lines of CLI changed; the connect/sync code paths</span>
+<span class="c">are the substance, the rest is verbs + tests + docs.</span></div>
+    </div>
+  </details>
+
+  <details open>
+    <summary>✅ Acceptance criteria — 5 passed, 0 failed</summary>
+    <div class="dbody" style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Criterion</th><th>Status</th><th>How known</th></tr></thead>
+        <tbody>
+          <tr><td><code>available</code> shows connectable types with category; Zendesk under helpdesk</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — output lists <code>zendesk · helpdesk · quick_start, oauth, messenger</code>; matches the list of connectable types the server returns (25)</td></tr>
+          <tr><td><code>connect zendesk --option oauth</code> opens the OAuth page and exits without waiting</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — opened the dashboard OAuth URL with the right workspace/agent params, exit 0; a test proves this path makes no POST</td></tr>
+          <tr><td><code>connect zendesk --option quick_start</code> with no field → readable error, no request sent</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — "missing required field(s): subdomain", exit 1; the missing-field check runs before any network call</td></tr>
+          <tr><td><code>sync</code> on a non-Zendesk integration → clear message, no crash, nothing triggered</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — "only zendesk integrations support trigger-sync", exit 1; no new run appeared</td></tr>
+          <tr><td><code>sync-status [&lt;id&gt;]</code> shows runs with status + progress, filtered to one integration</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — bare lists all runs; with an id, only that integration's runs; reads the list of sync runs, never the endpoint that starts one</td></tr>
+          <tr><td>Must-not-change: list / whoami unchanged; a new command while logged out errors and exits non-zero</td><td><span class="chip c-pass">PASS</span></td><td class="note"><span class="ev ran">ran it</span> — list and whoami byte-identical to before; logged-out gives the standard "Run <code>eesel login</code>" error, exit 1</td></tr>
+          <tr><td>Live OAuth round-trip completes in a real browser</td><td><span class="chip c-na">NOT RUN</span></td><td class="note">out of scope by design — the CLI initiates the flow and hands off; finishing OAuth needs a real third party</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <details open>
+    <summary>🔍 Review findings — 1 blocker (fixed), plus low notes</summary>
+    <div class="dbody">
+      <p style="margin-bottom:12px">This change was checked by a set of independent review passes — one per concern
+      (behaviour, resilience, server load, cost, customer impact, conventions), each done in its own fresh context so no
+      pass graded its own work. Here's what they found.</p>
+      <div class="finding fixed">
+        <h4><span class="tag fixed">Fixed</span>A misbehaving server made <code>connect</code> dump a stack trace</h4>
+        <p>The shared "let me see the error body" request helper parsed the response as JSON without guarding it. When a
+        server answers a request with a success code but a non-JSON body — a proxy or login page sitting in front of the
+        API, a real misconfiguration — that parse threw and the raw Python traceback escaped. It hit <code>connect</code>
+        (and any command on that helper). This is the same kind of leak that was just fixed for <code>chat</code>.</p>
+        <p><span class="ev ran">ran it</span> — reproduced against a local server returning a 200 HTML page (traceback),
+        then confirmed the fix: it now prints one clean line ("the response was not JSON — a proxy or login page?") and
+        exits 1, matching how the strict request helper already behaves. Found and fixed within this verify pass.</p>
+      </div>
+      <div class="finding low">
+        <h4><span class="tag low">Low</span>Old <code>--config</code> / <code>--token</code> connect flags removed (not just hidden)</h4>
+        <p>The build had kept these as "back-compat" flags, but a review pass showed they no longer reproduced the old
+        behavior for the very connectors a script would target. Rather than ship a flag that promises compatibility it
+        doesn't deliver, they were dropped: <code>connect</code> is now field-driven (<code>--field</code>) as the
+        ticket specifies. An old <code>add --config</code> call now stops with a plain "unrecognized argument" error
+        instead of silently doing the wrong thing. <span class="ev ran">ran it</span>.</p>
+      </div>
+      <div class="finding low">
+        <h4><span class="tag low">Low</span>Redundant-sync protection is server-side only</h4>
+        <p>Repeatedly triggering a sync collapses to one run on the server (it returns "already in progress", which the
+        CLI reports honestly). The CLI adds no local guard — acceptable, because it's no worse than scripting the
+        dashboard's own API and the server is the backstop. <span class="ev">read it</span>.</p>
+      </div>
+
+      <p style="margin-top:14px"><b>Safety squad</b> — each lens ran in its own fresh context:</p>
+      <div class="squad">
+        <div><b>Resilience</b> — solid after the fix above: unreachable server, 404s, empty/odd responses, malformed
+        <code>--field</code>, headless redirect all give clean exits, no hangs, no tracebacks. <span class="ev ran">ran each</span>.</div>
+        <div><b>Operational load</b> — no concern. Each command is 1–2 bounded requests, no fan-out, no retries; the
+        sync-runs feed is server-capped (50 rows + 24h). <span class="ev">read + cross-checked the server</span>.</div>
+        <div><b>Cost</b> — nothing here adds a new usage-billed call. <code>connect</code>/<code>sync</code> hit the same
+        endpoints the dashboard already drives; the read commands make no model calls. <span class="ev">read it</span>.</div>
+        <div><b>Customer impact</b> — read paths and the hidden <code>add</code>/<code>disconnect</code> aliases are
+        safe. Some old <code>add --config</code> forms now stop with a clear error instead of connecting — acceptable
+        since these verbs are unreleased; surfaced here so it's a deliberate call. <span class="ev ran">ran each old form</span>.</div>
+      </div>
+    </div>
+  </details>
+
+  <details>
+    <summary>🙋 Needs a human</summary>
+    <div class="dbody">
+      <ul class="human">
+        <li><b>Approve the command names.</b> Every other command group (documents, agents, mcp, …) uses the same three
+        verbs — <code>add</code>, <code>show</code>, <code>remove</code>. This change gives integrations its own names
+        instead (<code>available</code>, <code>connect</code>, <code>sync-status</code>), so it becomes the one
+        exception. It's the deliberate choice behind this work — and the new <code>connect</code> is also the more
+        correct implementation — but a human should sign off on the divergence before it ships (it's revertable).
+        <br><span class="ev">Done when: the team confirms these integration command names are the intended public surface, or asks to fold them back into the shared verbs.</span></li>
+      </ul>
+    </div>
+  </details>
+
+  <footer>
+    <span>VERIFY · commit 21eb608 · fresh-context review passes (behaviour · resilience · load · cost · customer impact · conventions)</span>
+    <span>tested live · docker dev stack :8080 · eesel login --dev</span>
+    <span>no open blocker; merge after the command-names decision is signed off</span>
+  </footer>
+
+</div>
