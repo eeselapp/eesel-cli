@@ -2954,35 +2954,71 @@ def _integrations_sync_status(args, creds: dict) -> int:
 
 
 def _integrations_remove(args, creds: dict) -> int:
-    """Disconnect (remove) a connected integration via DELETE
-    /integrations/{id}. Reached via `remove` or its alias `disconnect`.
+    """Remove a connected integration. Reached via `remove` or `disconnect`.
 
-    `<id>` resolves from a full id, id prefix, or integration type. Asks for
-    confirmation unless `--force` is passed, since disconnecting removes the
-    integration and its synced knowledge from the workspace.
+    Two scopes, mirroring the dashboard's two menu items:
+
+    - **From one agent** — when an agent is named explicitly (`eesel agents
+      <id> remove <x>`, or the `--agent <id>` flag): DELETE
+      /agents/{agent_id}/integrations/{id}, which drops just that agent's
+      triggers, tools, and knowledge-ACL entries for the integration. The
+      shared connection is left in place, so every other agent keeps its
+      access.
+    - **From the whole workspace** — with no explicit agent: DELETE
+      /integrations/{id}, which uninstalls the integration for every agent.
+
+    The switch is whether an agent was named *for this command* (``args.agent``)
+    — not whether one happens to be active. So a bare `eesel integrations
+    remove <x>` stays a workspace uninstall even when a default agent is set,
+    and the destructive workspace path always asks before acting.
+
+    `<x>` resolves from a full id, id prefix, or integration type. Asks for
+    confirmation unless `--force` is passed.
     """
-    integration = resolve_integration_strict(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+    scoped = bool(getattr(args, "agent", None))
+    agent_id = creds.get("agent_id")
+    integration = resolve_integration_strict(fetch_integrations(creds, agent_id=agent_id), args.id)
     if not integration:
         return 1
     integration_id = integration["id"]
     label = integration.get("integrationType") or integration_id
     identifier = integration.get("identifier")
     desc = f"{label}" + (f" ({identifier})" if identifier else "") + f" [{integration_id}]"
+
+    if scoped:
+        prompt = f"Remove integration {desc} from agent {args.agent}? Other agents keep their access. [y/N] "
+    else:
+        prompt = f"Uninstall integration {desc} from the whole workspace? Every agent loses it; this cannot be undone. [y/N] "
     if not getattr(args, "force", False):
         # Affirmative = y/yes (case-insensitive); bare Enter or EOF aborts.
         try:
-            answer = input(f"Disconnect integration {desc}? This cannot be undone. [y/N] ").strip().lower()
+            answer = input(prompt).strip().lower()
         except EOFError:
             answer = ""
         if answer not in ("y", "yes"):
             info("Aborted.")
             return 1
+
+    if scoped:
+        # Per-agent removal. The server returns 200, or 207 with an `errors`
+        # list when some of the trigger/tool/ACL cleanup partially failed but
+        # the removal still stands — surface those as warnings, not a failure.
+        result = http_request(
+            "DELETE",
+            f"{creds['api_url']}/agents/{urllib.parse.quote(str(agent_id))}/integrations/{urllib.parse.quote(str(integration_id))}",
+            token=creds["token"],
+        )
+        for issue in (result.get("errors") or []) if isinstance(result, dict) else []:
+            warn(f"partial cleanup issue: {issue}")
+        ok(f"Removed integration {desc} from agent {args.agent}. Other agents keep their access.")
+        return 0
+
     http_request(
         "DELETE",
         f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}",
         token=creds["token"],
     )
-    ok(f"Disconnected integration {desc}.")
+    ok(f"Uninstalled integration {desc} from the workspace.")
     return 0
 
 
@@ -5798,9 +5834,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     def _remove_args(p):
         p.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
         p.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-        p.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+        p.add_argument("--agent", help="Remove the integration from just this agent (id, id-prefix, or name) — other agents keep their access. Without it, the integration is uninstalled for the whole workspace.")
 
-    i_rm = ig_sub.add_parser("remove", help="Disconnect a connected integration (asks for confirmation)")
+    i_rm = ig_sub.add_parser("remove", help="Remove an integration from one agent (--agent) or uninstall it for the whole workspace")
     _remove_args(i_rm)
     # `disconnect` is the hidden back-compat alias for the canonical `remove`.
     _remove_args(ig_sub.add_parser("disconnect", help=argparse.SUPPRESS))

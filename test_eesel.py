@@ -4629,7 +4629,7 @@ class TestIntegrationsRemove:
         assert rc == 0
         assert captured["method"] == "DELETE"
         assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
-        assert "Disconnected" in capsys.readouterr().err
+        assert "Uninstalled" in capsys.readouterr().err
 
     def test_disconnect_alias_routes_to_remove(self, fake_creds, monkeypatch, capsys):
         captured = {}
@@ -4669,6 +4669,56 @@ class TestIntegrationsRemove:
         out = capsys.readouterr().err
         assert "ambiguous" in out
         assert "int-zd-1" in out and "int-zd-2" in out
+
+    def test_agent_scoped_remove_hits_per_agent_endpoint(self, fake_creds, monkeypatch, capsys):
+        # `--agent` (the flat form of `agents <id> remove <x>`) removes the
+        # integration from just that agent — DELETE /agents/{id}/integrations/{id} —
+        # not the workspace-wide DELETE /integrations/{id}.
+        captured = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "agent-test-456", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {"message": "Integration removed from agent"})
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True, agent="agent-test-456"))
+        assert rc == 0
+        assert captured["method"] == "DELETE"
+        assert captured["url"] == "http://localhost:8080/agents/agent-test-456/integrations/int-zendesk-1"
+        out = capsys.readouterr().err
+        assert "Removed" in out and "Other agents keep their access" in out
+
+    def test_agent_scoped_remove_surfaces_partial_cleanup_errors(self, fake_creds, monkeypatch, capsys):
+        # A 207 from the server carries an `errors` list: report it as a warning
+        # but still treat the removal as done (rc 0).
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "agent-test-456", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"message": "Integration removed with partial errors", "errors": ["triggers: boom"]})
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True, agent="agent-test-456"))
+        assert rc == 0
+        out = capsys.readouterr().err
+        assert "partial cleanup issue" in out and "triggers: boom" in out
+        assert "Removed" in out
+
+    def test_remove_prompt_text_differs_by_scope(self, fake_creds, monkeypatch):
+        # The confirmation makes the blast radius explicit: per-agent reassures
+        # that other agents keep access; workspace warns it hits every agent.
+        prompts = []
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "agent-test-456", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {})
+        monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "y")
+
+        eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", agent="agent-test-456"))
+        eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk"))
+        scoped_prompt, workspace_prompt = prompts
+        assert "Other agents keep their access" in scoped_prompt
+        assert "whole workspace" in workspace_prompt and "cannot be undone" in workspace_prompt
+
+    def test_agent_scoped_force_skips_prompt(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "agent-test-456", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {})
+        monkeypatch.setattr("builtins.input", lambda *a, **k: pytest.fail("--force must not prompt"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True, agent="agent-test-456"))
+        assert rc == 0
 
 
 class TestResolveIntegration:

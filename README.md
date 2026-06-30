@@ -167,7 +167,11 @@ eesel integrations connect <key> --option quick_start --field subdomain=acme [--
 eesel integrations connect <key> --option oauth [--agent <agent>]                                # browser OAuth hand-off
 eesel integrations sync <id> [--type help-center] [--agent <agent>]                  # trigger a data sync (Zendesk only)
 eesel integrations sync-status [<id>] [--agent <agent>]                              # sync-run status + progress (all, or one integration's)
-eesel integrations remove <id> [--agent <agent>]         # disconnect (-f to skip the prompt)
+# `remove` has two scopes (mirrors the dashboard's two options):
+#   --agent <agent>  → remove from just that agent; other agents keep their access
+#   (no --agent)     → uninstall for the WHOLE workspace; every agent loses it
+eesel integrations remove <id> --agent <agent>           # remove from one agent (others keep access)
+eesel integrations remove <id>                           # uninstall for the whole workspace (-f to skip the prompt)
 
 # Actions (formerly `tools`) are scoped under their integration; --agent picks
 # whose action set to read/write (default: the active agent)
