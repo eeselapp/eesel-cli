@@ -2550,7 +2550,17 @@ def cmd_integrations(args) -> int:
     # list/show is computed against this agent, and `connect`'s redirect/OAuth
     # hand-off carries it as the agentId so the post-auth page lands on the right
     # agent. Resolving it here applies the scope uniformly across the group.
-    if getattr(args, "agent", None):
+    agent_arg = getattr(args, "agent", None)
+    if agent_arg is not None and not agent_arg.strip():
+        # `--agent` was passed but is empty (e.g. `--agent "$AGENT"` with the
+        # variable unset). Don't let it fall through the truthiness check below to
+        # the unscoped path — for `remove` that would uninstall the integration
+        # for the whole workspace instead of revoking it from one agent. Treat
+        # "given but blank" as the error it is, distinct from "not given at all".
+        err("--agent was given but is empty. Pass an agent id, id-prefix, or name, "
+            "or omit --agent to act on the whole workspace.")
+        return 1
+    if agent_arg:
         agent, candidates = resolve_agent_strict(fetch_agents(creds), args.agent)
         if not agent:
             if candidates:
@@ -6242,6 +6252,15 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
         return argv
 
     agent = rest[0]            # the path scope: an agent id, id-prefix, or name
+    if not agent.strip():
+        # An empty agent token (e.g. `eesel agents "$AGENT" remove zendesk` with
+        # `$AGENT` unset) is never a valid scope. Reshaping it would inject an
+        # empty `--agent`, which downstream reads as "no agent given" — and for
+        # `remove` that silently becomes a workspace-wide uninstall instead of a
+        # per-agent revoke. Fail loudly before any routing happens.
+        err("Empty agent in the command path. Pass an agent id, id-prefix, or name "
+            "after `agents` (e.g. `eesel agents <id> ...`), or omit it.")
+        sys.exit(2)
     tail = rest[1:]
     if not tail:
         return ["agents", "show", agent]          # `agents <id>` → show the agent

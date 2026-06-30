@@ -4670,6 +4670,17 @@ class TestIntegrationsRemove:
         assert "ambiguous" in out
         assert "int-zd-1" in out and "int-zd-2" in out
 
+    def test_blank_agent_flag_errors_without_request(self, fake_creds, monkeypatch, capsys):
+        # A present-but-empty `--agent` (e.g. `--agent "$AGENT"` with the variable
+        # unset) must be treated as an error, NOT as "no agent" — otherwise the
+        # removal silently falls through to the workspace-wide uninstall. It is
+        # distinct from omitting `--agent` entirely (which IS a workspace uninstall).
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: pytest.fail("must not resolve an integration for a blank --agent"))
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE for a blank --agent"))
+        rc = eesel.cmd_integrations(_args(integrations_cmd="remove", id="zendesk", force=True, agent=""))
+        assert rc == 1
+        assert "--agent was given but is empty" in capsys.readouterr().err
+
     def test_agent_scoped_remove_hits_per_agent_endpoint(self, fake_creds, monkeypatch, capsys):
         # `--agent` (the flat form of `agents <id> remove <x>`) removes the
         # integration from just that agent — DELETE /agents/{id}/integrations/{id} —
@@ -6860,6 +6871,22 @@ class TestPathScopeResolver:
 
     def test_revoke_integration(self):
         assert self.n("agents", "blog", "remove", "zendesk") == ["integrations", "remove", "zendesk", "--agent", "blog"]
+
+    # ── empty agent scope is rejected, never reshaped ──
+    def test_empty_agent_scope_exits_without_reshaping(self):
+        # `eesel agents "" remove zendesk` (e.g. an unset shell variable spliced
+        # into the path) must not reshape into an empty `--agent`, which the
+        # removal would read as "no agent" and uninstall workspace-wide. It exits
+        # before any routing, so no destructive flat form is ever produced.
+        for tail in (["remove", "zendesk"], ["integrations", "list"], []):
+            with pytest.raises(SystemExit) as exc:
+                self.n("agents", "", *tail)
+            assert exc.value.code == 2
+
+    def test_whitespace_only_agent_scope_exits(self):
+        with pytest.raises(SystemExit) as exc:
+            self.n("agents", "   ", "remove", "zendesk")
+        assert exc.value.code == 2
 
     # ── child noun descent: "flag" scoping ──
     def test_integrations_list_flag_scoped(self):
