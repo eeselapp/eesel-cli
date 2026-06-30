@@ -6994,6 +6994,32 @@ class TestPathScopeParsesEndToEnd:
                 raise AssertionError(f"path form did not parse: {' '.join(form)}")
 
 
+class TestPathScopeDiscoverable:
+    """The path-as-scope forms are real but argparse can't list them (they reshape
+    into flat commands). They must therefore be advertised in --help, or they're
+    invisible to anyone who didn't read the source."""
+
+    def _agents_help(self):
+        agents = next(
+            a for a in eesel.build_parser()._subparsers._group_actions[0].choices.values()
+            if a.prog.endswith("agents")
+        )
+        return agents.format_help()
+
+    def test_agents_help_documents_the_path_scope_grammar(self):
+        h = self._agents_help()
+        assert "scope by path" in h
+        # The shape and a few representative scoped nouns are shown.
+        assert "eesel agents <id> <noun>" in h or "agents <id> integrations list" in h
+        for noun in ("integrations list", "skills list", "tasks list", "documents list"):
+            assert noun in h, f"path-scope help omits `agents <id> {noun}`"
+        assert "show --instructions" in h
+
+    def test_top_level_help_points_at_path_scope(self):
+        h = eesel.build_parser().format_help()
+        assert "agents <id> <noun> <verb>" in h
+
+
 class TestPathScopeVerbScoping:
     """A 'flag' noun only injects --agent for verbs whose flat parser accepts it
     (documents/tasks have verbs that don't). Verbs that don't must fall through

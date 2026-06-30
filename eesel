@@ -5579,6 +5579,28 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
         _install_suggestions(child)
 
 
+# Shown under `eesel agents --help`. The path-as-scope forms reshape to the flat
+# commands (see `_normalize_path_scope_argv`); they're real but otherwise
+# invisible — argparse only lists the flat `agents` verbs — so advertise them
+# here. Keep in sync with `_AGENT_SCOPED_CHILDREN` and the reshape's verb heads.
+_AGENTS_PATH_EPILOG = """\
+scope by path:
+  Put an agent's id in the command path to scope a noun to that agent — the
+  same as the flat command with --agent. The id can be a full id, id-prefix,
+  or name.
+
+    eesel agents <id>                        show the agent (= `agents show <id>`)
+    eesel agents <id> show --instructions    print just its system prompt
+    eesel agents <id> set <field> <value>    edit a field (= `agents set <id> --<field> ...`)
+    eesel agents <id> integrations list      that agent's integrations (any integrations verb)
+    eesel agents <id> skills list            that agent's skills (any skills verb)
+    eesel agents <id> tasks list             that agent's tasks (list/count/analytics/export)
+    eesel agents <id> documents list         that agent's documents (list/show/read/add)
+    eesel agents <id> remove <integration>   remove an integration from just this agent
+    eesel agents <id> chat "..."             chat with this agent
+"""
+
+
 def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     """Build the CLI parser.
 
@@ -5589,7 +5611,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     nothing breaks for someone who knows them, but the server-side allowlist
     (and, for dev login, the local-only dev secret) is the real gate.
     """
-    p = argparse.ArgumentParser(prog="eesel", description=__doc__.strip().split("\n")[0])
+    p = argparse.ArgumentParser(
+        prog="eesel",
+        description=__doc__.strip().split("\n")[0],
+        epilog="Tip: scope a command to one agent by path — `eesel agents <id> <noun> <verb>` "
+               "(e.g. `eesel agents <id> integrations list`). See `eesel agents --help`.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)" if staff else "Authenticate")
@@ -5603,7 +5631,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp = sub.add_parser("whoami", help="Show the current login")
     sp.set_defaults(func=cmd_whoami)
 
-    sp = sub.add_parser("agents", help="List, inspect, or manage agents")
+    sp = sub.add_parser(
+        "agents",
+        help="List, inspect, or manage agents",
+        epilog=_AGENTS_PATH_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     a_sub = sp.add_subparsers(dest="agents_cmd")
     list_p = a_sub.add_parser("list", help="List agents in this workspace (each row shows its on/off status)")
     list_p.add_argument("--json", action="store_true", help="Print the raw agent list as JSON")
