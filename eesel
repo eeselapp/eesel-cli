@@ -904,9 +904,7 @@ def parse_config_object(raw: str, *, example: str = '{"key": "value"}') -> dict:
     add, schedules add, skills edit, mcp add): malformed input gives the same
     message and the same exit code, rather than each command inventing its own
     error contract. ``example`` tailors the "must be a JSON object" hint to the
-    calling command. (Two commands keep bespoke parsers because their config
-    carries extra handling: ``integrations add`` and ``integrations actions
-    edit``.)
+    calling command.
     """
     try:
         obj = json.loads(raw)
@@ -1270,6 +1268,19 @@ def fetch_integration_definitions(creds: dict) -> list[dict]:
     if isinstance(data, list):
         return data
     return data.get("integrations") or data.get("items") or []
+
+
+def fetch_integration_definition(creds: dict, key: str) -> dict | None:
+    """One connectable type's definition from GET /integration-definitions/{key}
+    (the response wraps it under ``integration``), or None if there's no such
+    connector. `connect` uses this to read just the target's connection_options
+    rather than transferring the whole catalog."""
+    status, data = http_request_allow_error(
+        "GET", f"{creds['api_url']}/integration-definitions/{urllib.parse.quote(key)}", token=creds["token"]
+    )
+    if status >= 400 or not isinstance(data, dict):
+        return None
+    return data.get("integration")
 
 
 def _connection_options(definition: dict) -> list[dict]:
@@ -2663,35 +2674,31 @@ def _integrations_show(args, creds: dict) -> int:
     return 0
 
 
-def _latest_sync_run(creds: dict, integration_id: str):
-    """The most recent sync run for an integration from GET /v2/sync-runs, or
-    None.
+def _fetch_sync_runs(creds: dict) -> list:
+    """The workspace's sync runs from GET /v2/sync-runs, normalized to a list.
 
-    Reads the sync-runs feed (status + progress), NOT GET /integrations/{id}/sync
-    — the latter *triggers* a sync rather than reporting one, so reading status
-    from it would kick off unintended syncs. The feed only lists active and
-    last-24h runs, so an integration whose last sync is older has no run here.
+    The feed wraps the runs under ``jobs`` and only includes active and last-24h,
+    non-dismissed runs. Reading status here is deliberate: GET
+    /integrations/{id}/sync *triggers* a sync rather than reporting one, so it
+    must not be used to read status.
     """
+    data = http_request("GET", f"{creds['api_url']}/v2/sync-runs", token=creds["token"])
+    return data.get("jobs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+
+
+def _runs_for_integration(runs: list, integration_id: str) -> list:
+    """The sync runs in `runs` whose metadata names `integration_id`."""
+    return [r for r in runs if str((r.get("metadata") or {}).get("integration_id")) == str(integration_id)]
+
+
+def _latest_sync_run(creds: dict, integration_id: str):
+    """The most recent sync run for an integration, or None — the one with the
+    newest `updated_at` (so the result doesn't depend on the feed's order)."""
     try:
-        data = http_request("GET", f"{creds['api_url']}/v2/sync-runs", token=creds["token"])
+        matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
     except SystemExit:
         return None
-    runs = data.get("jobs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-    return next((r for r in runs if str((r.get("metadata") or {}).get("integration_id")) == str(integration_id)), None)
-
-
-def _parse_config_arg(raw: str | None) -> dict:
-    """Parse the `--config` JSON string into a dict, exiting with a clear
-    message if it isn't a valid JSON object."""
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.exit(f"--config is not valid JSON: {e}")
-    if not isinstance(parsed, dict):
-        sys.exit("--config must be a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
-    return parsed
+    return max(matching, key=lambda r: r.get("updated_at") or r.get("started_at") or "", default=None)
 
 
 def _parse_field_args(raw_fields) -> dict:
@@ -2766,7 +2773,7 @@ def _integrations_connect(args, creds: dict) -> int:
     keys are folded into the field set and `--token` is sent as `access_token`.
     """
     key = args.key
-    definition = next((d for d in fetch_integration_definitions(creds) if d.get("key") == key), None)
+    definition = fetch_integration_definition(creds, key)
     if definition is None:
         err(f"No connectable integration '{key}'.")
         info("Run `eesel integrations available` to see the catalog of connectable types.")
@@ -2779,7 +2786,8 @@ def _integrations_connect(args, creds: dict) -> int:
 
     # Setup fields come from repeatable --field key=value, plus the hidden
     # back-compat --config (a JSON object) and --token (sent as access_token).
-    fields = _parse_config_arg(getattr(args, "config", None))
+    raw_config = getattr(args, "config", None)
+    fields = parse_config_object(raw_config, example='{"subdomain": "acme"}') if raw_config else {}
     fields.update(_parse_field_args(getattr(args, "field", None)))
     token = getattr(args, "token", None)
     if token and "access_token" not in fields:
@@ -2906,10 +2914,9 @@ def _integrations_sync_status(args, creds: dict) -> int:
             return 1
         target_id = str(integration["id"])
 
-    data = http_request("GET", f"{creds['api_url']}/v2/sync-runs", token=creds["token"])
-    runs = data.get("jobs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    runs = _fetch_sync_runs(creds)
     if target_id is not None:
-        runs = [r for r in runs if str((r.get("metadata") or {}).get("integration_id")) == target_id]
+        runs = _runs_for_integration(runs, target_id)
 
     if getattr(args, "json", False):
         print(json.dumps(runs, indent=2))
@@ -5815,9 +5822,9 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
     hide_subcommands(act_sub, "edit")  # `edit` is the hidden alias for `set`
-    # `add`/`disconnect` are the hidden back-compat aliases for the canonical
-    # `connect`/`remove` (the ENG-4700 universal verbs, kept working but off the
-    # help surface so the ENG-4709 vocabulary is what's advertised).
+    # `add`/`disconnect` are the universal-verb spellings, kept working as hidden
+    # back-compat aliases for the canonical `connect`/`remove` but dropped from
+    # the help surface so the integration-specific vocabulary is what's advertised.
     hide_subcommands(ig_sub, "add", "disconnect")
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")

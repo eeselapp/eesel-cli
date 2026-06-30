@@ -4265,7 +4265,7 @@ class TestIntegrationsAgentScope:
         # The resolved --agent (not the stored active agent) is the agentId in
         # the OAuth hand-off URL, so the post-auth redirect lands on that agent.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
-        monkeypatch.setattr(eesel, "fetch_integration_definitions", lambda creds: list(_DEFINITIONS))
+        monkeypatch.setattr(eesel, "fetch_integration_definition", lambda creds, key: next((d for d in _DEFINITIONS if d["key"] == key), None))
         monkeypatch.setattr(eesel, "webbrowser", type("W", (), {"open": staticmethod(lambda url: True)}))
         rc = eesel.cmd_integrations(
             _connect_args(integrations_cmd="connect", key="zendesk", option="oauth", agent="agent-other-789")
@@ -4307,7 +4307,11 @@ class TestIntegrationsConnect:
     the browser. `add` is the hidden back-compat alias."""
 
     def _defs(self, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_integration_definitions", lambda creds: list(_DEFINITIONS))
+        # `connect` fetches one definition by key, not the whole catalog.
+        monkeypatch.setattr(
+            eesel, "fetch_integration_definition",
+            lambda creds, key: next((d for d in _DEFINITIONS if d["key"] == key), None),
+        )
 
     def _no_browser(self, monkeypatch, sink=None):
         def _open(url):
