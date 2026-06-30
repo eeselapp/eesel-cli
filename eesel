@@ -6127,21 +6127,25 @@ _AGENTS_FLAT_VERBS = frozenset(
     {"list", "show", "instructions", "create", "add", "set", "edit", "remove", "use", "unset"}
 )
 
-# Agent-scoped child nouns → how their flat form takes the agent:
-#   "flag" → append `--agent <id>`            (e.g. `integrations list --agent X`)
-#   "pos"  → agent is the first positional    (e.g. `skills list X`, verb then id)
-# This is the per-noun knowledge that lets one resolver serve every noun. A noun
-# only belongs here if EVERY verb under it accepts the agent the resolver injects.
+# Agent-scoped child nouns → (how the flat form takes the agent, which verbs accept it).
+#   mode "flag" → append `--agent <id>`         (e.g. `integrations list --agent X`)
+#   mode "pos"  → agent is the first positional  (e.g. `skills list X`, verb then id)
+#   verbs: the set of verbs whose flat parser actually accepts the agent. `None`
+#     means every verb does, so any following token is reshaped — required for
+#     `integrations`, where the token after the noun is often an integration
+#     *type* (`zd`), not a verb. A finite set means ONLY those verbs are reshaped;
+#     any other verb falls through untouched, so it gets a normal argparse error
+#     instead of a mis-injected `--agent` the handler would reject. (Keep each set
+#     in sync with the flat parsers; TestPathScopeParsesEndToEnd guards it.)
 # `triggers`/`schedules` are deliberately absent: their `list` is workspace-wide
-# (no agent argument), so a path form would hard-error. They get a real
-# per-agent path form when triggers+schedules are unified under `automations`.
-# `notifications` and the deprecated `tools` alias are likewise out of scope for
-# this pass (not in the namespace plan's first cut).
+# (no agent argument). They get a real per-agent path form when triggers+schedules
+# are unified under `automations`. `notifications` and the deprecated `tools`
+# alias are likewise out of scope for this pass.
 _AGENT_SCOPED_CHILDREN = {
-    "integrations": "flag",
-    "documents": "flag",
-    "tasks": "flag",
-    "skills": "pos",
+    "integrations": ("flag", None),
+    "documents": ("flag", frozenset({"list", "show", "read", "add"})),
+    "tasks": ("flag", frozenset({"list", "count", "analytics", "export"})),
+    "skills": ("pos", None),
 }
 
 
@@ -6204,12 +6208,21 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
         return ["integrations", head, tail[1]] + tail[2:] + ["--agent", agent]
 
     if head in _AGENT_SCOPED_CHILDREN:
+        mode, verbs = _AGENT_SCOPED_CHILDREN[head]
         child = tail[1:]                          # the child's own `verb [args]`
-        if _AGENT_SCOPED_CHILDREN[head] == "flag":
+        if mode == "flag":
+            # Only inject `--agent` for a verb whose flat parser accepts it; for
+            # any other verb leave argv untouched (a clean argparse error beats a
+            # mis-injected `--agent`). `verbs is None` → reshape every token
+            # (integrations, where the token may be an integration type).
+            if verbs is not None and (not child or child[0] not in verbs):
+                return argv
             return [head] + child + ["--agent", agent]
         # "pos": flat form is `<noun> <verb> <id> [args]`; default verb is list.
         if not child or child[0].startswith("-"):
             child = ["list"] + child
+        if verbs is not None and child[0] not in verbs:
+            return argv
         return [head, child[0], agent] + child[1:]
 
     if head == "chat":

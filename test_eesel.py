@@ -6942,3 +6942,35 @@ class TestPathScopeParsesEndToEnd:
                 self._parses(*form)
             except SystemExit:
                 raise AssertionError(f"path form did not parse: {' '.join(form)}")
+
+
+class TestPathScopeVerbScoping:
+    """A 'flag' noun only injects --agent for verbs whose flat parser accepts it
+    (documents/tasks have verbs that don't). Verbs that don't must fall through
+    untouched — a clean argparse error, never a mis-injected --agent. Regression
+    for the verify finding that documents remove/export/acl and tasks show/cost
+    hard-errored with 'unrecognized arguments: --agent'."""
+
+    def n(self, *argv):
+        return eesel._normalize_path_scope_argv(list(argv))
+
+    def test_agent_accepting_verbs_get_scoped(self):
+        assert self.n("agents", "blog", "documents", "show", "k") == ["documents", "show", "k", "--agent", "blog"]
+        assert self.n("agents", "blog", "documents", "add", "--title", "t") == ["documents", "add", "--title", "t", "--agent", "blog"]
+        assert self.n("agents", "blog", "tasks", "count") == ["tasks", "count", "--agent", "blog"]
+        assert self.n("agents", "blog", "tasks", "analytics") == ["tasks", "analytics", "--agent", "blog"]
+
+    def test_non_accepting_verbs_fall_through_untouched(self):
+        for verb in ("remove", "export", "acl"):
+            argv = ["agents", "blog", "documents", verb, "x"]
+            assert self.n(*argv) == argv, f"documents {verb} must not inject --agent"
+        for verb in ("show", "cost"):
+            argv = ["agents", "blog", "tasks", verb, "x"]
+            assert self.n(*argv) == argv, f"tasks {verb} must not inject --agent"
+
+    def test_those_fall_through_forms_do_not_smuggle_agent_flag(self):
+        # Belt-and-suspenders: the reshaped argv for a non-accepting verb never
+        # contains "--agent" (the exact symptom the verify pass caught).
+        for argv in (["agents", "blog", "documents", "remove", "k"],
+                     ["agents", "blog", "tasks", "cost", "t1"]):
+            assert "--agent" not in self.n(*argv)
