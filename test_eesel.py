@@ -4295,8 +4295,8 @@ class TestIntegrationsAgentScope:
 
 def _connect_args(**kw):
     """args for `integrations connect`/`add` with option/field and the hidden
-    back-compat flags (config/token/no_input) defaulted off."""
-    for key, default in (("option", None), ("field", None), ("config", None), ("token", None), ("no_input", False)):
+    headless guard (no_input) defaulted off."""
+    for key, default in (("option", None), ("field", None), ("no_input", False)):
         kw.setdefault(key, default)
     return _args(**kw)
 
@@ -4417,29 +4417,6 @@ class TestIntegrationsConnect:
         assert rc == 1
         assert "--no-input" in capsys.readouterr().err
 
-    def test_config_back_compat_folds_into_fields(self, fake_creds, monkeypatch):
-        # The hidden --config JSON keys are folded into the submit field set.
-        self._defs(monkeypatch)
-        captured = {}
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, *, token=None, body=None, timeout=60: (captured.update(body=body) or (201, {"integration_id": "z1"})),
-        )
-        rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="quick_start", config='{"subdomain": "acme"}'))
-        assert rc == 0
-        assert captured["body"]["subdomain"] == "acme"
-
-    def test_token_back_compat_sent_as_access_token(self, fake_creds, monkeypatch):
-        self._defs(monkeypatch)
-        captured = {}
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, *, token=None, body=None, timeout=60: (captured.update(body=body) or (201, {"integration_id": "z1"})),
-        )
-        rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="quick_start", field=["subdomain=acme"], token="tok-xyz"))
-        assert rc == 0
-        assert captured["body"]["access_token"] == "tok-xyz"
-
     def test_browser_connect_url_resolves_dashboard_and_fills_params(self, fake_creds):
         # Drops unresolved {{...}} params, fills the identifier param the endpoint
         # templates, and appends the active agent id — on the dashboard host.
@@ -4454,11 +4431,6 @@ class TestIntegrationsConnect:
         self._defs(monkeypatch)
         with pytest.raises(SystemExit):
             eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="quick_start", field=["noequalshere"]))
-
-    def test_invalid_config_json_exits(self, fake_creds, monkeypatch):
-        self._defs(monkeypatch)
-        with pytest.raises(SystemExit):
-            eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="quick_start", config="{not json"))
 
 
 class TestIntegrationsSync:

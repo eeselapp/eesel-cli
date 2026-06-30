@@ -860,7 +860,20 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-            parsed = json.loads(raw) if raw else {}
+            if not raw:
+                return resp.status, {}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                # A 2xx with a non-JSON body usually means a proxy/gateway or
+                # login page answered instead of the API. Exit with a clean
+                # message rather than letting the JSONDecodeError traceback
+                # escape — mirrors http_request's handling of the same case.
+                snippet = raw[:200].decode(errors="replace").strip()
+                sys.exit(
+                    f"{method} {url} → {resp.status} but the response was not JSON "
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                )
             return resp.status, (parsed if isinstance(parsed, dict) else {"result": parsed})
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -2509,19 +2522,20 @@ def _schedules_fire(creds: dict, target: str) -> int:
 def cmd_integrations(args) -> int:
     """Dispatch the `eesel integrations` subcommands.
 
-    `list` (default) shows every connected integration, one row each, with a
-    connection-status and a sync-status column. `show <integration>` prints one
-    integration's detail. `add` connects a new integration (`connect` is a thin
-    alias). `remove` disconnects one (`disconnect` is a thin alias). `sync`
-    triggers a data refresh for a connected integration.
+    `list` (default) shows every connected integration with connection status.
+    `available` lists the connectable catalog. `show <integration>` prints one
+    integration's detail. `connect` connects a new integration; `sync` triggers
+    a data refresh; `sync-status` reports sync-run progress; `remove` disconnects
+    one. `add` and `disconnect` are hidden back-compat aliases for `connect` and
+    `remove`.
     """
     creds = require_creds()
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
     # the EESEL_AGENT env var but per-command. It is resolved in memory and not
-    # persisted, so it never changes the saved active agent. Every integrations
-    # subcommand reads creds["agent_id"] — listing/connection status is computed
-    # against it, and `add` folds it into the setup payload — so overriding it
-    # here applies the scope uniformly across list/show/add/sync/remove.
+    # persisted, so it never changes the saved active agent. Connection status in
+    # list/show is computed against this agent, and `connect`'s redirect/OAuth
+    # hand-off carries it as the agentId so the post-auth page lands on the right
+    # agent. Resolving it here applies the scope uniformly across the group.
     if getattr(args, "agent", None):
         agent, candidates = resolve_agent_strict(fetch_agents(creds), args.agent)
         if not agent:
@@ -2768,9 +2782,6 @@ def _integrations_connect(args, creds: dict) -> int:
     For a `redirect` option the dashboard OAuth URL is opened in the browser and
     the command exits — it initiates the flow and hands off, exactly like
     `eesel login`; it does not wait for or complete the authorization.
-
-    `--config '<json>'` and `--token` are hidden back-compat flags: `--config`
-    keys are folded into the field set and `--token` is sent as `access_token`.
     """
     key = args.key
     definition = fetch_integration_definition(creds, key)
@@ -2784,14 +2795,8 @@ def _integrations_connect(args, creds: dict) -> int:
         err(f"Could not connect '{key}': {problem}")
         return 1
 
-    # Setup fields come from repeatable --field key=value, plus the hidden
-    # back-compat --config (a JSON object) and --token (sent as access_token).
-    raw_config = getattr(args, "config", None)
-    fields = parse_config_object(raw_config, example='{"subdomain": "acme"}') if raw_config else {}
-    fields.update(_parse_field_args(getattr(args, "field", None)))
-    token = getattr(args, "token", None)
-    if token and "access_token" not in fields:
-        fields["access_token"] = token
+    # Setup fields for a `submit` option come from repeatable --field key=value.
+    fields = _parse_field_args(getattr(args, "field", None))
 
     handler = option.get("handler_type")
     endpoint = option.get("endpoint") or ""
@@ -5723,18 +5728,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_av.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
-    i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with syncStatus)")
+    i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with the latest syncRun)")
     i_show.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     def _connect_args(p):
         p.add_argument("key", help="Integration type key to connect (e.g. zendesk, website) — see `eesel integrations available`")
         p.add_argument("--option", help="Which connection option to use (its `type` from `eesel integrations available`); required when a connector has several")
         p.add_argument("--field", action="append", metavar="KEY=VALUE", help="A setup field for a `submit` connection option, e.g. `--field subdomain=acme` (repeatable)")
         p.add_argument("--agent", help="Agent id, id-prefix, or name to connect the integration for (default: active agent, or $EESEL_AGENT)")
-        # Hidden back-compat flags carried over from the former `add` surface:
-        # --config keys are folded into the field set, --token is sent as
-        # access_token, and --no-input fails instead of opening a browser.
-        p.add_argument("--config", help=argparse.SUPPRESS)
-        p.add_argument("--token", help=argparse.SUPPRESS)
+        # Headless guard: fail instead of opening a browser for a redirect/OAuth
+        # option. Hidden — niche, for agent/CI runs that can't complete OAuth.
         p.add_argument("--no-input", action="store_true", help=argparse.SUPPRESS)
 
     i_connect = ig_sub.add_parser(
