@@ -6623,7 +6623,8 @@ class TestChatAgentFlag:
         )
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "trigger_id": "trig-1", "trigger_title": "heartbeat", "agent_id": creds.get("agent_id")})
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        # A successful turn returns its (possibly empty) reply text, not None.
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
         rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
         assert rc == 0
@@ -6645,7 +6646,8 @@ class TestChatTaskFlag:
             return {"id": "sess-1", **k}
 
         monkeypatch.setattr(eesel, "new_session", fake_new_session)
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        # A successful turn returns its (possibly empty) reply text, not None.
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
         rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
         assert rc == 0
         # The full resolved id is pinned, not the truncated prefix.
@@ -6662,3 +6664,104 @@ class TestChatTaskFlag:
         rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
         assert rc == 1
         assert "ambiguous" in capsys.readouterr().err
+
+
+class TestChatHonestExit:
+    """`eesel chat "…"` (one-shot) must exit non-zero when the server rejects the
+    turn. send_message returns None only on failure; a successful turn returns its
+    reply text (possibly empty), which still exits 0."""
+
+    def _sess(self):
+        return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-test-123",
+                "task_id": "t1", "messages": []}
+
+    def test_send_message_returns_none_on_sandbox_http_error(self, fake_creds, monkeypatch):
+        import io
+
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.HTTPError(
+                req.full_url, 402, "Payment Required", {},
+                io.BytesIO(b'{"code":"BILLING_LIMIT_EXCEEDED"}'))
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        assert eesel.send_message(fake_creds, self._sess(), "hi") is None
+
+    def test_stream_reply_returns_none_on_http_error(self, fake_creds, monkeypatch):
+        import io
+
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.HTTPError(req.full_url, 500, "Server Error", {}, io.BytesIO(b"boom"))
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+
+    def test_oneshot_exits_1_when_turn_rejected(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)  # rejected turn
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
+        assert rc == 1
+
+    def test_oneshot_exits_0_on_success(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "the reply")
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
+        assert rc == 0
+
+    def test_oneshot_exits_0_on_empty_but_successful_reply(self, fake_creds, monkeypatch):
+        # An empty string is a successful (if quiet) turn — must NOT be read as failure.
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "")
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
+        assert rc == 0
+
+    def test_oneshot_with_cost_still_prints_then_exits_nonzero(self, fake_creds, monkeypatch):
+        printed = {}
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        monkeypatch.setattr(eesel, "_current_run_count", lambda creds, sess: 0)
+        monkeypatch.setattr(eesel, "_print_cost_after_turn", lambda *a, **k: printed.setdefault("cost", True))
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=True))
+        assert rc == 1
+        assert printed.get("cost") is True  # cost summary still printed despite the failure
+
+
+class TestNewAgentScope:
+    """`eesel new --agent X` / `--schedule J` scope the new session to that agent
+    in memory only — they must never rewrite the saved active agent, and --agent
+    must be resolved (id/prefix/name), not stored raw."""
+
+    def test_new_agent_resolves_and_does_not_persist(self, fake_creds, monkeypatch):
+        created = {}
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "other-agent", "name": "Other"}])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("new --agent must not persist the active agent"))
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: (created.update(k) or {"id": "sess-1", "name": k.get("name")}))
+        rc = eesel.cmd_new(_args(agent="Other", schedule=None, name=None))
+        assert rc == 0
+        assert created["agent_id"] == "other-agent"  # name resolved to id, not stored raw
+
+    def test_new_agent_unmatched_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
+        monkeypatch.setattr(eesel, "new_session", lambda *a, **k: pytest.fail("must not create a session for an unmatched --agent"))
+        with pytest.raises(SystemExit):
+            eesel.cmd_new(_args(agent="nope", schedule=None, name=None))
+
+    def test_new_agent_ambiguous_prefix_errors(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "ag-1", "name": "One"}, {"agent_id": "ag-2", "name": "Two"}])
+        monkeypatch.setattr(eesel, "new_session", lambda *a, **k: pytest.fail("must not create a session on an ambiguous prefix"))
+        with pytest.raises(SystemExit):
+            eesel.cmd_new(_args(agent="ag", schedule=None, name=None))
+
+    def test_new_schedule_does_not_persist(self, fake_creds, monkeypatch):
+        created = {}
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "trig-1", "agent_id": "sched-agent", "config": {"title": "hb"}})
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("new --schedule must not persist the active agent"))
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: (created.update(k) or {"id": "sess-1", "name": "sess-1", "trigger_id": k.get("trigger_id"), "trigger_title": k.get("trigger_title")}))
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
+        rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
+        assert rc == 0
+        assert created["agent_id"] == "sched-agent"  # session pinned to the trigger's agent, in memory only

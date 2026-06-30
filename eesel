@@ -1520,7 +1520,7 @@ def pick_agent(creds: dict, *, prompt: bool = True) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def send_message(creds: dict, sess: dict, message: str) -> str:
+def send_message(creds: dict, sess: dict, message: str) -> str | None:
     # Empty user messages are how trigger-preview sessions auto-fire (kicked off
     # by `eesel new --trigger X` with no user typing yet). The backend filters
     # empty messages out of the persisted chat history, so the task's history
@@ -1564,7 +1564,10 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
         if message:
             sess["messages"].pop()
         save_session(sess)
-        return ""
+        # Return None (not "") to signal failure: a successful turn can legitimately
+        # produce empty text, so callers distinguish failure from empty-success on
+        # `is None`, and `eesel chat "…"` can exit non-zero on a rejected turn.
+        return None
     except urllib.error.URLError as e:
         # The server isn't reachable at all (connection refused, DNS failure,
         # timeout) — no HTTP response to surface. Exit cleanly like the shared
@@ -1587,7 +1590,7 @@ def send_message(creds: dict, sess: dict, message: str) -> str:
     return text
 
 
-def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
+def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | None:
     if stream_url:
         url = stream_url
         headers = {}
@@ -1641,7 +1644,8 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str:
                     print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
         err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
-        return ""
+        # None signals failure so the caller can exit non-zero (see send_message).
+        return None
     except urllib.error.URLError as e:
         # Server unreachable mid-stream — exit cleanly like the shared http_*
         # helpers instead of leaking the connection error traceback.
@@ -1958,10 +1962,13 @@ def cmd_instructions(args) -> int:
 
 def cmd_new(args) -> int:
     creds = require_creds()
-    pick_agent(creds, prompt=not args.agent)
-    if args.agent:
-        creds["agent_id"] = args.agent
-        save_creds(creds)
+    # --agent scopes this new session to one agent (id, id-prefix, or name),
+    # resolved in memory and never persisted — mirrors `chat --agent`. The new
+    # session records agent_id below, so later unrelated commands keep using the
+    # previously-saved active agent instead of being silently repointed.
+    creds = apply_agent_flag_override(creds, getattr(args, "agent", None))
+    if not getattr(args, "agent", None):
+        pick_agent(creds, prompt=True)
 
     trigger_id = trigger_title = None
     if getattr(args, "schedule", None):
@@ -1972,10 +1979,11 @@ def cmd_new(args) -> int:
             return 1
         trigger_id = match["id"]
         trigger_title = (match.get("config") or {}).get("title")
-        # Pin the agent on the session to whatever owns the trigger; mismatched
-        # agent + trigger sends a chat to the wrong agent.
+        # Pin the trigger's owning agent on the preview session only — resolve it
+        # in an in-memory copy and never rewrite the saved active agent, or every
+        # later unrelated command would silently run against the wrong agent.
+        creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
-        save_creds(creds)
 
     sess = new_session(
         creds,
@@ -3446,10 +3454,14 @@ def cmd_chat(args) -> int:
 
     if args.message:
         prev_runs = _current_run_count(creds, sess) if show_cost else 0
-        send_message(creds, sess, args.message)
+        reply = send_message(creds, sess, args.message)
         if show_cost:
             _print_cost_after_turn(creds, sess, prev_runs)
-        return 0
+        # Exit non-zero when the turn was rejected (server 4xx/5xx) so a script's
+        # `eesel chat "…" && next` doesn't proceed after a chat that never ran.
+        # send_message returns None only on failure; an empty-but-successful reply
+        # still exits 0.
+        return 0 if reply is not None else 1
 
     # REPL mode
     badge = f" [trigger: {sess.get('trigger_title')}]" if sess.get("trigger_id") else ""
@@ -5603,7 +5615,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_instructions)
 
     sp = sub.add_parser("new", help="Start a new chat session")
-    sp.add_argument("--agent", help="Agent id to use (default: active agent)")
+    sp.add_argument("--agent", help="Scope this session to an agent (id, id-prefix, or name); not persisted")
     sp.add_argument("--name", help="Session name (default: auto)")
     # `--trigger` is the old name, kept as an alias; the noun is now a scheduled job.
     sp.add_argument("--schedule", "--trigger", dest="schedule", help="Bind session to a scheduled job (id-prefix or title substring) so the agent runs under that job's context (preview mode)")
