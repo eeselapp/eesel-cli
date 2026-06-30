@@ -35,6 +35,15 @@ API surface used:
                                        (eesel integrations <integration> actions)
   GET  /integrations                 list workspace integrations + connection
                                        status (eesel integrations)
+  GET  /integration-definitions      the connectable catalog: each type's
+                                       connection_options (eesel integrations
+                                       available; drives eesel integrations connect)
+  POST /integrations/{key}/{option}  connect via a "submit" connection option,
+                                       e.g. /integrations/zendesk/quick_start
+                                       (eesel integrations connect --option)
+  POST /integrations/{id}/trigger-sync  trigger a data sync (eesel integrations sync)
+  GET  /v2/sync-runs                 sync-run status + progress (eesel integrations
+                                       sync-status; also the sync field of `show`)
   POST /agents/sandbox/start         start/continue a chat, returns {taskId,streamUrl}
                                        optional triggerId → preview a scheduled
                                        job's context in chat
@@ -851,7 +860,20 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
-            parsed = json.loads(raw) if raw else {}
+            if not raw:
+                return resp.status, {}
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                # A 2xx with a non-JSON body usually means a proxy/gateway or
+                # login page answered instead of the API. Exit with a clean
+                # message rather than letting the JSONDecodeError traceback
+                # escape — mirrors http_request's handling of the same case.
+                snippet = raw[:200].decode(errors="replace").strip()
+                sys.exit(
+                    f"{method} {url} → {resp.status} but the response was not JSON "
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                )
             return resp.status, (parsed if isinstance(parsed, dict) else {"result": parsed})
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -895,9 +917,7 @@ def parse_config_object(raw: str, *, example: str = '{"key": "value"}') -> dict:
     add, schedules add, skills edit, mcp add): malformed input gives the same
     message and the same exit code, rather than each command inventing its own
     error contract. ``example`` tailors the "must be a JSON object" hint to the
-    calling command. (Two commands keep bespoke parsers because their config
-    carries extra handling: ``integrations add`` and ``integrations actions
-    edit``.)
+    calling command.
     """
     try:
         obj = json.loads(raw)
@@ -1242,6 +1262,44 @@ def fetch_integrations(creds: dict, *, agent_id: str | None = None) -> list[dict
     if isinstance(data, list):
         return data
     return data.get("integrations") or data.get("items") or []
+
+
+def fetch_integration_definitions(creds: dict) -> list[dict]:
+    """List the connectable integration types — the catalog of what *can* be
+    connected, as opposed to what already is (`fetch_integrations`).
+
+    GET /integration-definitions returns ``{categories, integrations}``; this
+    returns the ``integrations`` list (tolerating a bare-list or ``items``
+    shape too). Each definition carries a ``key`` (the connector identifier
+    passed to ``eesel integrations connect <key>``), ``title``, ``category``,
+    and ``connection_options`` — the list of ways to connect it, each with a
+    ``type`` (the value for ``connect --option``), ``handler_type``
+    (``submit`` = direct POST, ``redirect`` = browser OAuth), an ``endpoint``,
+    and a field ``schema``.
+    """
+    data = http_request("GET", f"{creds['api_url']}/integration-definitions", token=creds["token"])
+    if isinstance(data, list):
+        return data
+    return data.get("integrations") or data.get("items") or []
+
+
+def fetch_integration_definition(creds: dict, key: str) -> dict | None:
+    """One connectable type's definition from GET /integration-definitions/{key}
+    (the response wraps it under ``integration``), or None if there's no such
+    connector. `connect` uses this to read just the target's connection_options
+    rather than transferring the whole catalog."""
+    status, data = http_request_allow_error(
+        "GET", f"{creds['api_url']}/integration-definitions/{urllib.parse.quote(key)}", token=creds["token"]
+    )
+    if status >= 400 or not isinstance(data, dict):
+        return None
+    return data.get("integration")
+
+
+def _connection_options(definition: dict) -> list[dict]:
+    """The connection options for one integration definition. The server has
+    used both snake_case and camelCase for this field, so accept either."""
+    return (definition or {}).get("connection_options") or (definition or {}).get("connectionOptions") or []
 
 
 def match_integrations(integrations: list[dict], target: str) -> list[dict]:
@@ -2464,19 +2522,20 @@ def _schedules_fire(creds: dict, target: str) -> int:
 def cmd_integrations(args) -> int:
     """Dispatch the `eesel integrations` subcommands.
 
-    `list` (default) shows every connected integration, one row each, with a
-    connection-status and a sync-status column. `show <integration>` prints one
-    integration's detail. `add` connects a new integration (`connect` is a thin
-    alias). `remove` disconnects one (`disconnect` is a thin alias). `sync`
-    triggers a data refresh for a connected integration.
+    `list` (default) shows every connected integration with connection status.
+    `available` lists the connectable catalog. `show <integration>` prints one
+    integration's detail. `connect` connects a new integration; `sync` triggers
+    a data refresh; `sync-status` reports sync-run progress; `remove` disconnects
+    one. `add` and `disconnect` are hidden back-compat aliases for `connect` and
+    `remove`.
     """
     creds = require_creds()
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
     # the EESEL_AGENT env var but per-command. It is resolved in memory and not
-    # persisted, so it never changes the saved active agent. Every integrations
-    # subcommand reads creds["agent_id"] — listing/connection status is computed
-    # against it, and `add` folds it into the setup payload — so overriding it
-    # here applies the scope uniformly across list/show/add/sync/remove.
+    # persisted, so it never changes the saved active agent. Connection status in
+    # list/show is computed against this agent, and `connect`'s redirect/OAuth
+    # hand-off carries it as the agentId so the post-auth page lands on the right
+    # agent. Resolving it here applies the scope uniformly across the group.
     if getattr(args, "agent", None):
         agent, candidates = resolve_agent_strict(fetch_agents(creds), args.agent)
         if not agent:
@@ -2494,16 +2553,20 @@ def cmd_integrations(args) -> int:
     sub = getattr(args, "integrations_cmd", None) or "list"
     if sub == "list":
         return _integrations_list(args, creds)
+    if sub == "available":
+        return _integrations_available(args, creds)
     if sub == "show":
         return _integrations_show(args, creds)
-    # `connect` is a permitted thin alias for the canonical `add`.
-    if sub in ("add", "connect"):
-        return _integrations_add(args, creds)
+    # `add` is a hidden back-compat alias for the canonical `connect`.
+    if sub in ("connect", "add"):
+        return _integrations_connect(args, creds)
     # `disconnect` is a permitted thin alias for the canonical `remove`.
     if sub in ("remove", "disconnect"):
         return _integrations_remove(args, creds)
     if sub == "sync":
         return _integrations_sync(args, creds)
+    if sub == "sync-status":
+        return _integrations_sync_status(args, creds)
     return 1
 
 
@@ -2563,13 +2626,39 @@ def _integrations_list(args, creds: dict) -> int:
     return 0
 
 
+def _integrations_available(args, creds: dict) -> int:
+    """List the connectable integration types (the catalog of what *can* be
+    connected). The `key` column is the value passed to
+    `eesel integrations connect <key>`; the `options` column lists that
+    connector's connection-option `type`s — the values accepted by
+    `connect --option`."""
+    definitions = fetch_integration_definitions(creds)
+    if getattr(args, "json", False):
+        print(json.dumps(definitions, indent=2))
+        return 0
+    if not definitions:
+        info("(no connectable integrations)")
+        return 0
+
+    fmt = " {:<22}  {:<16}  {:<26}  {}"
+    info(fmt.format("key", "category", "title", "connect options"))
+    for d in sorted(definitions, key=lambda x: (x.get("category") or "", x.get("key") or "")):
+        key = (d.get("key") or "?")[:22]
+        category = (d.get("category") or "—")[:16]
+        title = (d.get("title") or "")[:26]
+        opts = [o.get("type") for o in _connection_options(d) if o.get("type")]
+        options = ", ".join(opts) if opts else "—"
+        print(fmt.format(key, category, title, options))
+    return 0
+
+
 def _integrations_show(args, creds: dict) -> int:
     """Show one connected integration's detail (read-only).
 
     `<integration>` resolves from a full id, id prefix, or integration type.
-    Prints the connection status and the current sync status as fields. The
-    sync status is fetched from GET /integrations/{id}/sync; integrations that
-    do not support triggered syncs report no sync status rather than failing.
+    Prints the connection status and the latest sync run (status + progress),
+    read from GET /v2/sync-runs. An integration with no active or recent run
+    shows "—" for sync.
     """
     integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
     if not integration:
@@ -2577,11 +2666,11 @@ def _integrations_show(args, creds: dict) -> int:
         return 1
     integration_id = integration["id"]
 
-    sync_status = _fetch_sync_status(creds, integration_id)
+    run = _latest_sync_run(creds, integration_id)
 
     if getattr(args, "json", False):
         out = dict(integration)
-        out["syncStatus"] = sync_status
+        out["syncRun"] = run
         # `show` has no --secrets flag, so there is no way to reveal sensitive
         # properties here — always mask them, mirroring the list/table gate.
         print(json.dumps(_redact_secrets(out), indent=2))
@@ -2594,216 +2683,164 @@ def _integrations_show(args, creds: dict) -> int:
     if integration.get("identifier"):
         print(f" subdomain   {integration.get('identifier')}")
     print(f" connection  {integration.get('connectionStatus') or '?'}")
-    print(f" sync        {sync_status if sync_status else '—'}")
+    sync = f"{run.get('status')} — {_sync_run_progress(run)}" if run else "—"
+    print(f" sync        {sync}")
     return 0
 
 
-def _fetch_sync_status(creds: dict, integration_id: str):
-    """Return the current sync status string for an integration, or None.
+def _fetch_sync_runs(creds: dict) -> list:
+    """The workspace's sync runs from GET /v2/sync-runs, normalized to a list.
 
-    GET /integrations/{id}/sync returns a bare string (e.g. "Triggered Sync")
-    for connectors that support triggered syncs. Connectors that don't will
-    error; swallow that and report None so `show` works for every integration.
+    The feed wraps the runs under ``jobs`` and only includes active and last-24h,
+    non-dismissed runs. Reading status here is deliberate: GET
+    /integrations/{id}/sync *triggers* a sync rather than reporting one, so it
+    must not be used to read status.
     """
+    data = http_request("GET", f"{creds['api_url']}/v2/sync-runs", token=creds["token"])
+    return data.get("jobs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+
+
+def _runs_for_integration(runs: list, integration_id: str) -> list:
+    """The sync runs in `runs` whose metadata names `integration_id`."""
+    return [r for r in runs if str((r.get("metadata") or {}).get("integration_id")) == str(integration_id)]
+
+
+def _latest_sync_run(creds: dict, integration_id: str):
+    """The most recent sync run for an integration, or None — the one with the
+    newest `updated_at` (so the result doesn't depend on the feed's order)."""
     try:
-        data = http_request(
-            "GET",
-            f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}/sync",
-            token=creds["token"],
-        )
+        matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
     except SystemExit:
         return None
-    if isinstance(data, str):
-        return data or None
-    if isinstance(data, dict):
-        return data or None
-    return data
+    return max(matching, key=lambda r: r.get("updated_at") or r.get("started_at") or "", default=None)
 
 
-def _parse_config_arg(raw: str | None) -> dict:
-    """Parse the `--config` JSON string into a dict, exiting with a clear
-    message if it isn't a valid JSON object."""
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.exit(f"--config is not valid JSON: {e}")
-    if not isinstance(parsed, dict):
-        sys.exit("--config must be a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
-    return parsed
+def _parse_field_args(raw_fields) -> dict:
+    """Parse repeatable `--field key=value` arguments into a dict, exiting with
+    a clear message on a malformed entry. The value may contain `=` (only the
+    first splits the pair)."""
+    fields: dict = {}
+    for item in raw_fields or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            sys.exit(f"--field must be key=value, got '{item}'.")
+        fields[key] = value
+    return fields
 
 
-def _connection_status_after_connect(creds: dict, integration_id: str | None) -> str | None:
-    """Re-fetch the workspace integrations and return the connectionStatus of
-    `integration_id` (e.g. "full", "partial", "none"), or None if it can't be
-    determined.
+def _select_connection_option(definition: dict, requested: str | None) -> tuple[dict | None, str | None]:
+    """Pick which connection option `connect` should act on. With `requested`,
+    match it against the options' `type`. Without it, use the sole option, or
+    return a message asking the caller to choose when there are several. Returns
+    `(option, error_message)` — exactly one is set."""
+    options = _connection_options(definition)
+    if not options:
+        return None, "this integration exposes no connection options."
+    names = ", ".join(o.get("type") for o in options if o.get("type")) or "(unnamed)"
+    if requested:
+        match = next((o for o in options if o.get("type") == requested), None)
+        if match is None:
+            return None, f"no connection option '{requested}'. Available: {names}."
+        return match, None
+    if len(options) == 1:
+        return options[0], None
+    return None, f"several connection options — choose one with --option. Available: {names}."
 
-    The create endpoint's response does not include a connection status, and its
-    `redirect_url` is only a dashboard navigation hint — it is returned even for
-    a fully-authorized connect, so it cannot be used to tell full from partial.
-    The status lives on the serialized integration, so read it back from
-    GET /integrations. Best-effort: returns None on any failure so the caller can
-    fall back to inferring status from the payload.
+
+def _browser_connect_url(creds: dict, endpoint: str, identifier: str | None = None) -> str:
+    """Resolve a `redirect` connection option's endpoint to a full browser URL
+    on the dashboard host.
+
+    Drops unresolved `{{...}}` template params, appends the active agent id, and
+    fills an identifier param when the endpoint templates one (e.g. the Zendesk
+    messenger option's `zendeskSubdomain={{integrationIdentifier}}`). The OAuth
+    flow is served by the dashboard, a different host than the API.
     """
-    if not integration_id:
-        return None
-    try:
-        integrations = fetch_integrations(creds, agent_id=creds.get("agent_id"))
-    except Exception:
-        return None
-    for it in integrations:
-        if str(it.get("id")) == str(integration_id):
-            status = it.get("connectionStatus")
-            return str(status) if status is not None else None
-    return None
-
-
-def _oauth_authorize_url(creds: dict, key: str, identifier: str | None) -> str | None:
-    """Build the browser URL that actually starts the OAuth authorization flow
-    for integration `key`, or None if one can't be determined.
-
-    The server's create response returns a stale dashboard *page* path that no
-    longer resolves. The live OAuth entry point is published in the integration
-    definition's connection options: the option whose ``handler_type`` is
-    ``redirect`` carries the real ``/api/.../oauth/start`` endpoint. That endpoint
-    needs the account identifier (e.g. a Zendesk subdomain), but its parameter
-    name is integration-specific. Other options in the same definition template
-    that identifier as ``<param>={{integrationIdentifier}}`` (e.g. the Zendesk
-    messenger option uses ``zendeskSubdomain={{integrationIdentifier}}``), so the
-    parameter name is learned from those templates and applied to the start URL.
-
-    The resulting path is resolved against the dashboard origin (the OAuth flow
-    is served by the dashboard, a different host than the API), and the active
-    agent id is appended so the post-authorization redirect lands on a real page.
-    """
-    try:
-        data = http_request("GET", f"{creds['api_url']}/integration-definitions/{urllib.parse.quote(key)}", token=creds["token"])
-    except Exception:
-        return None
-    definition = data.get("integration") if isinstance(data, dict) else None
-    options = (definition or {}).get("connection_options") or (definition or {}).get("connectionOptions") or []
-
-    redirect_endpoint = None
-    identifier_param = None
-    for opt in options:
-        endpoint = opt.get("endpoint") or ""
-        if opt.get("handler_type") == "redirect" and "oauth/start" in endpoint and redirect_endpoint is None:
-            redirect_endpoint = endpoint
-        # Learn the identifier parameter name from any endpoint that templates it.
-        match = re.search(r"([A-Za-z0-9_]+)=\{\{integrationIdentifier\}\}", endpoint)
-        if match and identifier_param is None:
-            identifier_param = match.group(1)
-    if not redirect_endpoint:
-        return None
-
-    # Drop any unresolved template params (e.g. agentId={{agentId}}) so we can
-    # set our own concrete values below.
-    base, _, query = redirect_endpoint.partition("?")
+    match = re.search(r"([A-Za-z0-9_]+)=\{\{integrationIdentifier\}\}", endpoint)
+    identifier_param = match.group(1) if match else None
+    base, _, query = endpoint.partition("?")
     params = [(k, v) for k, v in urllib.parse.parse_qsl(query) if "{{" not in v]
     if identifier and identifier_param:
         params.append((identifier_param, identifier))
     if creds.get("agent_id"):
         params.append(("agentId", creds["agent_id"]))
-
     dashboard = (creds.get("dashboard_url") or ENVS["prod"]["dashboard"]).rstrip("/")
-    return f"{dashboard}{base}?{urllib.parse.urlencode(params)}"
+    return f"{dashboard}{base}?{urllib.parse.urlencode(params)}" if params else f"{dashboard}{base}"
 
 
-def _integrations_add(args, creds: dict) -> int:
-    """Connect (add) a new integration of type `<key>`, POSTing the `--config`
-    JSON as the setup payload. Reached via `add` or its alias `connect`.
+def _integrations_connect(args, creds: dict) -> int:
+    """Connect a new integration of type `<key>`. Reached via `connect` or its
+    hidden back-compat alias `add`.
 
-    Helpdesk connectors (e.g. zendesk) need required setup fields (subdomain)
-    and/or an external OAuth round-trip. The server validates the payload and
-    returns a 400 with guidance when something's missing — that message is
-    surfaced verbatim.
-
-    For headless/agent runs that can't open a browser, pass an access token with
-    `--token`; it's folded into the setup payload so the connector authorizes
-    without an interactive OAuth step.
-
-    After the create call, the real connection status is read back from
-    GET /integrations (the create response carries no status). A "full" status is
-    reported as connected. A "partial" status means the setup fields were stored
-    but an OAuth round-trip is still required: the live authorization URL (from
-    the integration definition's connection options) is printed for the browser,
-    or, under `--no-input`, the command fails since no one can complete it. Other
-    statuses (e.g. "none", which is normal for connectors with no auth concept
-    such as website crawls) are reported as connected.
-
-    If the status can't be read back at all (the re-fetch failed, or the new row
-    isn't listed yet), the command reports the integration as created but with an
-    unverified connection status rather than claiming it is connected — a
-    supplied --token is not a validated one, so it cannot stand in for a real
-    "full" status.
+    Each connector publishes one or more connection options (see
+    `eesel integrations available`), each with a `handler_type`: `submit` (a
+    direct POST that connects without leaving the terminal) or `redirect` (a
+    browser OAuth hand-off). `--option <type>` chooses one, and is required when
+    a connector exposes several. For a `submit` option the option's field
+    `schema` is filled from repeatable `--field key=value` and POSTed to the
+    option's endpoint; a missing required field is reported before any request.
+    For a `redirect` option the dashboard OAuth URL is opened in the browser and
+    the command exits — it initiates the flow and hands off, exactly like
+    `eesel login`; it does not wait for or complete the authorization.
     """
     key = args.key
-    config = _parse_config_arg(getattr(args, "config", None))
-    # An explicit --token authorizes the connector without a browser round-trip
-    # (headless/agent runs). Don't overwrite a token already supplied in --config.
-    token = getattr(args, "token", None)
-    if token and "access_token" not in config:
-        config["access_token"] = token
-    no_input = getattr(args, "no_input", False)
-    # Target the active agent when one is set, mirroring the dashboard, so the
-    # new integration's connection status is computed against it. The server
-    # extracts agent_id from the payload rather than persisting it as a property.
-    if creds.get("agent_id") and "agent_id" not in config and "agentId" not in config:
-        config["agent_id"] = creds["agent_id"]
-
-    status, result = http_request_allow_error(
-        "POST", f"{creds['api_url']}/integrations/{urllib.parse.quote(key)}", token=creds["token"], body=config
-    )
-
-    if status >= 400:
-        message = result.get("error") or result.get("message") or json.dumps(result)
-        err(f"Could not connect '{key}': {message}")
-        if result.get("details"):
-            info(str(result["details"]))
-        info("Helpdesk connectors need required setup fields (e.g. subdomain) and may require an OAuth step.")
-        info("Pass setup fields with --config, or an access token with --token for headless runs.")
+    definition = fetch_integration_definition(creds, key)
+    if definition is None:
+        err(f"No connectable integration '{key}'.")
+        info("Run `eesel integrations available` to see the catalog of connectable types.")
         return 1
 
-    integration_id = result.get("integration_id") or result.get("id")
-    identifier = result.get("identifier")
-    suffix = (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else "")
+    option, problem = _select_connection_option(definition, getattr(args, "option", None))
+    if option is None:
+        err(f"Could not connect '{key}': {problem}")
+        return 1
 
-    # Determine whether the integration is actually connected. A connector is
-    # "full" once it has credentials (e.g. subdomain + access_token) and "partial"
-    # when only the setup fields were stored and an OAuth round-trip is still
-    # needed. The create response carries no status and its `redirect_url` is just
-    # a navigation hint (returned even when fully authorized), so read the real
-    # status back from the workspace integrations.
-    conn_status = _connection_status_after_connect(creds, integration_id)
+    # Setup fields for a `submit` option come from repeatable --field key=value.
+    fields = _parse_field_args(getattr(args, "field", None))
 
-    # "partial" is the only status that means "set up but not authorized": the
-    # connector stored its setup fields and still needs an OAuth round-trip.
-    # "full" is connected; "none" is normal for connectors with no auth concept
-    # (e.g. website crawls); None means the status couldn't be read back and is
-    # reported as unverified rather than guessed — a supplied --token is not a
-    # validated one, so it can't stand in for a "full" status.
-    if conn_status == "partial":
-        if no_input:
-            err(f"Created '{key}'{suffix}, but it is not connected — this connector needs an interactive OAuth step and --no-input was given.")
-            info("Re-run with --token <access-token> to authorize without a browser.")
+    handler = option.get("handler_type")
+    endpoint = option.get("endpoint") or ""
+    opt_type = option.get("type") or "(unnamed)"
+
+    if handler == "redirect":
+        if getattr(args, "no_input", False):
+            err(f"Connecting '{key}' via '{opt_type}' needs an interactive browser OAuth step, and --no-input was given.")
             return 1
-        authorize_url = _oauth_authorize_url(creds, key, identifier or config.get("subdomain"))
-        info(f"Created '{key}'{suffix} — not yet connected (won't sync until OAuth completes).")
-        if authorize_url:
-            info(f"Open this URL in your browser to authorize:\n  {authorize_url}")
-        else:
-            info("Open the integration in the dashboard to finish authorizing.")
-        info("The browser OAuth step can't be completed headlessly; alternatively re-run with --token <access-token>.")
+        url = _browser_connect_url(creds, endpoint, fields.get("subdomain") or fields.get("identifier"))
+        info(f"Opening your browser to connect '{key}' — complete the authorization there:\n  {url}")
+        try:
+            webbrowser.open(url)
+        except Exception:
+            # No browser available (e.g. headless): the printed URL is the
+            # hand-off, so this isn't a failure.
+            pass
+        info("The CLI initiates the OAuth flow and hands off — it does not wait for it to finish.")
         return 0
 
-    if conn_status is None:
-        info(f"Created '{key}'{suffix} — connection status could not be verified.")
-        info("Run `eesel integrations list` to check whether it is connected.")
+    if handler == "submit":
+        required = (option.get("schema") or {}).get("required") or []
+        missing = [f for f in required if f not in fields]
+        if missing:
+            err(f"Could not connect '{key}': missing required field(s): {', '.join(missing)}.")
+            info(f"Pass them with --field, e.g. `--field {missing[0]}=<value>`.")
+            return 1
+        status, result = http_request_allow_error(
+            "POST", f"{creds['api_url']}{endpoint}", token=creds["token"], body=fields
+        )
+        if status >= 400:
+            message = result.get("error") or result.get("message") or json.dumps(result)
+            err(f"Could not connect '{key}': {message}")
+            if result.get("details"):
+                info(str(result["details"]))
+            return 1
+        integration_id = result.get("integration_id") or result.get("id")
+        identifier = result.get("identifier")
+        suffix = (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else "")
+        ok(f"Connected '{key}'{suffix}")
         return 0
 
-    ok(f"Connected '{key}'{suffix}")
-    return 0
+    err(f"Could not connect '{key}': unsupported connection handler '{handler}' for option '{opt_type}'.")
+    return 1
 
 
 # Valid `sync_type` values accepted by POST /integrations/{id}/trigger-sync.
@@ -2844,6 +2881,61 @@ def _integrations_sync(args, creds: dict) -> int:
         info(result.get("reason") or "A matching sync is already in progress.")
         return 0
     ok(result.get("message") or f"Triggered '{sync_type}' sync for {integration_id}.")
+    return 0
+
+
+def _sync_run_progress(run: dict) -> str:
+    """One-line progress for a sync run. Shows a percentage when the run reports
+    a total step count (clamped to 0–100, since the server can over-count
+    completed steps), else the completed-step count, plus the server's status
+    message when present."""
+    progress = run.get("progress") or {}
+    completed = progress.get("completed_steps")
+    total = progress.get("total_steps")
+    head = None
+    if isinstance(total, int) and total > 0 and isinstance(completed, int):
+        head = f"{max(0, min(100, round(100 * completed / total)))}%"
+    elif isinstance(completed, int) and completed:
+        head = f"{completed} steps"
+    message = progress.get("message")
+    parts = [p for p in (head, message) if p]
+    return " — ".join(parts) if parts else "—"
+
+
+def _integrations_sync_status(args, creds: dict) -> int:
+    """Show sync-run status and progress, read from GET /v2/sync-runs.
+
+    Bare `sync-status` lists every active or recent run in the workspace. With
+    an `<id>` (a connected integration's id, id-prefix, or type), it filters to
+    that integration's runs by matching ``metadata.integration_id``. Only
+    active and last-24h, non-dismissed runs are returned, so an integration
+    whose last sync is old legitimately shows nothing.
+    """
+    target_id = None
+    if getattr(args, "id", None):
+        integration = resolve_integration(fetch_integrations(creds, agent_id=creds.get("agent_id")), args.id)
+        if not integration:
+            err(f"No connected integration matches '{args.id}'. Run `eesel integrations list`.")
+            return 1
+        target_id = str(integration["id"])
+
+    runs = _fetch_sync_runs(creds)
+    if target_id is not None:
+        runs = _runs_for_integration(runs, target_id)
+
+    if getattr(args, "json", False):
+        print(json.dumps(runs, indent=2))
+        return 0
+    if not runs:
+        info("(no active or recent sync runs)")
+        return 0
+
+    fmt = " {:<10}  {:<22}  {}"
+    info(fmt.format("status", "integration", "progress"))
+    for r in runs:
+        meta = r.get("metadata") or {}
+        itype = (meta.get("integration_type") or "?")[:22]
+        print(fmt.format((r.get("status") or "?")[:10], itype, _sync_run_progress(r)))
     return 0
 
 
@@ -5608,11 +5700,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # so `hide_subcommands` — which pins the metavar immediately — can't be used).
     sub._choices_actions = [a for a in sub._choices_actions if a.dest != "tools"]
 
-    # `eesel integrations` lists and manages the workspace's integrations
-    # (add/connect, remove/disconnect, sync). Actions an integration exposes are
-    # scoped under it:
-    # `eesel integrations <integration> actions <list|show|enable|disable|edit>`.
-    sp = sub.add_parser("integrations", help="List, show, add, remove, sync integrations, or manage an integration's actions")
+    # `eesel integrations` lists and manages the workspace's integrations:
+    # `available` (the connectable catalog), `connect`, `sync`, `sync-status`,
+    # `show`, `remove`. Actions an integration exposes are scoped under it:
+    # `eesel integrations <integration> actions <list|show|enable|disable|set>`.
+    sp = sub.add_parser("integrations", help="List, connect, sync, and manage integrations and their actions")
     # --secrets / --json live on the parent too so bare `eesel integrations`
     # (which defaults to `list`) keeps accepting them.
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
@@ -5631,26 +5723,36 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
     i_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
     i_ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_av = ig_sub.add_parser("available", help="List connectable integration types and their connect options (read-only)")
+    i_av.add_argument("--json", action="store_true", help="Emit the raw integration-definitions payload")
+    i_av.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
     i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
-    i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with syncStatus)")
+    i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with the latest syncRun)")
     i_show.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
-    i_add = ig_sub.add_parser(
-        "add",
-        aliases=["connect"],
-        help="Connect a new integration of the given type",
-        description="Connect (add) a new integration. Helpdesk connectors (e.g. "
-        "zendesk) need required setup fields such as `subdomain` and may require "
-        "an external OAuth round-trip; pass setup fields with --config. For "
-        "headless/agent runs that can't open a browser, pass an access token with "
-        "--token (and --no-input to fail rather than print a browser URL). "
-        "`connect` is a thin alias for `add`.",
+    def _connect_args(p):
+        p.add_argument("key", help="Integration type key to connect (e.g. zendesk, website) — see `eesel integrations available`")
+        p.add_argument("--option", help="Which connection option to use (its `type` from `eesel integrations available`); required when a connector has several")
+        p.add_argument("--field", action="append", metavar="KEY=VALUE", help="A setup field for a `submit` connection option, e.g. `--field subdomain=acme` (repeatable)")
+        p.add_argument("--agent", help="Agent id, id-prefix, or name to connect the integration for (default: active agent, or $EESEL_AGENT)")
+        # Headless guard: fail instead of opening a browser for a redirect/OAuth
+        # option. Hidden — niche, for agent/CI runs that can't complete OAuth.
+        p.add_argument("--no-input", action="store_true", help=argparse.SUPPRESS)
+
+    i_connect = ig_sub.add_parser(
+        "connect",
+        help="Connect a new integration (browser OAuth hand-off, or a direct --field connect)",
+        description="Connect a new integration of the given type. Run "
+        "`eesel integrations available` to see connectable types and each one's "
+        "connection options. `--option <type>` chooses one (required when a "
+        "connector has several). A `submit` option connects directly — supply "
+        "its fields with repeatable `--field key=value`. A `redirect` option "
+        "opens the dashboard OAuth URL in your browser and hands off, like "
+        "`eesel login`; the CLI does not wait for the flow to finish.",
     )
-    i_add.add_argument("key", help="Integration type key to connect (e.g. zendesk, website, notion)")
-    i_add.add_argument("--config", help="Setup payload as a JSON object, e.g. '{\"subdomain\": \"acme\"}'")
-    i_add.add_argument("--token", help="Access token to authorize the connector without a browser (headless/agent runs)")
-    i_add.add_argument("--no-input", action="store_true", help="Never prompt or print a browser URL; fail if interactive OAuth is required")
-    i_add.add_argument("--agent", help="Agent id, id-prefix, or name to connect the integration for (default: active agent, or $EESEL_AGENT)")
+    _connect_args(i_connect)
+    # `add` is the hidden back-compat alias for the canonical `connect`.
+    _connect_args(ig_sub.add_parser("add", help=argparse.SUPPRESS))
     i_sy = ig_sub.add_parser(
         "sync",
         help="Trigger a data sync for a connected integration (Zendesk only today)",
@@ -5664,14 +5766,19 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         help="What to sync (default: help-center). One of: help-center, macros, tickets.",
     )
     i_sy.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
-    i_rm = ig_sub.add_parser(
-        "remove",
-        aliases=["disconnect"],
-        help="Disconnect a connected integration (asks for confirmation; `disconnect` is an alias)",
-    )
-    i_rm.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
-    i_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
-    i_rm.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_ss = ig_sub.add_parser("sync-status", help="Show sync-run status and progress (all runs, or one integration's)")
+    i_ss.add_argument("id", nargs="?", help="Optional: full id, id prefix, or type of a connected integration to filter to")
+    i_ss.add_argument("--json", action="store_true", help="Emit the raw sync-runs payload")
+    i_ss.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    def _remove_args(p):
+        p.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
+        p.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+        p.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+
+    i_rm = ig_sub.add_parser("remove", help="Disconnect a connected integration (asks for confirmation)")
+    _remove_args(i_rm)
+    # `disconnect` is the hidden back-compat alias for the canonical `remove`.
+    _remove_args(ig_sub.add_parser("disconnect", help=argparse.SUPPRESS))
 
     ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or edit an integration's actions")
     # The integration that scopes these actions (path positional, not a flag).
@@ -5717,6 +5824,10 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     ig_act.set_defaults(func=cmd_integration_actions, actions_cmd="list", agent=None, json=False, force=False)
     hide_subcommands(act_sub, "edit")  # `edit` is the hidden alias for `set`
+    # `add`/`disconnect` are the universal-verb spellings, kept working as hidden
+    # back-compat aliases for the canonical `connect`/`remove` but dropped from
+    # the help surface so the integration-specific vocabulary is what's advertised.
+    hide_subcommands(ig_sub, "add", "disconnect")
 
     sp = sub.add_parser("mcp", help="Manage external MCP servers registered on this workspace")
     m_sub = sp.add_subparsers(dest="mcp_cmd")
