@@ -6083,8 +6083,6 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         "chat. WRITE tools are stubbed server-side so no real emails/"
         "replies fire. Requires a sysadmin/impersonator account.",
     )
-    if not staff:
-        sub._choices_actions = [a for a in sub._choices_actions if a.dest != "impersonate"]
     # Take a positional that's either a user_id or the literal "clear".
     sp.add_argument(
         "user_id",
@@ -6093,11 +6091,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=cmd_impersonate)
 
-    # Pin the root `{...}` choices metavar to only the *visible* commands, now
-    # that every top-level subparser has been added. argparse would otherwise
-    # rebuild it from every registered subparser, leaking the hidden `tools` and
-    # `impersonate` aliases into the usage line.
-    sub.metavar = "{" + ",".join(ca.dest for ca in sub._choices_actions) + "}"
+    # Hide the top-level back-compat aliases now that every subparser is added.
+    # Use the shared helper (not a bare `help=SUPPRESS`): on Python 3.14 a
+    # suppressed subparser still lands in `_choices_actions`, so it would leak
+    # both a literal `==SUPPRESS==` row and an entry in the `{...}` usage metavar
+    # unless filtered by dest here. `impersonate` stays visible for staff.
+    _hidden_top = ["document", "tools", "instructions"]
+    if not staff:
+        _hidden_top.append("impersonate")
+    hide_subcommands(sub, *_hidden_top)
 
     # Wire "did you mean?" suggestions across every subcommand level at once.
     _install_suggestions(p)
@@ -6127,14 +6129,16 @@ _AGENTS_FLAT_VERBS = frozenset(
 # Agent-scoped child nouns → how their flat form takes the agent:
 #   "flag" → append `--agent <id>`            (e.g. `integrations list --agent X`)
 #   "pos"  → agent is the first positional    (e.g. `skills list X`, verb then id)
-# This is the per-noun knowledge that lets one resolver serve every noun.
+# This is the per-noun knowledge that lets one resolver serve every noun. A noun
+# only belongs here if EVERY verb under it accepts the agent the resolver injects.
+# `triggers`/`schedules` are deliberately absent: their `list` is workspace-wide
+# (no agent argument), so a path form would hard-error. They get a real
+# per-agent path form when triggers+schedules are unified under `automations`.
 _AGENT_SCOPED_CHILDREN = {
     "integrations": "flag",
     "documents": "flag",
     "tasks": "flag",
     "skills": "pos",
-    "triggers": "pos",
-    "schedules": "pos",
 }
 
 

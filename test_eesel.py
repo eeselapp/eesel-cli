@@ -6833,8 +6833,13 @@ class TestPathScopeResolver:
     def test_skills_show_pos_scoped(self):
         assert self.n("agents", "blog", "skills", "show", "translation") == ["skills", "show", "blog", "translation"]
 
-    def test_triggers_pos_scoped(self):
-        assert self.n("agents", "blog", "triggers", "list") == ["triggers", "list", "blog"]
+    def test_triggers_schedules_pass_through_untouched(self):
+        # `triggers`/`schedules` list is workspace-wide (no agent arg), so they
+        # are NOT agent-scoped children — the resolver must leave them alone
+        # rather than inject an agent the handler would reject. Their per-agent
+        # path form arrives with the `automations` unification.
+        assert self.n("agents", "blog", "triggers", "list") == ["agents", "blog", "triggers", "list"]
+        assert self.n("agents", "blog", "schedules", "list") == ["agents", "blog", "schedules", "list"]
 
     # ── chat at agent scope ──
     def test_chat_flag_scoped(self):
@@ -6901,3 +6906,39 @@ class TestNamingRenames:
     def test_skills_available_alias_still_works(self):
         a = self._parse("skills", "available", "blog")
         assert a.skills_cmd == "available"
+
+
+class TestPathScopeParsesEndToEnd:
+    """Regression for the gap a verify pass caught: the resolver's reshaped argv
+    must actually PARSE (argparse accepts it), not merely equal a tuple. A noun
+    in the registry whose handler doesn't accept the injected agent would parse
+    to rc=2 here."""
+
+    def _parses(self, *argv):
+        # Mirror main(): path-scope reshape, then the integrations actions reshape.
+        argv = eesel._normalize_path_scope_argv(list(argv))
+        argv = eesel._normalize_integrations_argv(argv)
+        # parse_args raises SystemExit on an unrecognized/invalid argv.
+        eesel.build_parser().parse_args(argv)
+
+    def test_agent_scoped_forms_parse(self):
+        forms = [
+            ("agents", "blog"),
+            ("agents", "blog", "show"),
+            ("agents", "blog", "show", "--instructions"),
+            ("agents", "blog", "set", "name", "X"),
+            ("agents", "blog", "integrations", "list"),
+            ("agents", "blog", "integrations", "zd", "actions", "enable", "reply"),
+            ("agents", "blog", "documents", "list"),
+            ("agents", "blog", "tasks", "list"),
+            ("agents", "blog", "skills", "list"),
+            ("agents", "blog", "skills", "show", "translation"),
+            ("agents", "blog", "skills"),
+            ("agents", "blog", "add", "zendesk"),
+            ("agents", "blog", "remove", "zendesk"),
+        ]
+        for form in forms:
+            try:
+                self._parses(*form)
+            except SystemExit:
+                raise AssertionError(f"path form did not parse: {' '.join(form)}")
