@@ -1787,7 +1787,8 @@ def cmd_agents(args) -> int:
         return 0
     if sub == "use":
         warn("`agents use` is deprecated: it stores a hidden active agent on disk. "
-             "Prefer explicit scope — `EESEL_AGENT=<id|name> eesel ...` or a `--agent` flag.")
+             "Prefer explicit scope — `eesel agents <id> ...`, `EESEL_AGENT=<id|name> eesel ...`, "
+             "or a `--agent` flag.")
         agents = fetch_agents(creds)
         if not agents:
             err("No agents in workspace. Create one in the dashboard first.")
