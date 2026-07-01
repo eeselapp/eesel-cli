@@ -626,7 +626,7 @@ class TestSessions:
         assert first["id"] == second["id"]
 
 
-class TestDocumentCommand:
+class TestFilesCommand:
     @pytest.fixture(autouse=True)
     def _default_single_agent(self, monkeypatch):
         # Documents are agent-scoped; with a single agent the CLI auto-selects
@@ -657,12 +657,12 @@ class TestDocumentCommand:
 
         monkeypatch.setattr(eesel, "http_request", fake_http_request)
 
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "list",
+                    "file_cmd": "list",
                     "prefix": "outputs/skills",
                     "search": "post",
                     "limit": 25,
@@ -699,9 +699,9 @@ class TestDocumentCommand:
         args = type(
             "Args",
             (),
-            {"document_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "json": True},
+            {"file_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "json": True},
         )()
-        rc = eesel.cmd_document(args)
+        rc = eesel.cmd_files(args)
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         # Only the current agent's document survives the scope filter.
@@ -720,10 +720,10 @@ class TestDocumentCommand:
             {"id": "doc-2", "key": "files/other-agent/b.md", "name": "b.md"},
         ]})
         args = type("Args", (), {
-            "document_cmd": "list", "prefix": None, "search": None,
+            "file_cmd": "list", "prefix": None, "search": None,
             "limit": 100, "offset": 0, "json": True, "agent": "Other Bot",
         })()
-        rc = eesel.cmd_document(args)
+        rc = eesel.cmd_files(args)
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         # Only the --agent target's document survives the scope filter.
@@ -733,11 +733,11 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "Bot"}])
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not fetch on an unresolved --agent"))
         args = type("Args", (), {
-            "document_cmd": "list", "prefix": None, "search": None,
+            "file_cmd": "list", "prefix": None, "search": None,
             "limit": 100, "offset": 0, "json": False, "agent": "nope",
         })()
         with pytest.raises(SystemExit):
-            eesel.cmd_document(args)
+            eesel.cmd_files(args)
         assert "No agent matches 'nope'" in capsys.readouterr().err
 
     def test_document_list_plain_emits_tab_separated_rows(self, tmp_config, fake_creds, monkeypatch, capsys):
@@ -758,9 +758,9 @@ class TestDocumentCommand:
         args = type(
             "Args",
             (),
-            {"document_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "plain": True},
+            {"file_cmd": "list", "prefix": None, "search": None, "limit": 100, "offset": 0, "plain": True},
         )()
-        rc = eesel.cmd_document(args)
+        rc = eesel.cmd_files(args)
         assert rc == 0
         out = capsys.readouterr().out
         lines = out.strip().splitlines()
@@ -786,12 +786,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_download", fake_http_download)
 
         output = tmp_path / "post.md"
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": key,
                     "document_id": None,
                     "format": "md",
@@ -838,12 +838,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_download", fake_http_download)
 
         output = tmp_path / "post.html"
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": None,
                     "document_id": "d22e305b-5d1",
                     "format": "html",
@@ -888,12 +888,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_download", lambda url, *, token, output_path: output_path.write_text("# Exported"))
 
         output = tmp_path / "post.md"
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": None,
                     "document_id": full_id,
                     "format": "md",
@@ -920,12 +920,12 @@ class TestDocumentCommand:
         download_mock = MagicMock()
         monkeypatch.setattr(eesel, "http_download", download_mock)
 
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": None,
                     "document_id": "d22e305b-5d1",
                     "format": "md",
@@ -943,12 +943,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_request", request_mock)
         monkeypatch.setattr(eesel, "http_download", download_mock)
 
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": "c11e2c42-b77e-45f1-88d1-cf9b22974c90/outputs/skills/agent-A/blog/run-1/POST.md",
                     "document_id": None,
                     "format": "md",
@@ -967,12 +967,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_request", request_mock)
         monkeypatch.setattr(eesel, "http_download", download_mock)
 
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     "document_key": "files/other-agent/random.md",
                     "document_id": None,
                     "format": "md",
@@ -1006,12 +1006,12 @@ class TestDocumentCommand:
         monkeypatch.setattr(eesel, "http_download", fake_http_download)
 
         output = tmp_path / "post.md"
-        rc = eesel.cmd_document(
+        rc = eesel.cmd_files(
             type(
                 "Args",
                 (),
                 {
-                    "document_cmd": "export",
+                    "file_cmd": "export",
                     # caller passes a key that includes its own workspace id prefix
                     "document_key": f"{workspace_id}/{stripped_key}",
                     "document_id": None,
@@ -1033,7 +1033,7 @@ class TestDocumentCommand:
         )
 
 
-class TestDocumentRead:
+class TestFilesRead:
     # fake_creds.agent_id == "agent-test-456"
     @pytest.fixture(autouse=True)
     def _default_single_agent(self, monkeypatch):
@@ -1048,7 +1048,7 @@ class TestDocumentRead:
     ]
 
     def _args(self, **kw):
-        base = {"document_cmd": "read", "target": None, "prefix": None, "format": "md"}
+        base = {"file_cmd": "read", "target": None, "prefix": None, "format": "md"}
         base.update(kw)
         return type("Args", (), base)()
 
@@ -1067,7 +1067,7 @@ class TestDocumentRead:
 
     def test_read_by_id_prints_content(self, tmp_config, fake_creds, monkeypatch, capsys):
         seen = self._wire(monkeypatch, content=b"# Notes\nhello world")
-        rc = eesel.cmd_document_read(self._args(target="doc-aaa11122"))
+        rc = eesel.cmd_files_read(self._args(target="doc-aaa11122"))
         assert rc == 0
         assert seen["doc_id"] == "doc-aaa11122"
         assert seen["fmt"] == "md"
@@ -1076,14 +1076,14 @@ class TestDocumentRead:
 
     def test_read_header_goes_to_stderr(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._wire(monkeypatch)
-        eesel.cmd_document_read(self._args(target="notes.md"))  # match by filename
+        eesel.cmd_files_read(self._args(target="notes.md"))  # match by filename
         captured = capsys.readouterr()
         assert "files/agent-test-456/notes.md" in captured.err
         assert "files/agent-test-456/notes.md" not in captured.out
 
     def test_read_by_filename_and_html_format(self, tmp_config, fake_creds, monkeypatch):
         seen = self._wire(monkeypatch, content=b"<h1>x</h1>")
-        rc = eesel.cmd_document_read(self._args(target="POST.md", format="html"))
+        rc = eesel.cmd_files_read(self._args(target="POST.md", format="html"))
         assert rc == 0
         assert seen["doc_id"] == "doc-bbb33344"
         assert seen["fmt"] == "html"
@@ -1097,7 +1097,7 @@ class TestDocumentRead:
             return 1  # pick the second agent-owned doc
 
         monkeypatch.setattr(eesel, "interactive_select", fake_select)
-        rc = eesel.cmd_document_read(self._args())
+        rc = eesel.cmd_files_read(self._args())
         assert rc == 0
         # Only the two agent-owned docs are offered (other-agent + integrations filtered out).
         assert len(captured["options"]) == 2
@@ -1106,38 +1106,38 @@ class TestDocumentRead:
     def test_read_prefix_is_passed_through_and_scopes(self, tmp_config, fake_creds, monkeypatch):
         seen = self._wire(monkeypatch)
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: 0)
-        eesel.cmd_document_read(self._args(prefix="files/"))
+        eesel.cmd_files_read(self._args(prefix="files/"))
         assert seen.get("prefix") == "files/"  # forwarded to fetch_documents
 
     def test_read_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._wire(monkeypatch)
-        rc = eesel.cmd_document_read(self._args(target="nope"))
+        rc = eesel.cmd_files_read(self._args(target="nope"))
         assert rc == 1
         assert capsys.readouterr().out == ""
 
     def test_read_ambiguous_id_prefix_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
         # Two agent-owned ids share the prefix "doc-".
         self._wire(monkeypatch)
-        rc = eesel.cmd_document_read(self._args(target="doc-"))
+        rc = eesel.cmd_files_read(self._args(target="doc-"))
         assert rc == 1
         assert "ambiguous" in capsys.readouterr().err
 
     def test_read_excludes_other_agents_doc(self, tmp_config, fake_creds, monkeypatch, capsys):
         # The other agent's doc must not be reachable by id.
         self._wire(monkeypatch)
-        rc = eesel.cmd_document_read(self._args(target="doc-other-99"))
+        rc = eesel.cmd_files_read(self._args(target="doc-other-99"))
         assert rc == 1
 
-    def test_read_no_documents_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_read_no_files_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_documents", lambda creds, **kw: [])
-        rc = eesel.cmd_document_read(self._args(prefix="integrations/"))
+        rc = eesel.cmd_files_read(self._args(prefix="integrations/"))
         assert rc == 0
-        assert "no documents" in capsys.readouterr().err
+        assert "no files" in capsys.readouterr().err
 
     def test_read_cancel_menu_returns_nonzero(self, tmp_config, fake_creds, monkeypatch):
         self._wire(monkeypatch)
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
-        assert eesel.cmd_document_read(self._args()) == 1
+        assert eesel.cmd_files_read(self._args()) == 1
 
 
 class TestHttpFetch:
@@ -1148,14 +1148,14 @@ class TestHttpFetch:
         assert out.read_bytes() == b"DATA"
 
 
-class TestDocumentsAdd:
+class TestFilesAdd:
     @pytest.fixture(autouse=True)
     def _default_single_agent(self, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents",
                             lambda creds: [{"agent_id": "agent-test-456", "name": "Default Bot"}])
 
     def _args(self, **over):
-        base = {"document_cmd": "add", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
+        base = {"file_cmd": "add", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
         base.update(over)
         return type("Args", (), base)()
 
@@ -1167,7 +1167,7 @@ class TestDocumentsAdd:
             return {"id": "doc-99", "key": "files/agent-test-456/my-doc.md", "name": "My Doc"}
 
         monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_document(self._args(content="hello world"))
+        rc = eesel.cmd_files(self._args(content="hello world"))
         assert rc == 0
         assert calls == [
             (
@@ -1189,18 +1189,18 @@ class TestDocumentsAdd:
         monkeypatch.setattr(eesel, "http_request", fake_http)
         content_file = tmp_path / "body.md"
         content_file.write_text("# From a file\n")
-        rc = eesel.cmd_document(self._args(content_file=str(content_file)))
+        rc = eesel.cmd_files(self._args(content_file=str(content_file)))
         assert rc == 0
         assert captured["content"] == "# From a file\n"
 
     def test_falls_back_to_id_when_no_key(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"id": "doc-only-id"})
-        rc = eesel.cmd_document(self._args(content="x"))
+        rc = eesel.cmd_files(self._args(content="x"))
         assert rc == 0
         assert capsys.readouterr().out.strip() == "doc-only-id"
 
 
-class TestDocumentsRemove:
+class TestFilesRemove:
     # `remove` resolves each argument against the documents that actually exist
     # before deleting anything, so the tests stand up a small document set.
     @pytest.fixture(autouse=True)
@@ -1214,7 +1214,7 @@ class TestDocumentsRemove:
     ]
 
     def _args(self, keys, force=False):
-        return type("Args", (), {"document_cmd": "remove", "keys": keys, "force": force, "agent": None})()
+        return type("Args", (), {"file_cmd": "remove", "keys": keys, "force": force, "agent": None})()
 
     def test_removes_resolved_keys_when_confirmed(self, tmp_config, fake_creds, monkeypatch):
         calls = []
@@ -1226,7 +1226,7 @@ class TestDocumentsRemove:
         monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
         monkeypatch.setattr(eesel, "http_request", fake_http)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        rc = eesel.cmd_document(self._args(["files/a.md", "files/b.md"]))
+        rc = eesel.cmd_files(self._args(["files/a.md", "files/b.md"]))
         assert rc == 0
         assert calls == [
             ("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md", "files/b.md"]})
@@ -1239,7 +1239,7 @@ class TestDocumentsRemove:
         monkeypatch.setattr(eesel, "agent_documents", lambda creds, **k: self.DOCS)
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: calls.append((method, k.get("body"))) or {})
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        rc = eesel.cmd_document(self._args(["doc-a"]))
+        rc = eesel.cmd_files(self._args(["doc-a"]))
         assert rc == 0
         assert calls == [("DELETE", {"keys": ["files/a.md"]})]
 
@@ -1252,7 +1252,7 @@ class TestDocumentsRemove:
             raise AssertionError("confirm() must not be called when --force is passed")
 
         monkeypatch.setattr(eesel, "confirm", boom)
-        rc = eesel.cmd_document(self._args(["files/a.md"], force=True))
+        rc = eesel.cmd_files(self._args(["files/a.md"], force=True))
         assert rc == 0
         assert calls == [("DELETE", "http://localhost:8080/documents", {"keys": ["files/a.md"]})]
 
@@ -1264,7 +1264,7 @@ class TestDocumentsRemove:
 
         monkeypatch.setattr(eesel, "http_request", boom)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: False)
-        rc = eesel.cmd_document(self._args(["files/a.md"]))
+        rc = eesel.cmd_files(self._args(["files/a.md"]))
         assert rc == 1
 
     def test_unknown_key_refuses_and_deletes_nothing(self, tmp_config, fake_creds, monkeypatch):
@@ -1278,7 +1278,7 @@ class TestDocumentsRemove:
 
         monkeypatch.setattr(eesel, "http_request", boom)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        rc = eesel.cmd_document(self._args(["files/typo.md"]))
+        rc = eesel.cmd_files(self._args(["files/typo.md"]))
         assert rc == 1
 
     def test_one_bad_key_among_good_ones_refuses_all(self, tmp_config, fake_creds, monkeypatch):
@@ -1291,7 +1291,7 @@ class TestDocumentsRemove:
 
         monkeypatch.setattr(eesel, "http_request", boom)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        rc = eesel.cmd_document(self._args(["files/a.md", "files/nope.md"]))
+        rc = eesel.cmd_files(self._args(["files/a.md", "files/nope.md"]))
         assert rc == 1
 
     def test_blank_key_refuses(self, tmp_config, fake_creds, monkeypatch):
@@ -1302,7 +1302,7 @@ class TestDocumentsRemove:
 
         monkeypatch.setattr(eesel, "http_request", boom)
         monkeypatch.setattr(eesel, "confirm", lambda prompt: True)
-        rc = eesel.cmd_document(self._args([""], force=True))
+        rc = eesel.cmd_files(self._args([""], force=True))
         assert rc == 1
 
 
@@ -1340,14 +1340,14 @@ class TestBlankTargetRefusal:
         assert eesel.resolve_integration_strict(self.INTEGRATIONS, "") is None
 
 
-class TestDocumentsAcl:
+class TestFilesAcl:
     AGENTS = [{"agent_id": "agent-test-456", "name": "Support Bot"}]
 
     def _get_args(self, agent):
-        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": agent, "json": False})()
+        return type("Args", (), {"file_cmd": "acl", "acl_cmd": "show", "agent": agent, "json": False})()
 
     def _set_args(self, agent, prefixes):
-        return type("Args", (), {"document_cmd": "acl", "acl_cmd": "set", "agent": agent, "prefix": prefixes})()
+        return type("Args", (), {"file_cmd": "acl", "acl_cmd": "set", "agent": agent, "prefix": prefixes})()
 
     def test_show_prints_key_prefixes(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = []
@@ -1358,7 +1358,7 @@ class TestDocumentsAcl:
 
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_document(self._get_args("Support Bot"))
+        rc = eesel.cmd_files(self._get_args("Support Bot"))
         assert rc == 0
         assert calls == [("GET", "http://localhost:8080/agents/agent-test-456/knowledge-acl", None)]
         out = capsys.readouterr().out
@@ -1372,8 +1372,8 @@ class TestDocumentsAcl:
             "http_request",
             lambda *a, **k: {"key_prefixes": ["files/agent-test-456", "outputs/skills/agent-test-456"]},
         )
-        args = type("Args", (), {"document_cmd": "acl", "acl_cmd": "show", "agent": "Support Bot", "json": True})()
-        rc = eesel.cmd_document(args)
+        args = type("Args", (), {"file_cmd": "acl", "acl_cmd": "show", "agent": "Support Bot", "json": True})()
+        rc = eesel.cmd_files(args)
         assert rc == 0
         assert json.loads(capsys.readouterr().out) == ["files/agent-test-456", "outputs/skills/agent-test-456"]
 
@@ -1395,7 +1395,7 @@ class TestDocumentsAcl:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         monkeypatch.setattr(eesel, "http_request", fake_http)
         # User asks for a broad bare `files` plus a specific prefix.
-        rc = eesel.cmd_document(self._set_args("agent-test-456", ["files", "files/shared"]))
+        rc = eesel.cmd_files(self._set_args("agent-test-456", ["files", "files/shared"]))
         assert rc == 0
         # PUT to write, then GET to read back what the server actually stored.
         assert [c[0] for c in calls] == ["PUT", "GET"]
@@ -1413,7 +1413,7 @@ class TestDocumentsAcl:
             raise AssertionError("must not hit the API when the agent can't be resolved")
 
         monkeypatch.setattr(eesel, "http_request", boom)
-        rc = eesel.cmd_document(self._get_args("does-not-exist"))
+        rc = eesel.cmd_files(self._get_args("does-not-exist"))
         assert rc == 1
 
 
@@ -1643,23 +1643,11 @@ class TestAgentsCreateCommand:
         }
         assert "created-id-999" in capsys.readouterr().err  # ok() writes to stderr
 
-    def test_add_alias_creates_agent_like_create(self, tmp_config, fake_creds, monkeypatch, capsys):
-        # `agents add` is the hidden alias for `create`; it must dispatch to the
-        # same create path (not silently no-op) so the universal `add` verb works
-        # for agents too.
-        calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "add", "--name", "QA Bot", "--instructions", "you are a test agent"))
-        assert rc == 0
-        assert len(calls) == 1
-        assert calls[0]["method"] == "POST"
-        assert calls[0]["url"].endswith("/agents")
-        assert calls[0]["body"] == {
-            "workspace_id": "ws-test-123",
-            "name": "QA Bot",
-            "prompt": "you are a test agent",
-            "is_active": True,
-        }
-        assert "created-id-999" in capsys.readouterr().err
+    def test_add_verb_is_no_longer_accepted(self):
+        # `agents add` used to be a hidden alias for `create`; that alias is
+        # removed, so `add` is no longer a valid agents verb.
+        with pytest.raises(SystemExit):
+            _parse("agents", "add", "--name", "QA Bot", "--instructions", "you are a test agent")
 
 
 class TestAgentsEditFieldsCommand:
@@ -1672,7 +1660,7 @@ class TestAgentsEditFieldsCommand:
     def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
+        rc = eesel.cmd_agents(_parse("agents", "set", "agent-abc123", "--name", "Renamed"))
         assert rc == 0
         assert calls[0]["method"] == "PUT"
         assert calls[0]["url"].endswith("/agents/agent-abc123")
@@ -1681,21 +1669,21 @@ class TestAgentsEditFieldsCommand:
     def test_instructions_only_sends_prompt(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--instructions", "new text"))
+        eesel.cmd_agents(_parse("agents", "set", "agent-abc123", "--instructions", "new text"))
         # calls[0] is the PUT; a read-back GET follows it.
         assert calls[0]["body"] == {"prompt": "new text"}
 
     def test_nothing_to_change_fails(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123"))
+        rc = eesel.cmd_agents(_parse("agents", "set", "agent-abc123"))
         assert rc == 1
         assert calls == []
 
     def test_ambiguous_target_refuses_without_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "Blog Writer", "--name", "X"))
+        rc = eesel.cmd_agents(_parse("agents", "set", "Blog Writer", "--name", "X"))
         assert rc == 1
         assert calls == []
         err = capsys.readouterr().err
@@ -1704,7 +1692,7 @@ class TestAgentsEditFieldsCommand:
     def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "nope", "--name", "X"))
+        rc = eesel.cmd_agents(_parse("agents", "set", "nope", "--name", "X"))
         assert rc == 1
         assert calls == []
 
@@ -1805,9 +1793,10 @@ def _agents_subparsers():
 
 class TestAgentsVerbNaming:
     """The agents subcommands follow the CLI's canonical verb set
-    (list/show/create/edit/remove). The old REST-shaped spellings
-    (get/update/delete) and the alternate `set` are removed outright — this is an
-    unreleased command surface, so there are no back-compat aliases for them."""
+    (list/show/create/set/remove). The old REST-shaped spellings
+    (get/update/delete) and the former `edit` alias are removed outright — this
+    is an unreleased command surface, so there are no back-compat aliases for
+    them."""
 
     AGENTS = [{"agent_id": "agent-abc123", "name": "Support Bot"}]
 
@@ -1816,15 +1805,13 @@ class TestAgentsVerbNaming:
         for verb in ("list", "show", "create", "set", "remove"):
             assert verb in visible
 
-    def test_edit_is_hidden_alias_for_set(self, tmp_config, fake_creds, monkeypatch):
-        # `set` is canonical; `edit` keeps working as a hidden alias.
+    def test_edit_alias_is_no_longer_accepted(self):
+        # `set` is canonical; the former `edit` alias is removed and no longer
+        # parses (neither visible nor accepted).
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
         assert "edit" not in visible
-        calls = _capture_requests(monkeypatch)
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Z"))
-        assert rc == 0
-        assert calls[0]["body"] == {"name": "Z"}
+        with pytest.raises(SystemExit):
+            _parse("agents", "edit", "agent-abc123", "--name", "Z")
 
     def test_use_and_unset_hidden_from_help(self):
         visible = [a.dest for a in _agents_subparsers()._choices_actions]
@@ -1851,7 +1838,7 @@ class TestAgentsVerbNaming:
     def test_edit_updates_fields(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         calls = _capture_requests(monkeypatch)
-        rc = eesel.cmd_agents(_parse("agents", "edit", "agent-abc123", "--name", "Renamed"))
+        rc = eesel.cmd_agents(_parse("agents", "set", "agent-abc123", "--name", "Renamed"))
         assert rc == 0
         assert calls[0]["method"] == "PUT"
         assert calls[0]["body"] == {"name": "Renamed"}
@@ -2622,44 +2609,43 @@ class TestSubcommandSuggestions:
         args = eesel.build_parser().parse_args(["sessions", "list"])
         assert args.sessions_cmd == "list"
 
-    def test_triggers_fire_points_at_schedules(self, capsys):
-        # `fire` moved from `triggers` to `schedules`. An old `triggers fire <id>`
-        # call should redirect there, not dead-end on a bare "invalid choice".
+    def test_top_level_triggers_is_no_longer_a_choice(self, capsys):
+        # `triggers` moved under `automations`; it is no longer a top-level
+        # command, so a bare `triggers ...` fails as an invalid top-level choice.
         with pytest.raises(SystemExit):
             eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
         err = capsys.readouterr().err
-        assert "eesel schedules fire" in err
+        assert "Choose from:" in err
 
     def test_relocated_name_skips_generic_did_you_mean(self, capsys):
-        # A relocation hint replaces the generic suggestion for that name.
+        # There is no relocation hint for the removed top-level `triggers`; it is
+        # simply reported as an invalid top-level choice.
         with pytest.raises(SystemExit):
             eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
         err = capsys.readouterr().err
         assert "Did you mean" not in err
 
     def test_triggers_typo_still_suggests_nearest(self, capsys):
-        # Non-relocated typos under `triggers` keep the generic suggestion.
+        # Typos under the `automations triggers` namespace keep the generic
+        # nearest-verb suggestion.
         with pytest.raises(SystemExit):
-            eesel.build_parser().parse_args(["triggers", "lst"])
+            eesel.build_parser().parse_args(["automations", "triggers", "lst"])
         assert "Did you mean 'list'?" in capsys.readouterr().err
 
 
 class TestTriggersAllRemoved:
-    def test_all_flag_redirects_and_fails_closed(self, fake_creds, capsys):
+    def test_all_flag_is_not_accepted(self):
         # `triggers --all` was removed (listing-all is now the default for
-        # `triggers list`). It must fail closed with a pointer, never silently
-        # do the wrong thing.
-        args = eesel.build_parser().parse_args(["triggers", "--all"])
-        rc = args.func(args)
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "triggers --all" in err
-        assert "eesel schedules list" in err
+        # `automations triggers list`). The flag no longer exists on the parser,
+        # so passing it is rejected.
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["automations", "triggers", "--all"])
 
-    def test_all_flag_hidden_from_help(self):
-        # The flag is kept parseable only to power the redirect; it stays out of
-        # the help text so it isn't advertised as usable.
-        triggers = _subparsers_action(eesel.build_parser()).choices["triggers"]
+    def test_all_flag_absent_from_help(self):
+        # The flag is gone from the parser and must not appear in help text.
+        triggers = _subparsers_action(
+            _subparsers_action(eesel.build_parser()).choices["automations"]
+        ).choices["triggers"]
         assert "--all" not in triggers.format_help()
 
 
@@ -2807,14 +2793,14 @@ class TestArgParser:
 
     def test_triggers_registry_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "registry"])
-        assert args.cmd == "triggers"
+        args = parser.parse_args(["automations", "triggers", "registry"])
+        assert args.cmd == "automations"
         assert args.triggers_cmd == "registry"
         assert args.func is eesel.cmd_triggers
 
     def test_triggers_add_parses_key_and_config(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "add", "Support Bot", "--key", "zendesk_ticket_created", "--config", "{}"])
+        args = parser.parse_args(["automations", "triggers", "add", "Support Bot", "--key", "zendesk_ticket_created", "--config", "{}"])
         assert args.triggers_cmd == "add"
         assert args.agent == "Support Bot"
         assert args.key == "zendesk_ticket_created"
@@ -2823,48 +2809,69 @@ class TestArgParser:
     def test_triggers_add_requires_key(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["triggers", "add", "Support Bot"])  # missing --key
+            parser.parse_args(["automations", "triggers", "add", "Support Bot"])  # missing --key
 
     def test_triggers_show_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "show", "trg-1"])
+        args = parser.parse_args(["automations", "triggers", "show", "trg-1"])
         assert args.triggers_cmd == "show"
         assert args.trigger_id == "trg-1"
         assert args.func is eesel.cmd_triggers
 
     def test_triggers_remove_parses_force_flag(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["triggers", "remove", "trg-1", "--force"])
+        args = parser.parse_args(["automations", "triggers", "remove", "trg-1", "--force"])
         assert args.triggers_cmd == "remove"
         assert args.trigger_id == "trg-1"
         assert args.force is True
+
+    def test_top_level_triggers_and_schedules_are_removed(self):
+        # `triggers` and `schedules` now live under the `automations` parent;
+        # the old top-level spellings are no longer valid choices.
+        parser = eesel.build_parser()
+        for argv in (["triggers", "registry"], ["schedules", "list"]):
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_bare_automations_reports_sub_namespace_error(self, capsys):
+        # `eesel automations` with no sub-namespace routes to cmd_automations,
+        # which names the available sub-namespaces and returns 2.
+        parser = eesel.build_parser()
+        args = parser.parse_args(["automations"])
+        assert args.cmd == "automations"
+        assert args.func is eesel.cmd_automations
+        rc = args.func(args)
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "triggers" in err and "schedules" in err
 
     def test_triggers_removed_verbs_no_longer_parse(self):
         # The REST-derived verbs (`create`/`delete`) were renamed to the canonical
         # set and must not parse. `fire`/`run` previously lingered as triggers
         # aliases that no longer dispatched; manually firing a scheduled job now
-        # lives solely under `eesel schedules fire`, so they must not parse here.
+        # lives solely under `eesel automations schedules fire`, so they must not
+        # parse here.
         parser = eesel.build_parser()
         for argv in (
-            ["triggers", "create", "Support Bot", "--key", "k"],
-            ["triggers", "delete", "trg-1"],
-            ["triggers", "fire", "heartbeat"],
-            ["triggers", "run", "heartbeat"],
+            ["automations", "triggers", "create", "Support Bot", "--key", "k"],
+            ["automations", "triggers", "delete", "trg-1"],
+            ["automations", "triggers", "fire", "heartbeat"],
+            ["automations", "triggers", "run", "heartbeat"],
         ):
             with pytest.raises(SystemExit):
                 parser.parse_args(argv)
 
     def test_schedules_list_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["schedules", "list"])
-        assert args.cmd == "schedules"
+        args = parser.parse_args(["automations", "schedules", "list"])
+        assert args.cmd == "automations"
         assert args.schedules_cmd == "list"
         assert args.func is eesel.cmd_schedules
 
     def test_schedules_add_parses_cron_and_flags(self):
         parser = eesel.build_parser()
         args = parser.parse_args([
-            "schedules", "add", "Support Bot",
+            "automations", "schedules", "add", "Support Bot",
             "--cron", "0 9 * * *", "--prompt", "Send the morning digest",
             "--title", "Morning digest", "--timezone", "Europe/London",
         ])
@@ -2879,25 +2886,25 @@ class TestArgParser:
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
             # missing --cron (--prompt also required, but --cron alone is enough to reject)
-            parser.parse_args(["schedules", "add", "Support Bot", "--prompt", "x"])
+            parser.parse_args(["automations", "schedules", "add", "Support Bot", "--prompt", "x"])
 
     def test_schedules_add_requires_prompt(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
             # The server rejects scheduled triggers without a prompt, so the CLI
             # makes it a required flag and fails before sending the request.
-            parser.parse_args(["schedules", "add", "Support Bot", "--cron", "0 9 * * *"])
+            parser.parse_args(["automations", "schedules", "add", "Support Bot", "--cron", "0 9 * * *"])
 
     def test_schedules_remove_parses_force_flag(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["schedules", "remove", "sch-1", "-f"])
+        args = parser.parse_args(["automations", "schedules", "remove", "sch-1", "-f"])
         assert args.schedules_cmd == "remove"
         assert args.job == "sch-1"
         assert args.force is True
 
     def test_schedules_fire_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["schedules", "fire", "heartbeat"])
+        args = parser.parse_args(["automations", "schedules", "fire", "heartbeat"])
         assert args.schedules_cmd == "fire"
         assert args.job == "heartbeat"
 
@@ -2937,52 +2944,52 @@ class TestConfirm:
         args = parser.parse_args(["cost", "abc12345"])
         assert args.session_id == "abc12345"
 
-    def test_document_list_subcommand_parses(self):
+    def test_files_list_subcommand_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["document", "list", "--prefix", "outputs/skills", "--search", "post", "--limit", "25"])
-        assert args.cmd == "document"
-        assert args.document_cmd == "list"
+        args = parser.parse_args(["files", "list", "--prefix", "outputs/skills", "--search", "post", "--limit", "25"])
+        assert args.cmd == "files"
+        assert args.file_cmd == "list"
         assert args.prefix == "outputs/skills"
         assert args.search == "post"
         assert args.limit == 25
 
-    def test_document_subcommands_accept_agent_flag(self):
+    def test_files_subcommands_accept_agent_flag(self):
         parser = eesel.build_parser()
         for argv in (
-            ["documents", "list", "--agent", "Bot"],
-            ["documents", "show", "doc-1", "--agent", "Bot"],
-            ["documents", "add", "--title", "T", "--content", "x", "--agent", "Bot"],
+            ["files", "list", "--agent", "Bot"],
+            ["files", "show", "doc-1", "--agent", "Bot"],
+            ["files", "add", "--title", "T", "--content", "x", "--agent", "Bot"],
         ):
             args = parser.parse_args(argv)
             assert args.agent == "Bot"
 
-    def test_document_export_subcommand_parses(self):
+    def test_files_export_subcommand_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["document", "export", "--document-id", "doc-123", "--format", "html"])
-        assert args.cmd == "document"
-        assert args.document_cmd == "export"
+        args = parser.parse_args(["files", "export", "--file-id", "doc-123", "--format", "html"])
+        assert args.cmd == "files"
+        assert args.file_cmd == "export"
         assert args.document_id == "doc-123"
         assert args.format == "html"
 
-    def test_document_defaults_to_list(self):
+    def test_files_defaults_to_list(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["document"])
-        assert args.cmd == "document"
-        assert args.document_cmd == "list"
+        args = parser.parse_args(["files"])
+        assert args.cmd == "files"
+        assert args.file_cmd == "list"
         assert args.limit == 100
 
-    def test_document_read_subcommand_parses(self):
+    def test_files_read_subcommand_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["document", "read", "doc-123", "--prefix", "files/", "--format", "html"])
-        assert args.document_cmd == "read"
+        args = parser.parse_args(["files", "read", "doc-123", "--prefix", "files/", "--format", "html"])
+        assert args.file_cmd == "read"
         assert args.target == "doc-123"
         assert args.prefix == "files/"
         assert args.format == "html"
 
-    def test_document_read_no_target_defaults(self):
+    def test_files_read_no_target_defaults(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["document", "read"])
-        assert args.document_cmd == "read"
+        args = parser.parse_args(["files", "read"])
+        assert args.file_cmd == "read"
         assert args.target is None
         assert args.prefix is None
         assert args.format == "md"
@@ -2990,103 +2997,102 @@ class TestConfirm:
     def test_top_level_export_removed(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["export", "--document-id", "doc-123"])
+            parser.parse_args(["export", "--file-id", "doc-123"])
 
-    def test_documents_plural_is_canonical_noun(self):
+    def test_plural_documents_is_removed(self):
+        # `files` is the canonical noun; plural `documents` no longer exists.
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "list"])
-        assert args.cmd == "documents"
-        assert args.document_cmd == "list"
-        assert args.func is eesel.cmd_document
+        with pytest.raises(SystemExit):
+            parser.parse_args(["documents", "list"])
 
     def test_singular_document_still_parses_as_alias(self):
         parser = eesel.build_parser()
         args = parser.parse_args(["document", "list"])
         assert args.cmd == "document"
-        assert args.document_cmd == "list"
-        assert args.func is eesel.cmd_document
+        assert args.file_cmd == "list"
+        assert args.func is eesel.cmd_files
 
     def test_singular_document_hidden_from_help(self):
         # The alias parses but is dropped from the top-level command listing.
         help_text = eesel.build_parser().format_help()
-        assert "documents" in help_text
+        assert "files" in help_text
         assert "\n    document " not in help_text
 
     def test_show_is_documented_synonym_of_read(self):
         parser = eesel.build_parser()
-        show_args = parser.parse_args(["documents", "show", "doc-1", "--format", "html"])
-        read_args = parser.parse_args(["documents", "read", "doc-1", "--format", "html"])
-        assert show_args.document_cmd == "show"
-        assert read_args.document_cmd == "read"
+        show_args = parser.parse_args(["files", "show", "doc-1", "--format", "html"])
+        read_args = parser.parse_args(["files", "read", "doc-1", "--format", "html"])
+        assert show_args.file_cmd == "show"
+        assert read_args.file_cmd == "read"
         # Both route to the same handler, which treats show/read identically.
-        assert show_args.func is eesel.cmd_document and read_args.func is eesel.cmd_document
+        assert show_args.func is eesel.cmd_files and read_args.func is eesel.cmd_files
 
-    def test_read_hidden_from_documents_help(self):
-        # `read` stays parseable but is not advertised under `documents --help`.
-        documents_action = next(
+    def test_read_hidden_from_files_help(self):
+        # `read` stays parseable but is not advertised under `files --help`.
+        files_action = next(
             a for a in eesel.build_parser()._subparsers._group_actions[0].choices.values()
-            if a.prog.endswith("documents")
+            if a.prog.endswith("files")
         )
-        sub_help = documents_action.format_help()
+        sub_help = files_action.format_help()
         assert "show " in sub_help
         assert "read" not in sub_help.split("optional arguments")[0].replace("==SUPPRESS==", "")
 
-    def test_documents_list_accepts_json(self):
+    def test_files_list_accepts_json(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "list", "--search", "post", "--json"])
-        assert args.document_cmd == "list"
+        args = parser.parse_args(["files", "list", "--search", "post", "--json"])
+        assert args.file_cmd == "list"
         assert args.search == "post"
         assert args.json is True
 
-    def test_documents_add_parses(self):
+    def test_files_add_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "add", "--title", "T", "--content", "C"])
-        assert args.document_cmd == "add"
+        args = parser.parse_args(["files", "add", "--title", "T", "--content", "C"])
+        assert args.file_cmd == "add"
         assert args.title == "T"
         assert args.content == "C"
         assert args.source_type == "files"
 
-    def test_documents_add_requires_content(self):
+    def test_files_add_requires_content(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "add", "--title", "T"])
+            parser.parse_args(["files", "add", "--title", "T"])
 
-    def test_documents_add_rejects_both_content_sources(self):
+    def test_files_add_rejects_both_content_sources(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "add", "--title", "T", "--content", "C", "--content-file", "f"])
+            parser.parse_args(["files", "add", "--title", "T", "--content", "C", "--content-file", "f"])
 
-    def test_documents_search_is_a_list_flag_not_a_verb(self):
+    def test_files_search_is_a_list_flag_not_a_verb(self):
         # A free-text query folds into `list --search`; there is no `search` verb.
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "search", "files/abc"])
+            parser.parse_args(["files", "search", "files/abc"])
 
-    def test_documents_remove_parses_multiple_keys_and_force(self):
+    def test_files_remove_parses_multiple_keys_and_force(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "remove", "k1", "k2", "-f"])
-        assert args.document_cmd == "remove"
+        args = parser.parse_args(["files", "remove", "k1", "k2", "-f"])
+        assert args.file_cmd == "remove"
         assert args.keys == ["k1", "k2"]
         assert args.force is True
 
-    def test_documents_acl_show_parses(self):
+    def test_files_acl_show_parses(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "acl", "show", "Support Bot"])
-        assert args.document_cmd == "acl"
+        args = parser.parse_args(["files", "acl", "show", "Support Bot"])
+        assert args.file_cmd == "acl"
         assert args.acl_cmd == "show"
         assert args.agent == "Support Bot"
 
-    def test_documents_acl_set_parses_repeatable_prefix(self):
+    def test_files_acl_set_parses_repeatable_prefix(self):
         parser = eesel.build_parser()
-        args = parser.parse_args(["documents", "acl", "set", "agent-1", "--prefix", "a/", "--prefix", "b/"])
+        args = parser.parse_args(["files", "acl", "set", "agent-1", "--prefix", "a/", "--prefix", "b/"])
         assert args.acl_cmd == "set"
         assert args.agent == "agent-1"
         assert args.prefix == ["a/", "b/"]
 
-    def test_documents_acl_set_requires_prefix(self):
+    def test_files_acl_set_requires_prefix(self):
         parser = eesel.build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["documents", "acl", "set", "agent-1"])
+            parser.parse_args(["files", "acl", "set", "agent-1"])
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -4360,13 +4366,12 @@ class TestIntegrationsConnect:
         assert "No connectable integration 'nope'" in err
         assert "available" in err
 
-    def test_add_alias_routes_to_connect(self, fake_creds, monkeypatch):
-        self._defs(monkeypatch)
-        opened = []
-        self._no_browser(monkeypatch, opened)
-        rc = eesel.cmd_integrations(_connect_args(integrations_cmd="add", key="zendesk", option="oauth"))
-        assert rc == 0
-        assert opened  # same redirect behavior as `connect`
+    def test_add_alias_is_no_longer_accepted(self):
+        # `integrations add` used to alias `connect`; that alias is removed, so
+        # `add` is no longer a valid integrations verb.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(eesel._normalize_integrations_argv(["integrations", "add", "zendesk"]))
 
     def test_submit_surfaces_server_400(self, fake_creds, monkeypatch, capsys):
         self._defs(monkeypatch)
@@ -4598,14 +4603,12 @@ class TestIntegrationsRemove:
         assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
         assert "Uninstalled" in capsys.readouterr().err
 
-    def test_disconnect_alias_routes_to_remove(self, fake_creds, monkeypatch, capsys):
-        captured = {}
-        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_integrations(_args(integrations_cmd="disconnect", id="int-zendesk-1", force=True))
-        assert rc == 0
-        assert captured["method"] == "DELETE"
-        assert captured["url"] == "http://localhost:8080/integrations/int-zendesk-1"
+    def test_disconnect_alias_is_no_longer_accepted(self):
+        # `integrations disconnect` used to alias `remove`; that alias is removed,
+        # so `disconnect` is no longer a valid integrations verb.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(eesel._normalize_integrations_argv(["integrations", "disconnect", "int-zendesk-1"]))
 
     def test_prompts_and_aborts_on_no(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(_INTEGRATIONS))
@@ -5173,13 +5176,12 @@ class TestSchedulesFire:
         assert captured["url"] == "http://localhost:8080/triggers/sch-1/fire"
         assert "Fired 'Heartbeat'" in capsys.readouterr().err
 
-    def test_run_alias_still_fires(self, fake_creds, monkeypatch, capsys):
-        # `run` is a backward-compat alias for `fire`.
-        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: self._match())
-        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"scheduled_at": None, "external_reference": None})
-        rc = eesel.cmd_schedules(_args(schedules_cmd="run", job="heartbeat"))
-        assert rc == 0
-        assert "Fired 'Heartbeat'" in capsys.readouterr().err
+    def test_run_alias_is_no_longer_accepted(self):
+        # `run` was a backward-compat alias for `fire`; it is removed and no
+        # longer parses under `automations schedules`.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["automations", "schedules", "run", "heartbeat"])
 
     def test_fire_no_match_errors(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, t: None)
@@ -5292,13 +5294,12 @@ class TestSchedulesRemove:
         assert rc == 1
         assert sent["called"] is False
 
-    def test_delete_alias_still_removes(self, fake_creds, monkeypatch):
-        captured = {}
-        monkeypatch.setattr(eesel, "resolve_scheduled_job_strict", lambda creds, target: {"id": "sch-3", "config": {}, "agent_name": "Bot"})
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: captured.update(method=method, url=url) or {})
-        rc = eesel.cmd_schedules(_args(schedules_cmd="delete", job="sch-3", force=True))
-        assert rc == 0
-        assert captured == {"method": "DELETE", "url": "http://localhost:8080/triggers/sch-3"}
+    def test_delete_alias_is_no_longer_accepted(self):
+        # `delete` was a backward-compat alias for `remove`; it is removed and no
+        # longer parses under `automations schedules`.
+        parser = eesel.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["automations", "schedules", "delete", "sch-3"])
 
     def test_remove_unmatched_job_errors_cleanly(self, fake_creds, monkeypatch, capsys):
         # A non-matching value (e.g. a title with a space) must NOT be sent to the
@@ -5402,9 +5403,9 @@ class TestSkillsList:
 
 
 class TestSkillsAvailable:
-    """`skills available` lists the marketplace catalog an agent can install
-    from — the ids `skills add` accepts, so a valid <skill_id> is discoverable
-    without leaving the CLI."""
+    """`skills list --available` lists the marketplace catalog an agent can
+    install from — the ids `skills add` accepts, so a valid <skill_id> is
+    discoverable without leaving the CLI."""
 
     def test_available_requests_available_filter_and_lists_ids(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
@@ -5418,7 +5419,7 @@ class TestSkillsAvailable:
             ]
 
         monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_skills(_skills_parse("skills", "available", "agent-abc123"))
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123", "--available"))
         out = capsys.readouterr().out
         assert rc == 0
         assert "filter=available" in captured["url"]  # the catalog, not installed
@@ -5427,7 +5428,7 @@ class TestSkillsAvailable:
     def test_available_plain_emits_id_and_name(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: [{"id": "simulation", "name": "Simulate"}])
-        rc = eesel.cmd_skills(_skills_parse("skills", "available", "agent-abc123", "--plain"))
+        rc = eesel.cmd_skills(_skills_parse("skills", "list", "agent-abc123", "--available", "--plain"))
         assert rc == 0
         assert "simulation\tSimulate" in capsys.readouterr().out
 
@@ -5566,33 +5567,33 @@ class TestSkillsEdit:
         visible = [a.dest for a in sk_sub._choices_actions]
         assert "set" in visible and "edit" not in visible
 
-    def test_edit_patches_parsed_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_set_patches_multi_key_config_object(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
         rc = eesel.cmd_skills(
-            _skills_parse("skills", "edit", "agent-abc123", "triage", "--config", '{"threshold": 3, "label": "urgent"}')
+            _skills_parse("skills", "set", "agent-abc123", "triage", "--config", '{"threshold": 3, "label": "urgent"}')
         )
         assert rc == 0
         assert calls[0]["method"] == "PATCH"
         assert calls[0]["url"].endswith("/agents/agent-abc123/skills/triage/config")
         assert calls[0]["body"] == {"threshold": 3, "label": "urgent"}
 
-    def test_edit_rejects_invalid_json_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_set_rejects_invalid_json_before_request(self, tmp_config, fake_creds, monkeypatch, capsys):
         # Malformed --config exits with the shared parse_config_object contract
         # (code 2) before any request is sent.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
         with pytest.raises(SystemExit) as exc:
-            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "{not json"))
+            eesel.cmd_skills(_skills_parse("skills", "set", "agent-abc123", "triage", "--config", "{not json"))
         assert exc.value.code == 2
         assert calls == []
         assert "not valid JSON" in capsys.readouterr().err
 
-    def test_edit_rejects_non_object_json(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_set_rejects_non_object_json(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
         calls = _capture_skill_requests(monkeypatch)
         with pytest.raises(SystemExit) as exc:
-            eesel.cmd_skills(_skills_parse("skills", "edit", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
+            eesel.cmd_skills(_skills_parse("skills", "set", "agent-abc123", "triage", "--config", "[1, 2, 3]"))
         assert exc.value.code == 2
         assert calls == []
         assert "must be a JSON object" in capsys.readouterr().err
@@ -5625,9 +5626,9 @@ class TestSkillsArgParser:
         assert args.skills_cmd == "show"
         assert args.skill_id == "skill-1"
 
-    def test_edit_requires_config(self):
+    def test_set_requires_config(self):
         with pytest.raises(SystemExit):
-            _skills_parse("skills", "edit", "my-agent", "skill-1")  # missing --config
+            _skills_parse("skills", "set", "my-agent", "skill-1")  # missing --config
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -5850,14 +5851,14 @@ class TestMcpEditCommand:
     def test_sends_only_provided_field(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
-        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--name", "Renamed"))
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123", "--name", "Renamed"))
         assert rc == 0
         assert calls[0]["method"] == "PUT"
         assert calls[0]["url"].endswith("/workspaces/ws-test-123/mcp-servers/srv-abc123")
         assert calls[0]["body"] == {"name": "Renamed"}
 
-    def test_set_is_canonical_edit_hidden_alias(self, tmp_config, fake_creds, monkeypatch):
-        # `set` is canonical and does the same PUT; `edit` is a hidden alias.
+    def test_set_is_canonical_and_edit_is_removed(self, tmp_config, fake_creds, monkeypatch):
+        # `set` is canonical and does the PUT; the former `edit` alias is removed.
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
         rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123", "--name", "Renamed"))
@@ -5865,24 +5866,26 @@ class TestMcpEditCommand:
         m_sub = _subparsers_action(_subparsers_action(eesel.build_parser()).choices["mcp"])
         visible = [a.dest for a in m_sub._choices_actions]
         assert "set" in visible and "edit" not in visible
+        with pytest.raises(SystemExit):
+            _mcp_parse("mcp", "edit", "srv-abc123", "--name", "X")
 
     def test_url_only_sends_base_url(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
-        eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123", "--url", "https://new"))
+        eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123", "--url", "https://new"))
         assert calls[-1]["body"] == {"base_url": "https://new"}
 
     def test_nothing_to_update_fails(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
-        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "srv-abc123"))
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "srv-abc123"))
         assert rc == 1
         assert calls == []
 
     def test_unknown_target_errors(self, tmp_config, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds: self.SERVERS)
         calls = _mcp_capture(monkeypatch, response={})
-        rc = eesel.cmd_mcp(_mcp_parse("mcp", "edit", "nope", "--name", "X"))
+        rc = eesel.cmd_mcp(_mcp_parse("mcp", "set", "nope", "--name", "X"))
         assert rc == 1
         assert calls == []
 
@@ -6406,7 +6409,7 @@ class TestParseToolConfig:
 
 
 class TestIntegrationActionsWrite:
-    """enable / edit / disable on `eesel integrations <integration> actions`."""
+    """enable / set / disable on `eesel integrations <integration> actions`."""
 
     def _agents(self):
         return [
@@ -6471,29 +6474,29 @@ class TestIntegrationActionsWrite:
         assert rc == 1
         assert "No agent matches" in capsys.readouterr().err
 
-    # ── edit ────────────────────────────────────────────────────────────
-    def test_edit_posts_parsed_config(self, fake_creds, monkeypatch, capsys):
+    # ── set ─────────────────────────────────────────────────────────────
+    def test_set_posts_parsed_config(self, fake_creds, monkeypatch, capsys):
         captured = self._setup(monkeypatch, {"config": {"permission_mode": "ask"}})
         rc = eesel.cmd_integration_actions(_args(
-            actions_cmd="edit", integration="zendesk", agent="agent-test-456",
+            actions_cmd="set", integration="zendesk", agent="agent-test-456",
             action="zendesk_leave_internal_note", config='{"permission_mode": "ask"}'))
         assert rc == 0
         assert captured["method"] == "POST"
         assert captured["url"] == "http://localhost:8080/agents/agent-test-456/tools/zendesk_leave_internal_note"
         assert captured["body"] == {"config": {"permission_mode": "ask"}, "integration_id": "int-zendesk-1"}
 
-    def test_edit_rejects_bad_json_without_request(self, fake_creds, monkeypatch, capsys):
+    def test_set_rejects_bad_json_without_request(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("should not POST"))
         rc = eesel.cmd_integration_actions(_args(
-            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config="{bad"))
+            actions_cmd="set", integration="zendesk", agent="agent-test-456", action="k", config="{bad"))
         assert rc == 1
         assert "not valid JSON" in capsys.readouterr().err
 
-    def test_edit_redacts_secrets_in_echoed_config(self, fake_creds, monkeypatch, capsys):
+    def test_set_redacts_secrets_in_echoed_config(self, fake_creds, monkeypatch, capsys):
         self._setup(monkeypatch, {"config": {"access_token": "tok-LEAK", "mode": "ask"}})
         eesel.cmd_integration_actions(_args(
-            actions_cmd="edit", integration="zendesk", agent="agent-test-456", action="k", config='{"mode": "ask"}'))
+            actions_cmd="set", integration="zendesk", agent="agent-test-456", action="k", config='{"mode": "ask"}'))
         err = capsys.readouterr().err
         assert "tok-LEAK" not in err
         assert "***" in err
@@ -6569,14 +6572,17 @@ class TestNormalizeIntegrationsArgv:
             argv = ["integrations", "zendesk", "actions", verb, "reply"]
             assert eesel._normalize_integrations_argv(argv) == ["integrations", "actions", "zendesk", verb, "reply"]
 
-    def test_actions_set_canonical_edit_hidden_alias(self):
-        # `set` is the canonical config verb; `edit` is a hidden alias.
+    def test_actions_set_is_canonical_and_edit_is_removed(self):
+        # `set` is the canonical config verb; the former `edit` alias is removed.
         parser = eesel.build_parser()
-        for verb in ("set", "edit"):
-            args = parser.parse_args(
+        args = parser.parse_args(
+            eesel._normalize_integrations_argv(
+                ["integrations", "zendesk", "actions", "set", "reply", "--config", "{}"]))
+        assert args.actions_cmd == "set"
+        with pytest.raises(SystemExit):
+            parser.parse_args(
                 eesel._normalize_integrations_argv(
-                    ["integrations", "zendesk", "actions", verb, "reply", "--config", "{}"]))
-            assert args.actions_cmd == verb
+                    ["integrations", "zendesk", "actions", "edit", "reply", "--config", "{}"]))
         integrations = _subparsers_action(parser).choices["integrations"]
         act_sub = _subparsers_action(integrations).choices["actions"]
         visible = [a.dest for a in _subparsers_action(act_sub)._choices_actions]
@@ -6833,7 +6839,9 @@ class TestPathScopeResolver:
 
     # ── grant / revoke at agent scope ──
     def test_grant_integration(self):
-        assert self.n("agents", "blog", "add", "zendesk") == ["integrations", "add", "zendesk", "--agent", "blog"]
+        # The grant `add` head maps to the canonical `connect` verb (the old
+        # `integrations add` alias was removed).
+        assert self.n("agents", "blog", "add", "zendesk") == ["integrations", "connect", "zendesk", "--agent", "blog"]
 
     def test_revoke_integration(self):
         assert self.n("agents", "blog", "remove", "zendesk") == ["integrations", "remove", "zendesk", "--agent", "blog"]
@@ -6863,8 +6871,8 @@ class TestPathScopeResolver:
         assert self.n("agents", "blog", "integrations", "zd", "actions", "enable", "reply") == \
             ["integrations", "zd", "actions", "enable", "reply", "--agent", "blog"]
 
-    def test_documents_flag_scoped(self):
-        assert self.n("agents", "blog", "documents", "list") == ["documents", "list", "--agent", "blog"]
+    def test_files_flag_scoped(self):
+        assert self.n("agents", "blog", "files", "list") == ["files", "list", "--agent", "blog"]
 
     # ── child noun descent: "pos" scoping (agent is the first positional) ──
     def test_skills_list_pos_scoped(self):
@@ -6948,9 +6956,11 @@ class TestNamingRenames:
         eesel.cmd_skills(a)
         assert seen["kw"] == {}  # installed view: no filter_
 
-    def test_skills_available_alias_still_works(self):
-        a = self._parse("skills", "available", "blog")
-        assert a.skills_cmd == "available"
+    def test_skills_available_alias_is_removed(self):
+        # `available` was a verb alias for `list --available`; it is removed and
+        # no longer parses.
+        with pytest.raises(SystemExit):
+            self._parse("skills", "available", "blog")
 
 
 class TestPathScopeParsesEndToEnd:
@@ -6974,7 +6984,7 @@ class TestPathScopeParsesEndToEnd:
             ("agents", "blog", "set", "name", "X"),
             ("agents", "blog", "integrations", "list"),
             ("agents", "blog", "integrations", "zd", "actions", "enable", "reply"),
-            ("agents", "blog", "documents", "list"),
+            ("agents", "blog", "files", "list"),
             ("agents", "blog", "tasks", "list"),
             ("agents", "blog", "skills", "list"),
             ("agents", "blog", "skills", "show", "translation"),
@@ -7006,7 +7016,7 @@ class TestPathScopeDiscoverable:
         assert "scope by path" in h
         # The shape and a few representative scoped nouns are shown.
         assert "eesel agents <id> <noun>" in h or "agents <id> integrations list" in h
-        for noun in ("integrations list", "skills list", "tasks list", "documents list"):
+        for noun in ("integrations list", "skills list", "tasks list", "files list"):
             assert noun in h, f"path-scope help omits `agents <id> {noun}`"
         assert "show --instructions" in h
 
@@ -7017,17 +7027,17 @@ class TestPathScopeDiscoverable:
 
 class TestPathScopeVerbScoping:
     """A 'flag' noun only injects --agent for verbs whose flat parser accepts it
-    (documents/tasks have verbs that don't). A verb the flat parser can't scope by
+    (files/tasks have verbs that don't). A verb the flat parser can't scope by
     agent must NOT get a mis-injected --agent; instead it exits with an error that
-    names the verb (not the agent id), so a scoped `documents acl` / `tasks show`
+    names the verb (not the agent id), so a scoped `files acl` / `tasks show`
     fails clearly rather than reshaping into a command the handler would reject."""
 
     def n(self, *argv):
         return eesel._normalize_path_scope_argv(list(argv))
 
     def test_agent_accepting_verbs_get_scoped(self):
-        assert self.n("agents", "blog", "documents", "show", "k") == ["documents", "show", "k", "--agent", "blog"]
-        assert self.n("agents", "blog", "documents", "add", "--title", "t") == ["documents", "add", "--title", "t", "--agent", "blog"]
+        assert self.n("agents", "blog", "files", "show", "k") == ["files", "show", "k", "--agent", "blog"]
+        assert self.n("agents", "blog", "files", "add", "--title", "t") == ["files", "add", "--title", "t", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "count") == ["tasks", "count", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "analytics") == ["tasks", "analytics", "--agent", "blog"]
 
@@ -7038,9 +7048,9 @@ class TestPathScopeVerbScoping:
         # of the flag-mode path form (unlike list/show/read/add/remove/export).
         for verb in ("acl",):
             with pytest.raises(SystemExit) as exc:
-                self.n("agents", "blog", "documents", verb, "x")
+                self.n("agents", "blog", "files", verb, "x")
             assert exc.value.code == 2
-            assert f"`{verb}` is not an agent-scoped `documents` verb" in capsys.readouterr().err
+            assert f"`{verb}` is not an agent-scoped `files` verb" in capsys.readouterr().err
         for verb in ("show", "cost"):
             with pytest.raises(SystemExit):
                 self.n("agents", "blog", "tasks", verb, "x")
@@ -7057,7 +7067,7 @@ class TestPathScopeBareNounListsConsistently:
 
     def test_flag_mode_nouns_default_to_list(self):
         assert self.n("agents", "blog", "tasks") == ["tasks", "list", "--agent", "blog"]
-        assert self.n("agents", "blog", "documents") == ["documents", "list", "--agent", "blog"]
+        assert self.n("agents", "blog", "files") == ["files", "list", "--agent", "blog"]
         assert self.n("agents", "blog", "integrations") == ["integrations", "list", "--agent", "blog"]
 
     def test_pos_mode_noun_defaults_to_list(self):
@@ -7082,7 +7092,7 @@ class TestPathScopeUnknownHeadErrors:
         out = capsys.readouterr().err
         assert "`triggers` is not an agent command" in out
         # names the noun, and points at the workspace-level command for it
-        assert "use the top-level `eesel triggers`" in out
+        assert "eesel automations triggers" in out
 
     def test_typo_suggests_the_real_noun(self, capsys):
         with pytest.raises(SystemExit):
