@@ -71,33 +71,34 @@ eesel sessions remove <id>
 In the REPL: `/new`, `/sessions`, `/agents`, `/show`, `/tasks`, `/task <id>`,
 `/cost`, `/cost-on`, `/cost-off`, `/quit`.
 
-## Documents
+## Files
 
-List, read, and export documents from your workspace — e.g. to view or
+List, read, and export files from your workspace — e.g. to view or
 download a blog draft the agent generated, or any other artifact in the
-doc store.
+file store.
 
 ```bash
-eesel document list                                            # all documents
-eesel document list --prefix outputs/skills                    # filter by key prefix
-eesel document list --search "blog title"                      # filter by name/key
+eesel files list                                            # all files
+eesel files list --prefix outputs/skills                    # filter by key prefix
+eesel files list --search "blog title"                      # filter by name/key
 
-eesel document read                                            # arrow-key menu, then print
-eesel document read <id-or-key>                                # print one doc to stdout
-eesel document read --prefix files/                            # menu, filtered to files/…
-eesel document read <id> --format html                         # read as HTML (default: md)
-eesel document read <id> > draft.md                            # body→stdout, so redirect works
+eesel files read                                            # arrow-key menu, then print
+eesel files read <id-or-key>                                # print one file to stdout
+eesel files read --prefix files/                            # menu, filtered to files/…
+eesel files read <id> --format html                         # read as HTML (default: md)
+eesel files read <id> > draft.md                            # body→stdout, so redirect works
 
-eesel document export --document-key <key> --format md -o post.md
-eesel document export --document-id <id-or-prefix> --format html -o post.html
+eesel files export --file-key <key> --format md -o post.md
+eesel files export --file-id <id-or-prefix> --format html -o post.html
 ```
 
 `--format` accepts `md` or `html`. For `export`, `-o` is optional; without
-it the file lands in the current directory using the document's filename.
+it the file lands in the current directory using the file's filename.
 `read` prints the body to stdout (the header goes to stderr, so redirects
 capture just the content) and, with no id, opens an arrow-key picker.
+(The singular `eesel document …` still works as a hidden back-compat alias.)
 
-Documents are scoped to one agent — its `files/…` and `outputs/skills/…`
+Files are scoped to one agent — its `files/…` and `outputs/skills/…`
 keys — so scope the command with `EESEL_AGENT` or `--agent` first.
 `--prefix` filters within that scope (e.g. `files/`, `outputs/`).
 
@@ -129,22 +130,22 @@ Backed by the same workspace token the chat stream already uses
 login is needed. Staff preview/impersonation tasks are filtered out
 server-side and never appear here.
 
-## Integrations, tools, triggers & schedules
+## Integrations, tools & automations
 
 Inspect and wire up how an agent runs: which integrations the workspace has
 connected, what tools/actions an agent can take, what event/webhook triggers
 fire it, and what scheduled jobs run it on a cron.
 
-Triggers and scheduled jobs are two separate command groups. An **event/webhook
-trigger** (`zendesk_ticket_created`, etc.) fires the agent when something happens
-in an integration. A **scheduled job** runs the agent on a cron and can also be
-fired manually.
+Triggers and scheduled jobs live together under `eesel automations`. An
+**event/webhook trigger** (`zendesk_ticket_created`, etc.) fires the agent when
+something happens in an integration. A **scheduled job** runs the agent on a
+cron and can also be fired manually.
 
-> **Moved:** `eesel triggers` / `eesel triggers list` used to list scheduled
-> (cron) jobs as well. They now list **only event/webhook triggers** — scheduled
-> jobs are under `eesel schedules`. If you scripted `eesel triggers` to read cron
-> jobs, switch that call to `eesel schedules`. (The old `eesel triggers --all`
-> flag is gone; use the two groups.)
+> **Moved:** triggers and scheduled jobs are now under one parent,
+> `eesel automations`: use `eesel automations triggers …` and
+> `eesel automations schedules …`. The top-level `eesel triggers` /
+> `eesel schedules` commands (and the old `eesel triggers --all` flag) have been
+> removed — update any scripts to the `eesel automations …` form.
 
 ```bash
 eesel integrations                  # id, type, connection status, subdomain
@@ -167,7 +168,11 @@ eesel integrations connect <key> --option quick_start --field subdomain=acme [--
 eesel integrations connect <key> --option oauth [--agent <agent>]                                # browser OAuth hand-off
 eesel integrations sync <id> [--type help-center] [--agent <agent>]                  # trigger a data sync (Zendesk only)
 eesel integrations sync-status [<id>] [--agent <agent>]                              # sync-run status + progress (all, or one integration's)
-eesel integrations remove <id> [--agent <agent>]         # disconnect (-f to skip the prompt)
+# `remove` has two scopes (mirrors the dashboard's two options):
+#   --agent <agent>  → remove from just that agent; other agents keep their access
+#   (no --agent)     → uninstall for the WHOLE workspace; every agent loses it
+eesel integrations remove <id> --agent <agent>           # remove from one agent (others keep access)
+eesel integrations remove <id>                           # uninstall for the whole workspace (-f to skip the prompt)
 
 # Actions (formerly `tools`) are scoped under their integration; --agent picks
 # whose action set to read/write (default: the active agent)
@@ -178,28 +183,29 @@ eesel integrations <integration> actions disable <action> [--agent <agent>]   # 
 eesel integrations <integration> actions set <action> --config '{...}' [--agent <agent>]
 
 # Event/webhook triggers
-eesel triggers                      # every event trigger, grouped by integration
-eesel triggers --json               # raw payload
-eesel triggers registry             # available trigger types (keys for `add`)
-eesel triggers add <agent> --key zendesk_ticket_created
-eesel triggers remove <id>
+eesel automations triggers                      # every event trigger, grouped by integration
+eesel automations triggers --json               # raw payload
+eesel automations triggers registry             # available trigger types (keys for `add`)
+eesel automations triggers add <agent> --key zendesk_ticket_created
+eesel automations triggers remove <id>
 
 # Scheduled jobs (cron)
-eesel schedules                     # every scheduled job (id, title, cron, tz)
-eesel schedules add <agent> --cron "0 9 * * *" --prompt "Summarise overnight tickets" --title "Morning digest"
-eesel schedules fire <id-or-title>  # run one manually, now
-eesel schedules remove <id>
+eesel automations schedules                     # every scheduled job (id, title, cron, tz)
+eesel automations schedules add <agent> --cron "0 9 * * *" --prompt "Summarise overnight tickets" --title "Morning digest"
+eesel automations schedules fire <id-or-title>  # run one manually, now
+eesel automations schedules remove <id>
 ```
 
 `eesel integrations <integration> actions list [--agent <agent>]` lists each
-action's name, read/write kind, permission mode, and integration. `eesel triggers` shows
-each event trigger's type, config, last-run time, and integration. `eesel
-schedules` shows each job's title, cron, and timezone. Secret-looking values in
+action's name, read/write kind, permission mode, and integration.
+`eesel automations triggers` shows each event trigger's type, config, last-run
+time, and integration. `eesel automations schedules` shows each job's title,
+cron, and timezone. Secret-looking values in
 trigger config (access tokens, signing secrets) are masked in the human view;
 use `--json` for the raw payload. `eesel integrations --secrets` reveals
 integration credentials and is gated to sysadmin/impersonator accounts.
 
-### `set` (and the old `edit` alias)
+### `set`
 
 `set` is the canonical write verb across the CLI. How it treats the keys you
 *don't* pass differs by command — `set` does **not** mean "replace everything"
@@ -214,20 +220,25 @@ everywhere. When in doubt, check that verb's `--help`:
 - **Writes only the named fields you pass**, leaving the rest of the record
   untouched — `eesel agents set <agent> --instructions …`, `eesel mcp set
   <server> --name … --url …`, `eesel workspace set <field> <value>`.
-- **Replaces a whole set** — `eesel documents acl set <agent> --prefix …`
+- **Replaces a whole set** — `eesel files acl set <agent> --prefix …`
   replaces the agent's ACL key prefixes (it does not append).
 
-`edit` is kept only as a **hidden back-compat alias** for `set` on the commands
-that used to spell it that way (agents, mcp, skills, `integrations actions`); new
-scripts should use `set`.
+### Back-compat aliases
 
-Some renamed commands keep **hidden back-compat aliases** so existing scripts
-don't break: `eesel tools [agent]` still works (now `eesel integrations <x>
-actions`), `eesel agents add` aliases `eesel agents create`, and on the
-integrations group `add` aliases `connect` and `disconnect` aliases `remove`.
-They're hidden from `--help`; prefer the canonical spellings. Manually firing a
-scheduled job is `eesel schedules fire <id>` (the old `eesel triggers fire` has
-been removed).
+Only the aliases that shipped in the customer-facing v0.3.0 release are kept, as
+**hidden** spellings so existing scripts don't break: `eesel tools [agent]` (now
+`eesel integrations <x> actions`), the top-level `eesel instructions [agent]`
+(now `eesel agents <id> show --instructions`), the singular `eesel document …`
+(now `eesel files …`), and `eesel sessions delete` (now `eesel sessions remove`).
+They're hidden from `--help`; prefer the canonical spellings.
+
+The post-v0.3.0 rename aliases have been **removed** — use the canonical verbs:
+`set` (not `edit`) on agents / mcp / skills / `integrations actions`; `create`
+(not `agents add`); `connect` / `remove` (not `integrations add` /
+`disconnect`); `list --available` (not `skills available`); and
+`eesel automations schedules remove` / `fire` (not `delete` / `run`). The
+stateful `eesel agents use` / `unset` are gone — scope each command with
+`--agent`, `EESEL_AGENT`, or the `eesel agents <id> …` path.
 
 ## Cost
 
