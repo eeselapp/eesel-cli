@@ -130,7 +130,7 @@ class TestMintDevJwt:
 
 
 class TestLoginDev:
-    def test_mints_workspace_scoped_token_and_stores_active_agent(self, tmp_config, monkeypatch):
+    def test_mints_workspace_scoped_token_and_stores_no_agent(self, tmp_config, monkeypatch):
         monkeypatch.setattr(eesel, "discover_local_ids", lambda workspace_id=None: ("ws-1", "agent-1", "user-1"))
 
         creds = eesel.login_dev()
@@ -141,7 +141,8 @@ class TestLoginDev:
         assert payload["workspace_id"] == "ws-1"
         assert payload["user_id"] == "user-1"
         assert "agent_id" not in payload
-        assert creds["agent_id"] == "agent-1"
+        # Login no longer stores a default agent: commands scope themselves.
+        assert creds["agent_id"] is None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -626,6 +627,14 @@ class TestSessions:
 
 
 class TestDocumentCommand:
+    @pytest.fixture(autouse=True)
+    def _default_single_agent(self, monkeypatch):
+        # Documents are agent-scoped; with a single agent the CLI auto-selects
+        # it. The default fake workspace's document keys are under agent-test-456.
+        # Tests needing a multi-agent workspace override fetch_agents themselves.
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-test-456", "name": "Default Bot"}])
+
     def test_document_list_prints_workspace_documents(self, tmp_config, fake_creds, monkeypatch, capsys):
         calls = []
 
@@ -1026,6 +1035,11 @@ class TestDocumentCommand:
 
 class TestDocumentRead:
     # fake_creds.agent_id == "agent-test-456"
+    @pytest.fixture(autouse=True)
+    def _default_single_agent(self, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-test-456", "name": "Default Bot"}])
+
     DOCS = [
         {"id": "doc-aaa11122", "key": "files/agent-test-456/notes.md", "name": "notes.md"},
         {"id": "doc-bbb33344", "key": "outputs/skills/agent-test-456/blog/run-1/POST.md", "name": "POST.md"},
@@ -1135,6 +1149,11 @@ class TestHttpFetch:
 
 
 class TestDocumentsAdd:
+    @pytest.fixture(autouse=True)
+    def _default_single_agent(self, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-test-456", "name": "Default Bot"}])
+
     def _args(self, **over):
         base = {"document_cmd": "add", "title": "My Doc", "content": None, "content_file": None, "source_type": "files"}
         base.update(over)
@@ -1184,6 +1203,11 @@ class TestDocumentsAdd:
 class TestDocumentsRemove:
     # `remove` resolves each argument against the documents that actually exist
     # before deleting anything, so the tests stand up a small document set.
+    @pytest.fixture(autouse=True)
+    def _default_single_agent(self, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-test-456", "name": "Default Bot"}])
+
     DOCS = [
         {"id": "doc-a", "key": "files/a.md"},
         {"id": "doc-b", "key": "files/b.md"},
@@ -1716,15 +1740,14 @@ class TestAgentsRemoveCommand:
         assert rc == 1
         assert calls == []
 
-    def test_removing_active_agent_clears_pointer(self, tmp_config, fake_creds, monkeypatch):
-        # fake_creds stores agent-test-456 as active; remove it and confirm the
-        # stored pointer is cleared.
+    def test_removing_an_agent_issues_delete(self, tmp_config, fake_creds, monkeypatch):
+        # There is no stored active-agent pointer to clear; removal just deletes.
         agents = [{"agent_id": "agent-test-456", "name": "Active One"}]
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
-        _capture_requests(monkeypatch, response={})
+        calls = _capture_requests(monkeypatch, response={})
         rc = eesel.cmd_agents(_parse("agents", "remove", "agent-test-456", "--force"))
         assert rc == 0
-        assert eesel.load_creds().get("agent_id") is None
+        assert any(c["method"] == "DELETE" and "/agents/agent-test-456" in c["url"] for c in calls)
 
     def test_ambiguous_target_refuses(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
@@ -1970,10 +1993,19 @@ class TestResolveAgentOrError:
         assert "ambiguous" in errout
         assert "agent-abc123" in errout and "agent-abc999" in errout
 
-    def test_no_target_errors(self, monkeypatch, capsys):
+    def test_no_target_multi_agent_errors(self, monkeypatch, capsys):
+        # No explicit scope in a multi-agent workspace: refuse and list the
+        # agents rather than act on an arbitrary one.
         monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         assert eesel.resolve_agent_or_error({}, None) is None
-        assert "No agent given" in capsys.readouterr().err
+        assert "2 agents" in capsys.readouterr().err
+
+    def test_no_target_single_agent_auto_selects(self, monkeypatch):
+        # The one implicit case: a single-agent workspace is used automatically.
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "solo", "name": "Solo"}])
+        assert eesel.resolve_agent_or_error({}, None)["agent_id"] == "solo"
 
     def test_falls_back_to_env(self, monkeypatch):
         monkeypatch.setenv("EESEL_AGENT", "agent-abc123")
@@ -2137,10 +2169,19 @@ class TestResolveAgentOrError:
         assert "ambiguous" in errout
         assert "agent-abc123" in errout and "agent-abc999" in errout
 
-    def test_no_target_errors(self, monkeypatch, capsys):
+    def test_no_target_multi_agent_errors(self, monkeypatch, capsys):
+        # No explicit scope in a multi-agent workspace: refuse and list the
+        # agents rather than act on an arbitrary one.
         monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         assert eesel.resolve_agent_or_error({}, None) is None
-        assert "No agent given" in capsys.readouterr().err
+        assert "2 agents" in capsys.readouterr().err
+
+    def test_no_target_single_agent_auto_selects(self, monkeypatch):
+        # The one implicit case: a single-agent workspace is used automatically.
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "solo", "name": "Solo"}])
+        assert eesel.resolve_agent_or_error({}, None)["agent_id"] == "solo"
 
     def test_falls_back_to_env(self, monkeypatch):
         monkeypatch.setenv("EESEL_AGENT", "agent-abc123")
@@ -2238,22 +2279,6 @@ class TestParseConfigObject:
         assert '{"enabled": true}' in capsys.readouterr().err
 
 
-class TestAgentLabel:
-    def test_includes_name_and_short_id(self):
-        label = eesel._agent_label({"agent_id": "agent-abcdef123456", "name": "Support"})
-        assert "Support" in label
-        assert "agent-ab" in label  # 8-char prefix
-
-    def test_marks_active(self):
-        a = {"agent_id": "agent-1", "name": "Bot"}
-        assert "*active" in eesel._agent_label(a, active="agent-1")
-        assert "*active" not in eesel._agent_label(a, active="agent-2")
-
-    def test_includes_agent_type(self):
-        label = eesel._agent_label({"agent_id": "a", "name": "Bot", "agent_type": "knowledge_agent"})
-        assert "[knowledge_agent]" in label
-
-
 class TestInstructionsCommand:
     AGENTS = [
         {"agent_id": "agent-test-456", "name": "Active One", "prompt": "Be helpful and concise."},
@@ -2264,8 +2289,9 @@ class TestInstructionsCommand:
     def _args(self, agent=None):
         return type("Args", (), {"agent": agent})()
 
-    def test_prints_active_agent_prompt(self, tmp_config, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+    def test_single_agent_auto_prints_prompt(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # With one agent and no explicit scope, the CLI uses that sole agent.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [self.AGENTS[0]])
         rc = eesel.cmd_instructions(self._args())
         assert rc == 0
         out = capsys.readouterr().out
@@ -2302,97 +2328,54 @@ class TestInstructionsCommand:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [])
         assert eesel.cmd_instructions(self._args()) == 1
 
-    def test_no_active_agent_errors(self, tmp_config, fake_creds, monkeypatch):
-        # Active agent id doesn't match any returned agent and no target given.
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "x", "name": "X", "prompt": "p"}])
+    def test_multi_agent_no_scope_errors(self, tmp_config, fake_creds, monkeypatch):
+        # Several agents and no explicit scope → refuse rather than guess.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
         assert eesel.cmd_instructions(self._args()) == 1
 
 
-class TestAgentsUseInteractive:
-    AGENTS = [
-        {"agent_id": "agent-aaa", "name": "First"},
-        {"agent_id": "agent-bbb", "name": "Second"},
-    ]
+class _FakeStdin:
+    """Minimal stand-in for sys.stdin so a test can control isatty()."""
+    def __init__(self, tty):
+        self._tty = tty
 
-    def _args(self, agent_id=None):
-        return type("Args", (), {"agents_cmd": "use", "agent_id": agent_id})()
+    def isatty(self):
+        return self._tty
 
-    def test_use_with_id_sets_active(self, tmp_config, fake_creds, monkeypatch):
+
+class TestPickAgent:
+    """chat / new resolve their agent via pick_agent: an explicit scope wins, a
+    single-agent workspace is used automatically, an interactive terminal
+    prompts, and a non-interactive run refuses rather than guess. Nothing is
+    persisted."""
+    AGENTS = [{"agent_id": "a1", "name": "One"}, {"agent_id": "a2", "name": "Two"}]
+
+    def test_explicit_scope_wins_without_lookup(self, monkeypatch):
+        # --agent / EESEL_AGENT already set creds["agent_id"] in memory.
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: pytest.fail("no lookup needed"))
+        assert eesel.pick_agent({"agent_id": "a2"}) == "a2"
+
+    def test_single_agent_auto_selected(self, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "solo", "name": "Solo"}])
+        assert eesel.pick_agent({}) == "solo"
+
+    def test_multi_agent_non_interactive_errors(self, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        rc = eesel.cmd_agents(self._args("agent-bbb"))
-        assert rc == 0
-        assert eesel.load_creds()["agent_id"] == "agent-bbb"
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        with pytest.raises(SystemExit):
+            eesel.pick_agent({}, prompt=True)
+        assert "2 agents" in capsys.readouterr().err
 
-    def test_use_without_id_opens_menu_and_sets_choice(self, tmp_config, fake_creds, monkeypatch):
+    def test_multi_agent_tty_prompts(self, monkeypatch):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        seen = {}
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "1")  # pick the second
+        assert eesel.pick_agent({}, prompt=True) == "a2"
 
-        def fake_select(options, *, title=None, initial=0):
-            seen["options"] = options
-            seen["initial"] = initial
-            return 1  # pick "Second"
-
-        monkeypatch.setattr(eesel, "interactive_select", fake_select)
-        rc = eesel.cmd_agents(self._args(None))
-        assert rc == 0
-        assert eesel.load_creds()["agent_id"] == "agent-bbb"
-        assert len(seen["options"]) == 2
-
-    def test_menu_starts_on_active_agent(self, tmp_config, fake_creds, monkeypatch):
-        # fake_creds active agent is "agent-test-456"; put it second in the list.
-        agents = [{"agent_id": "agent-aaa", "name": "First"}, {"agent_id": "agent-test-456", "name": "Active"}]
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
-        captured = {}
-
-        def fake_select(options, *, title=None, initial=0):
-            captured["initial"] = initial
-            return initial
-
-        monkeypatch.setattr(eesel, "interactive_select", fake_select)
-        eesel.cmd_agents(self._args(None))
-        assert captured["initial"] == 1
-
-    def test_cancel_leaves_active_agent_unchanged(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
-        rc = eesel.cmd_agents(self._args(None))
-        assert rc == 1
-        assert eesel.load_creds()["agent_id"] == "agent-test-456"  # untouched
-
-    def test_unknown_id_errors(self, tmp_config, fake_creds, monkeypatch):
-        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
-        rc = eesel.cmd_agents(self._args("ghost"))
-        assert rc == 1
-        assert eesel.load_creds()["agent_id"] == "agent-test-456"
-
-
-class TestAgentsUnset:
-    def _args(self):
-        return type("Args", (), {"agents_cmd": "unset"})()
-
-    def test_unset_clears_active_agent(self, tmp_config, fake_creds):
-        assert eesel.load_creds().get("agent_id") == "agent-test-456"
-        rc = eesel.cmd_agents(self._args())
-        assert rc == 0
-        # The key is removed entirely, leaving the rest of the creds intact.
-        creds = eesel.load_creds()
-        assert "agent_id" not in creds
-        assert creds["workspace_id"] == "ws-test-123"
-        assert creds["token"] == "test-jwt-token"
-
-    def test_unset_when_already_unset_is_noop(self, tmp_config, fake_creds, capsys):
-        eesel.cmd_agents(self._args())  # clear once
-        rc = eesel.cmd_agents(self._args())  # clear again
-        assert rc == 0
-        assert "No active agent" in capsys.readouterr().err
-
-    def test_unset_does_not_call_fetch_agents(self, tmp_config, fake_creds, monkeypatch):
-        # Clearing is purely local — it must not hit the network.
-        def boom(creds):
-            raise AssertionError("fetch_agents should not be called for unset")
-
-        monkeypatch.setattr(eesel, "fetch_agents", boom)
-        assert eesel.cmd_agents(self._args()) == 0
+    def test_does_not_persist(self, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "solo", "name": "Solo"}])
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("pick_agent must not persist"))
+        assert eesel.pick_agent({}) == "solo"
 
 
 class TestInteractiveSelectFallback:
@@ -2750,27 +2733,11 @@ class TestArgParser:
         with pytest.raises(SystemExit):
             parser.parse_args(["sessions", "use"])  # missing positional
 
-    def test_agents_use_parses_id(self):
+    def test_agents_use_is_no_longer_a_subcommand(self):
+        # The stored active-agent concept was removed; `use`/`unset` are gone.
         parser = eesel.build_parser()
-        args = parser.parse_args(["agents", "use", "my-agent"])
-        assert args.cmd == "agents"
-        assert args.agents_cmd == "use"
-        assert args.agent_id == "my-agent"
-
-    def test_agents_use_id_is_optional(self):
-        # `agents use` with no id parses (interactive menu picks the agent).
-        parser = eesel.build_parser()
-        args = parser.parse_args(["agents", "use"])
-        assert args.cmd == "agents"
-        assert args.agents_cmd == "use"
-        assert args.agent_id is None
-
-    def test_agents_unset_parses(self):
-        parser = eesel.build_parser()
-        args = parser.parse_args(["agents", "unset"])
-        assert args.cmd == "agents"
-        assert args.agents_cmd == "unset"
-        assert args.func is eesel.cmd_agents
+        with pytest.raises(SystemExit):
+            parser.parse_args(["agents", "use", "my-agent"])
 
     def test_tasks_analytics_parses_dates_and_agent(self):
         parser = eesel.build_parser()
@@ -4833,16 +4800,14 @@ class TestIntegrationActionsList:
         eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent="Sales Bot", json=False))
         assert captured["aid"] == "agent-other-999"
 
-    def test_no_active_agent_errors(self, fake_creds, monkeypatch, capsys):
-        creds = dict(fake_creds)
-        creds.pop("agent_id")
-        eesel.save_creds(creds)
+    def test_multi_agent_no_scope_errors(self, fake_creds, monkeypatch, capsys):
+        # Several agents and no --agent/EESEL_AGENT → refuse before any fetch.
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
             {"agent_id": "a1", "name": "Bot"}, {"agent_id": "a2", "name": "Bot2"}])
         monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: pytest.fail("should not fetch"))
         rc = eesel.cmd_integration_actions(_args(actions_cmd="list", integration="zendesk", agent=None, json=False))
         assert rc == 1
-        assert "No active agent" in capsys.readouterr().err
+        assert "2 agents" in capsys.readouterr().err
 
     def test_json_emits_scoped_payload(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
@@ -5419,13 +5384,14 @@ class TestSkillsList:
         assert rc == 0
         assert "/agents/agent-abc123/skills" in captured["url"]
 
-    def test_list_no_agent_and_no_env_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_list_multi_agent_no_scope_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)  # 2 agents
         calls = _capture_skill_requests(monkeypatch)
         rc = eesel.cmd_skills(_skills_parse("skills", "list"))
         assert rc == 1
-        assert calls == []
-        assert "No agent given" in capsys.readouterr().err
+        assert calls == []  # refused before hitting the skills endpoint
+        assert "2 agents" in capsys.readouterr().err
 
     def test_list_empty_prints_hint(self, tmp_config, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: _SKILLS_AGENTS)
@@ -7068,7 +7034,9 @@ class TestPathScopeVerbScoping:
     def test_non_accepting_verbs_exit_naming_the_verb(self, capsys):
         # A verb the flat parser can't scope by agent exits (code 2) and the error
         # names the verb, never injecting --agent for the handler to choke on.
-        for verb in ("remove", "export", "acl"):
+        # `acl` takes a positional <agent>, not an --agent flag, so it stays out
+        # of the flag-mode path form (unlike list/show/read/add/remove/export).
+        for verb in ("acl",):
             with pytest.raises(SystemExit) as exc:
                 self.n("agents", "blog", "documents", verb, "x")
             assert exc.value.code == 2

@@ -366,11 +366,9 @@ def apply_agent_env_override(creds: dict) -> dict:
     """Let the EESEL_AGENT environment variable scope a single command to one
     agent, without writing anything to disk.
 
-    When EESEL_AGENT is set, it overrides the stored active agent (the one set
-    by `eesel agents use`) for this invocation only. This is the explicit,
-    stateless alternative to a persisted active agent: `EESEL_AGENT=blog-bot
-    eesel chat "hi"` always talks to blog-bot regardless of what `use` last
-    saved, and the choice doesn't leak into the next command. A per-command
+    When EESEL_AGENT is set it scopes the command to that agent for this
+    invocation only: `EESEL_AGENT=blog-bot eesel chat "hi"` always talks to
+    blog-bot, and the choice doesn't leak into the next command. A per-command
     `--agent` flag still wins, since each command applies it after this.
 
     The value is a full id, id-prefix, or agent name — resolved exactly like
@@ -401,7 +399,7 @@ def apply_agent_env_override(creds: dict) -> dict:
 
 def apply_agent_flag_override(creds: dict, agent: str | None) -> dict:
     """Scope a single command to `agent` (a `--agent` value: full id, id-prefix,
-    or name), overriding the active agent / EESEL_AGENT for this invocation only.
+    or name), winning over EESEL_AGENT for this invocation only.
 
     Returns creds unchanged when `agent` is None. Resolved in memory and never
     written to disk. An unmatched or ambiguous value is a hard error, mirroring
@@ -439,6 +437,12 @@ def require_creds() -> dict:
     if not creds:
         err("Not logged in. Run `eesel login` first.")
         sys.exit(1)
+
+    # There is no stored "active agent". A persisted `agent_id` (left by an older
+    # CLI that saved one) must never act as a silent default — every agent-scoped
+    # command names its agent explicitly, or the sole agent is used. Drop it so
+    # `creds["agent_id"]` is only ever set in memory, by `--agent` / EESEL_AGENT.
+    creds.pop("agent_id", None)
 
     expires_at = creds.get("expires_at") or 0
     near_expiry = bool(expires_at) and time.time() > expires_at - TOKEN_REFRESH_SKEW_SECONDS
@@ -936,20 +940,24 @@ def parse_config_object(raw: str, *, example: str = '{"key": "value"}') -> dict:
 
 
 def login_dev(workspace_id: str | None = None) -> dict:
-    workspace_id, agent_id, user_id = discover_local_ids(workspace_id)
+    # discover_local_ids also returns an agent id, but login no longer stores a
+    # default agent: every agent-scoped command names its own agent (or the sole
+    # agent is used when there's only one), so there is no ambient "active agent"
+    # to persist. The dev JWT authenticates on workspace + user, not agent.
+    workspace_id, _agent_id, user_id = discover_local_ids(workspace_id)
     token = mint_dev_jwt(workspace_id, None, user_id)
     creds = {
         "env": "dev",
         "api_url": ENVS["dev"]["api"],
         "dashboard_url": ENVS["dev"]["dashboard"],
         "workspace_id": workspace_id,
-        "agent_id": agent_id,
+        "agent_id": None,
         "user_id": user_id,
         "token": token,
         "expires_at": int(time.time()) + CLI_TOKEN_TTL_SECONDS,
     }
     save_creds(creds)
-    ok(f"Logged in (dev) — workspace={workspace_id} agent={agent_id}" + (f" user={user_id}" if user_id else " (no owner user_id)"))
+    ok(f"Logged in (dev) — workspace={workspace_id}" + (f" user={user_id}" if user_id else " (no owner user_id)"))
     return creds
 
 
@@ -988,7 +996,7 @@ def _creds_from_login_payload(captured: dict, api_url: str, dashboard: str) -> d
         "dashboard_url": dashboard,
         "workspace_id": workspace_id,
         "user_email": user_email,
-        "agent_id": None,  # picked on first chat / via `eesel agents use`
+        "agent_id": None,  # no stored default; every command names its own agent
     }
 
     if access_token and refresh_token:
@@ -1147,9 +1155,9 @@ def match_agents(agents: list[dict], target: str) -> list[dict]:
 
 def resolve_agent(agents: list[dict], target: str) -> dict | None:
     """First agent matching `target` by exact id, id-prefix, then exact name,
-    or None. First-match (used by the active-agent selectors like `agents use`
-    and `chat`); see `resolve_agent_strict` for the write/destructive commands
-    that must refuse ambiguity instead of acting on an arbitrary match."""
+    or None. First-match, for lookups where an arbitrary tie-break is
+    acceptable; agent-scoped commands use `resolve_agent_or_error`, which
+    refuses ambiguity instead of acting on an arbitrary match."""
     matches = match_agents(agents, target)
     return matches[0] if matches else None
 
@@ -1188,17 +1196,6 @@ def build_agent_update_body(*, name: str | None = None, instructions: str | None
     if instructions is not None:
         body["prompt"] = instructions
     return body
-
-
-def _agent_label(a: dict, active: str | None = None) -> str:
-    """One-line display label for an agent, used in lists and pickers."""
-    aid = a.get("agent_id", "?")
-    label = f"{a.get('name', '?')}  ({aid[:8]})"
-    if a.get("agent_type"):
-        label += f"  [{a.get('agent_type')}]"
-    if active and aid == active:
-        label += "  *active"
-    return label
 
 
 def fetch_triggers(creds: dict, agent_id: str) -> list[dict]:
@@ -1494,25 +1491,39 @@ def resolve_scheduled_job_strict(creds: dict, target: str) -> dict | None:
 
 
 def pick_agent(creds: dict, *, prompt: bool = True) -> str:
+    """Resolve the agent a session (chat / new) runs against.
+
+    Scope is explicit: an already-applied `--agent`/`EESEL_AGENT`
+    (`creds["agent_id"]`, set in memory for this invocation) wins. Otherwise a
+    single-agent workspace is used automatically. With several agents and no
+    scope, an interactive terminal shows a picker (asking, not silently
+    guessing); a non-interactive/scripted run errors, so a script never talks to
+    an arbitrary agent. The choice is never persisted — the next command must
+    scope itself again.
+    """
     if creds.get("agent_id"):
         return creds["agent_id"]
     agents = fetch_agents(creds)
     if not agents:
-        sys.exit("No agents in workspace. Create one in the dashboard first.")
-    if len(agents) == 1 or not prompt:
-        chosen = agents[0]
-    else:
-        print("Pick an agent:")
-        for i, a in enumerate(agents):
-            print(f"  [{i}] {a.get('name', '?')}  ({a.get('agent_id', '?')[:8]})")
-        try:
-            idx = int(input("> ").strip())
-            chosen = agents[idx]
-        except (ValueError, IndexError):
-            sys.exit("Invalid choice.")
-    creds["agent_id"] = chosen["agent_id"]
-    save_creds(creds)
-    return creds["agent_id"]
+        sys.exit("No agents in workspace. Create one with `eesel agents create` first.")
+    if len(agents) == 1:
+        return agents[0]["agent_id"]
+    if not (prompt and sys.stdin.isatty()):
+        err(f"This workspace has {len(agents)} agents — name the one to use:")
+        for a in agents:
+            err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+        err("Pass `--agent <id|name>`, set EESEL_AGENT=<id|name>, or use "
+            "`eesel agents <id> chat …`.")
+        sys.exit(1)
+    print("Pick an agent:")
+    for i, a in enumerate(agents):
+        print(f"  [{i}] {a.get('name', '?')}  ({a.get('agent_id', '?')[:8]})")
+    try:
+        idx = int(input("> ").strip())
+        chosen = agents[idx]
+    except (ValueError, IndexError):
+        sys.exit("Invalid choice.")
+    return chosen["agent_id"]
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1732,7 +1743,10 @@ def cmd_whoami(args) -> int:
     print(f"env          : {creds.get('env')}")
     print(f"api_url      : {creds.get('api_url')}")
     print(f"workspace_id : {creds.get('workspace_id')}")
-    print(f"agent_id     : {creds.get('agent_id') or '(none — set EESEL_AGENT or pass --agent)'}")
+    # No stored "active agent": each agent-scoped command names its own agent
+    # (path `agents <id> …`, `--agent`, or EESEL_AGENT), and a single-agent
+    # workspace is used automatically.
+    print("agent        : scoped per command (`agents <id> …`, --agent, or EESEL_AGENT)")
     if creds.get("user_email"):
         print(f"user_email   : {creds['user_email']}")
     print(f"token expires: {expires_in}s ({expires_in // 3600}h {(expires_in % 3600) // 60}m)")
@@ -1774,58 +1788,14 @@ def cmd_agents(args) -> int:
         if not agents:
             info("(no agents)")
             return 0
-        active = creds.get("agent_id")
         for a in agents:
-            mark = "*" if a.get("agent_id") == active else " "
             # Status is a column, not a filter: every agent is listed, each with
             # its live/off state shown inline.
             status = "[on] " if a.get("is_active") else "[off]"
             print(
-                f" {mark} {a.get('agent_id', '?')[:12]}  {status}  {a.get('name', '?')}"
+                f" {a.get('agent_id', '?')[:12]}  {status}  {a.get('name', '?')}"
                 + (f"  [{a.get('agent_type')}]" if a.get("agent_type") else "")
             )
-        return 0
-    if sub == "use":
-        warn("`agents use` is deprecated: it stores a hidden active agent on disk. "
-             "Prefer explicit scope — `eesel agents <id> ...`, `EESEL_AGENT=<id|name> eesel ...`, "
-             "or a `--agent` flag.")
-        agents = fetch_agents(creds)
-        if not agents:
-            err("No agents in workspace. Create one in the dashboard first.")
-            return 1
-        active = creds.get("agent_id")
-        target = args.agent_id
-        if target:
-            match = resolve_agent(agents, target)
-            if not match:
-                err(f"No agent matches '{target}'.")
-                return 1
-        else:
-            # No id given → interactive arrow-key menu, starting on the active one.
-            labels = [_agent_label(a, active) for a in agents]
-            initial = next((i for i, a in enumerate(agents) if a.get("agent_id") == active), 0)
-            choice = interactive_select(
-                labels,
-                title="Select an agent  (↑/↓ to move, Enter to confirm, q to cancel):",
-                initial=initial,
-            )
-            if choice is None:
-                info("Cancelled.")
-                return 1
-            match = agents[choice]
-        creds["agent_id"] = match["agent_id"]
-        save_creds(creds)
-        ok(f"Active agent: {match.get('name')} ({match['agent_id']})")
-        return 0
-    if sub == "unset":
-        warn("`agents unset` is deprecated alongside `agents use`. "
-             "Prefer explicit scope — `EESEL_AGENT=<id|name> eesel ...` or a `--agent` flag.")
-        if not creds.get("agent_id"):
-            info("No active agent set.")
-            return 0
-        prev = creds.pop("agent_id", None)
-        save_creds(creds)
-        ok(f"Cleared active agent ({prev}). Commands that need one will prompt, or accept EESEL_AGENT / a --agent flag.")
         return 0
     if sub == "show":
         if getattr(args, "show_instructions", False):
@@ -1896,12 +1866,6 @@ def _agents_delete(args, creds: dict) -> int:
         return 1
     http_request("DELETE", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"])
     ok(f"Removed {agent.get('name')} ({agent['agent_id']}).")
-    # If the deleted agent was the active one, drop the stored pointer so later
-    # commands don't reference a dead id.
-    if creds.get("agent_id") == agent["agent_id"]:
-        creds.pop("agent_id", None)
-        save_creds(creds)
-        info("Cleared the active-agent pointer (it referenced the deleted agent).")
     return 0
 
 
@@ -1934,28 +1898,15 @@ def _agents_get(args, creds: dict) -> int:
 def cmd_instructions(args) -> int:
     """Print an agent's instructions (the system prompt that drives it).
 
-    Defaults to the active agent; pass an id / id-prefix / name to inspect a
-    different one. The instructions go to stdout (pipe/redirect-friendly) and
-    the header to stderr, so `eesel instructions > prompt.md` captures just the
-    prompt.
+    Name the agent by id / id-prefix / name (or scope via the `agents <id> …`
+    path or EESEL_AGENT); a single-agent workspace needs no scope. The
+    instructions go to stdout (pipe/redirect-friendly) and the header to stderr,
+    so `eesel instructions > prompt.md` captures just the prompt.
     """
     creds = require_creds()
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
+    agent = resolve_agent_or_error(creds, getattr(args, "agent", None))
+    if not agent:
         return 1
-
-    target = getattr(args, "agent", None)
-    if target:
-        agent = resolve_agent(agents, target)
-        if not agent:
-            err(f"No agent matches '{target}'.")
-            return 1
-    else:
-        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
-        if not agent:
-            err("No agent selected. Pass an agent id/name, set EESEL_AGENT, or use a --agent flag.")
-            return 1
 
     info(f"# {agent.get('name', '?')} ({agent.get('agent_id', '')[:12]}) — instructions")
     prompt = (agent.get("prompt") or "").strip()
@@ -1970,11 +1921,14 @@ def cmd_new(args) -> int:
     creds = require_creds()
     # --agent scopes this new session to one agent (id, id-prefix, or name),
     # resolved in memory and never persisted — mirrors `chat --agent`. The new
-    # session records agent_id below, so later unrelated commands keep using the
-    # previously-saved active agent instead of being silently repointed.
+    # session records its agent_id below; the scope stays local to this command.
     creds = apply_agent_flag_override(creds, getattr(args, "agent", None))
-    if not getattr(args, "agent", None):
-        pick_agent(creds, prompt=True)
+    # A session must be pinned to a named agent. --schedule carries the
+    # trigger's own agent (resolved below), so it doesn't need one named here.
+    if not creds.get("agent_id") and not getattr(args, "schedule", None):
+        agent_id = pick_agent(creds, prompt=True)
+        creds = dict(creds)
+        creds["agent_id"] = agent_id
 
     trigger_id = trigger_title = None
     if getattr(args, "schedule", None):
@@ -1986,8 +1940,7 @@ def cmd_new(args) -> int:
         trigger_id = match["id"]
         trigger_title = (match.get("config") or {}).get("title")
         # Pin the trigger's owning agent on the preview session only — resolve it
-        # in an in-memory copy and never rewrite the saved active agent, or every
-        # later unrelated command would silently run against the wrong agent.
+        # in an in-memory copy so the scope stays local to this command.
         creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
 
@@ -2142,14 +2095,8 @@ def _triggers_add(creds: dict, args) -> int:
     server requires a non-null config, so an omitted --config is sent as an
     empty object. --config must be a JSON object.
     """
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one with `eesel agents create` first.")
-        return 1
-    agent = resolve_agent(agents, args.agent)
+    agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
-        err(f"No agent matches '{args.agent}'.")
-        info("Run `eesel agents list` to see available agents.")
         return 1
 
     config: dict = {}
@@ -2358,24 +2305,12 @@ def cmd_tools(args) -> int:
     which lists one integration at a time. This alias preserves the old
     behavior — a read-only list of an agent's actions across all integrations —
     so existing scripts that call `eesel tools [agent]` keep working.
-    Defaults to the active agent; pass an id / id-prefix / name for another.
+    Name the agent (id / prefix / name); a single-agent workspace needs no scope.
     """
     creds = require_creds()
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
+    agent = resolve_agent_or_error(creds, getattr(args, "agent", None))
+    if not agent:
         return 1
-    target = getattr(args, "agent", None)
-    if target:
-        agent = resolve_agent(agents, target)
-        if not agent:
-            err(f"No agent matches '{target}'.")
-            return 1
-    else:
-        agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
-        if not agent:
-            err("No active agent. Run `eesel agents use` to pick one (or pass an agent id/name).")
-            return 1
 
     agent_id = agent["agent_id"]
     tools = fetch_tools(creds, agent_id)
@@ -2448,14 +2383,8 @@ def _schedules_add(creds: dict, args) -> int:
     optional JSON object whose keys are merged in first, so the dedicated flags
     (`cron`, `prompt`, `title`, `timezone`) take precedence over it.
     """
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one with `eesel agents create` first.")
-        return 1
-    agent = resolve_agent(agents, args.agent)
+    agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
-        err(f"No agent matches '{args.agent}'.")
-        info("Run `eesel agents list` to see available agents.")
         return 1
 
     config: dict = {}
@@ -2546,7 +2475,7 @@ def cmd_integrations(args) -> int:
     creds = require_creds()
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
     # the EESEL_AGENT env var but per-command. It is resolved in memory and not
-    # persisted, so it never changes the saved active agent. Connection status in
+    # persisted, so the scope stays local to this command. Connection status in
     # list/show is computed against this agent, and `connect`'s redirect/OAuth
     # hand-off carries it as the agentId so the post-auth page lands on the right
     # agent. Resolving it here applies the scope uniformly across the group.
@@ -2775,8 +2704,9 @@ def _browser_connect_url(creds: dict, endpoint: str, identifier: str | None = No
     """Resolve a `redirect` connection option's endpoint to a full browser URL
     on the dashboard host.
 
-    Drops unresolved `{{...}}` template params, appends the active agent id, and
-    fills an identifier param when the endpoint templates one (e.g. the Zendesk
+    Drops unresolved `{{...}}` template params, appends the scoped agent id when
+    one was named (via --agent / EESEL_AGENT), and fills an identifier param when
+    the endpoint templates one (e.g. the Zendesk
     messenger option's `zendeskSubdomain={{integrationIdentifier}}`). The OAuth
     flow is served by the dashboard, a different host than the API.
     """
@@ -3034,38 +2964,16 @@ def _integrations_remove(args, creds: dict) -> int:
 
 def _resolve_actions_agent(creds: dict, target: str | None) -> dict | None:
     """Resolve the agent whose actions an `integrations ... actions` subcommand
-    operates on, printing the error itself.
+    operates on.
 
     Actions (formerly "tools") are configured per agent via /agents/{id}/tools,
     so even though the command path is scoped by integration, we still need to
-    know which agent's action set to read or write. With an explicit `target`
-    (id / id-prefix / name) it must match an agent; without one it falls back to
-    the stored active agent. Returns the agent dict, or None after emitting an
-    `err(...)` so the caller can `return 1`.
+    know which agent's action set to read or write. Scope must be named
+    explicitly (path / --agent / EESEL_AGENT); the sole-agent shortcut applies
+    when the workspace has just one agent. Returns the agent dict, or None after
+    emitting an `err(...)` so the caller can `return 1`.
     """
-    agents = fetch_agents(creds)
-    if not agents:
-        err("No agents in workspace. Create one in the dashboard first.")
-        return None
-    if target:
-        # Actions subcommands include destructive writes (disable/edit), so an
-        # ambiguous name is refused rather than resolved to an arbitrary match.
-        agent, candidates = resolve_agent_strict(agents, target)
-        if agent:
-            return agent
-        if candidates:
-            err(f"'{target}' is ambiguous — it matches {len(candidates)} agents:")
-            for a in candidates:
-                err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
-            err("Re-run with a full agent id to disambiguate.")
-        else:
-            err(f"No agent matches '{target}'.")
-        return None
-    agent = next((a for a in agents if a.get("agent_id") == creds.get("agent_id")), None)
-    if not agent:
-        err("No active agent. Run `eesel agents use` to pick one (or pass --agent).")
-        return None
-    return agent
+    return resolve_agent_or_error(creds, target)
 
 
 def _action_matches_integration(row: dict, integration: str) -> bool:
@@ -3434,16 +3342,14 @@ def cmd_chat(args) -> int:
     creds = require_creds()
     # `--agent` scopes this one chat to a specific agent (id, id-prefix, or
     # name), like the EESEL_AGENT env var but per-command. It is resolved in
-    # memory and not persisted, so it never changes the saved active agent.
+    # memory and not persisted, so it never changes anything on disk. An
+    # ambiguous name is refused rather than resolved to an arbitrary agent.
     if getattr(args, "agent", None):
-        match = resolve_agent(fetch_agents(creds), args.agent)
+        match = resolve_agent_or_error(creds, args.agent)
         if not match:
-            err(f"No agent matches '{args.agent}'.")
-            info("Run `eesel agents list` to see available agents.")
             return 1
         creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
-    pick_agent(creds, prompt=False)  # only prompt in REPL if needed
 
     # --trigger always opens a fresh session pinned to that trigger. Reusing an
     # active session whose trigger doesn't match would mean half its turns ran
@@ -3454,6 +3360,14 @@ def cmd_chat(args) -> int:
     if task_target and target:
         err("--task and --trigger are mutually exclusive.")
         return 1
+
+    # A plain chat/REPL must run against a named agent. --task and --trigger
+    # carry their own agent (from the task or the trigger below), so they don't
+    # need one named here. Resolved in memory only — never persisted.
+    if not task_target and not target and not creds.get("agent_id"):
+        agent_id = pick_agent(creds, prompt=True)
+        creds = dict(creds)
+        creds["agent_id"] = agent_id
     if task_target:
         # Attach to an existing backend conversation by its task id — e.g. one
         # an agent handed to an external service so it can post a result back
@@ -3485,10 +3399,10 @@ def cmd_chat(args) -> int:
             err(f"No scheduled job matches '{target}'.")
             info("Run `eesel schedules list` to see available jobs.")
             return 1
-        # Pin the agent for this preview session only — resolve it in memory and
-        # never rewrite the saved active agent, mirroring --agent. The session
-        # itself stores agent_id (below), so the preview runs under the trigger's
-        # agent without leaking that choice into later unrelated commands.
+        # Pin the agent for this preview session only — resolve it in memory,
+        # mirroring --agent. The session itself stores agent_id (below), so the
+        # preview runs under the trigger's agent without the scope leaking into
+        # later unrelated commands.
         creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
         sess = new_session(
@@ -4081,7 +3995,7 @@ def _document_key(doc: dict) -> str:
 
 
 def agent_documents(creds: dict, *, prefix: str | None = None, limit: int = 500) -> list[dict]:
-    """Documents the active agent owns (files/{agent}, outputs/skills/{agent}),
+    """Documents the scoped agent owns (files/{agent}, outputs/skills/{agent}),
     optionally narrowed to a key prefix. Shared by `document read`'s direct
     lookup and its interactive menu."""
     docs = fetch_documents(creds, prefix=prefix, limit=limit)
@@ -4134,7 +4048,7 @@ def mcp_call_tool(creds: dict, tool_name: str, arguments: dict) -> dict:
         token=creds["token"],
         body=body,
         headers={
-            "X-Eesel-Agent-Id": creds["agent_id"],
+            "X-Eesel-Agent-Id": creds.get("agent_id"),
             "X-Eesel-Metadata": _mcp_metadata_header({"available_tools_override": [tool_name]}),
         },
     )
@@ -4468,6 +4382,23 @@ def cmd_mcp(args) -> int:
     return 1
 
 
+def _scope_documents_agent(creds: dict, args) -> bool:
+    """Pin the agent whose document slice a `documents` subcommand acts on.
+
+    Documents live under per-agent key prefixes (`files/{agent_id}`,
+    `outputs/skills/{agent_id}`), so every documents subcommand is agent-scoped.
+    The agent must be named (via the `agents <id> …` path, `--agent`, or
+    EESEL_AGENT); a single-agent workspace needs no scope. Sets
+    `creds["agent_id"]` to the resolved agent so the downstream key-namespace
+    filters (`document_matches_agent`, `agent_documents`) work. Returns False —
+    after printing the reason — when the agent can't be resolved."""
+    agent = resolve_agent_or_error(creds, getattr(args, "agent", None))
+    if not agent:
+        return False
+    creds["agent_id"] = agent["agent_id"]
+    return True
+
+
 def cmd_document(args) -> int:
     """Dispatch the `documents` (and legacy singular `document`) subcommands.
 
@@ -4477,6 +4408,8 @@ def cmd_document(args) -> int:
     sub = args.document_cmd or "list"
     if sub == "list":
         creds = require_creds_scoped(args)
+        if not _scope_documents_agent(creds, args):
+            return 1
         documents = fetch_documents(
             creds,
             prefix=args.prefix,
@@ -4531,6 +4464,8 @@ def _documents_add(args) -> int:
     """`eesel documents add` — bring a new document into the workspace
     (POST /documents). Prints the new document's key so it can be captured."""
     creds = require_creds_scoped(args)
+    if not _scope_documents_agent(creds, args):
+        return 1
     if args.content is not None and args.content_file is not None:
         err("Pass either --content or --content-file, not both.")
         return 1
@@ -4579,6 +4514,8 @@ def _documents_remove(args) -> int:
     silently ignored. The reported count is the number of documents actually
     matched and sent for deletion, not the number of arguments passed."""
     creds = require_creds_scoped(args)
+    if not _scope_documents_agent(creds, args):
+        return 1
     documents = agent_documents(creds, limit=500)
     by_key = {_document_key(doc): doc for doc in documents if _document_key(doc)}
     by_id = {doc.get("id"): doc for doc in documents if doc.get("id")}
@@ -4671,6 +4608,8 @@ def cmd_document_read(args) -> int:
     `eesel document read <id> > out.md` captures just the content.
     """
     creds = require_creds_scoped(args)
+    if not _scope_documents_agent(creds, args):
+        return 1
     fmt = (getattr(args, "format", None) or "md").lower()
     prefix = getattr(args, "prefix", None)
 
@@ -4726,6 +4665,8 @@ def cmd_document_read(args) -> int:
 
 def cmd_document_export(args) -> int:
     creds = require_creds()
+    if not _scope_documents_agent(creds, args):
+        return 1
     fmt = args.format.lower()
 
     if args.document_id:
@@ -4801,24 +4742,37 @@ def _skill_is_on(skill: dict) -> bool:
 
 
 def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
-    """Resolve `target` to exactly one agent for a write/destructive command,
-    or print why it could not and return None.
+    """Resolve which agent an agent-scoped command acts on, or print why it
+    could not and return None.
 
-    `target` falls back to the EESEL_AGENT environment variable. Unlike the
-    first-match `resolve_agent`, this refuses an ambiguous name: it lists the
-    candidates and returns None so the caller aborts rather than mutating an
-    arbitrary agent. Use this for every command that changes server state
-    (acl set, triggers/schedules add, actions disable, skills remove,
-    notifications, instructions set, …); reads that select an "active" agent
-    may keep using `resolve_agent`.
+    This is the single resolver every agent-scoped command uses. Scope is
+    always explicit: `target` comes from the `agents <id> <noun> <verb>` path
+    form, a `--agent` flag, or the EESEL_AGENT environment variable. There is no
+    fallback to a stored "active" agent — a command must name the agent it
+    changes, so you can always tell from the command alone which agent it hit.
+
+    The one implicit case is a workspace with exactly one agent: with nothing to
+    disambiguate, that sole agent is used. Otherwise a missing scope is an error
+    that lists the agents and how to name one.
+
+    Unlike the first-match `resolve_agent`, an explicit but ambiguous name is
+    refused (candidates listed, None returned) rather than resolved to an
+    arbitrary agent.
     """
     target = target or os.environ.get("EESEL_AGENT")
-    if not target:
-        err("No agent given. Pass one (e.g. `eesel skills add <agent> <skill>`) or set EESEL_AGENT.")
-        return None
     agents = fetch_agents(creds)
     if not agents:
         err("No agents in workspace. Create one with `eesel agents create` first.")
+        return None
+    if not target:
+        # No explicit scope. Only safe when there's a single agent to mean.
+        if len(agents) == 1:
+            return agents[0]
+        err(f"This workspace has {len(agents)} agents — name the one to act on:")
+        for a in agents:
+            err(f"  {a.get('agent_id', '?')}  {a.get('name', '?')}")
+        err("Scope it with `eesel agents <id> <command>`, a `--agent <id|name>` flag, "
+            "or EESEL_AGENT=<id|name>.")
         return None
     agent, candidates = resolve_agent_strict(agents, target)
     if agent:
@@ -5481,7 +5435,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     ls.add_argument("--search", help="Free-text query over document names/keys")
     ls.add_argument("--limit", type=int, default=100, help="Maximum documents to return")
     ls.add_argument("--offset", type=int, default=0, help="Pagination offset")
-    ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     ls.add_argument("--json", action="store_true", help="Emit the raw documents payload")
     ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>key<TAB>name` row per document")
 
@@ -5494,7 +5448,7 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
         )
         rd.add_argument("target", nargs="?", help="Document id, id-prefix, key, or filename (omit to pick from a menu)")
         rd.add_argument("--prefix", help="Filter the menu/list to keys under this prefix (e.g. files/, outputs/)")
-        rd.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+        rd.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
         rd.add_argument("--format", default="md", choices=["md", "html"], help="Content format (default: md)")
         rd.add_argument("--json", action="store_true", help="Emit the document as a JSON object (id, key, content)")
 
@@ -5504,6 +5458,9 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     target.add_argument("--document-id", help="Document id to export")
     exp.add_argument("--format", default="md", choices=["md", "html"], help="Export format")
     exp.add_argument("-o", "--output", help="Output file path")
+    exp.add_argument("--agent", help="Agent whose document to export (id / prefix / name); "
+                                     "required unless the workspace has a single agent — or use "
+                                     "the `agents <id> …` path or EESEL_AGENT")
 
     cr = d_sub.add_parser("add", help="Add a document to the workspace (prints its key)")
     cr.add_argument("--title", required=True, help="Document title")
@@ -5511,11 +5468,12 @@ def _add_documents_parser(sub, name: str, hidden: bool = False) -> None:
     content.add_argument("--content", help="Document content (inline)")
     content.add_argument("--content-file", help="Read document content from this file")
     cr.add_argument("--source-type", default="files", help="Source type the document is filed under (default: files)")
-    cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access (default: active agent, or $EESEL_AGENT)")
+    cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
 
     de = d_sub.add_parser("remove", help="Remove documents by key (asks for confirmation)")
     de.add_argument("keys", nargs="+", help="One or more document keys or ids to remove (each must match an existing document)")
     de.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
+    de.add_argument("--agent", help="Agent whose documents to remove; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
 
     acl = d_sub.add_parser("acl", help="Show or set an agent's knowledge-ACL key prefixes")
     acl_sub = acl.add_subparsers(dest="acl_cmd")
@@ -5662,7 +5620,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
                       help="Print only the system prompt (raw, pipeable)")
 
     instr = a_sub.add_parser("instructions", help=argparse.SUPPRESS)  # alias for `show --instructions`
-    instr.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    instr.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name; the sole agent is used if there's only one, otherwise name it")
 
     create = a_sub.add_parser("create", help="Create a new agent")
     create.add_argument("--name", help="Agent name (required)")
@@ -5690,23 +5648,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     remove.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
-    # `use` / `unset` set or clear a persistent active agent stored on disk. The
-    # preferred, stateless way to scope a command is the EESEL_AGENT environment
-    # variable or a per-command --agent flag (see apply_agent_env_override), so a
-    # command's target is explicit rather than depending on hidden saved state.
-    # They stay available but are hidden from help and the usage line: help=
-    # SUPPRESS blanks the description, then the names are dropped from
-    # _choices_actions so they disappear from the subcommand list and metavar.
-    use = a_sub.add_parser("use", help=argparse.SUPPRESS)
-    use.add_argument("agent_id", nargs="?")
-    a_sub.add_parser("unset", help=argparse.SUPPRESS)
-
-    hide_subcommands(a_sub, "use", "unset", "add", "edit", "instructions")
+    hide_subcommands(a_sub, "add", "edit", "instructions")
 
     sp.set_defaults(func=cmd_agents)
 
     sp = sub.add_parser("instructions", help=argparse.SUPPRESS)  # alias for `agents <id> show --instructions`
-    sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    sp.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name; the sole agent is used if there's only one, otherwise name it")
     sp.set_defaults(func=cmd_instructions)
 
     sp = sub.add_parser("new", help="Start a new chat session")
@@ -5733,7 +5680,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
     sp.add_argument("message", nargs="?", help="Message to send (omit for REPL)")
-    sp.add_argument("--agent", help="Agent id, id-prefix, or name to chat with (default: active agent, or $EESEL_AGENT). Explicit, stateless scope — does not change the saved active agent")
+    sp.add_argument("--agent", help="Agent id, id-prefix, or name to chat with; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> chat …` path). On a terminal with several agents you'll be prompted; scripts must name one. Stateless — nothing is persisted")
     sp.add_argument("--cost", action="store_true", help="After each reply, print a one-line cost + token summary for the whole session (incl. sub-agents)")
     # `--trigger` is the old name, kept as an alias; the noun is now a scheduled job.
     sp.add_argument(
@@ -5750,7 +5697,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         help="Continue an existing conversation by its backend task id "
         "(e.g. one an agent included in an outbound request so your "
         "service can post the result back into the same conversation). "
-        "Uses the active agent for new sessions",
+        "The conversation carries its own agent, so none need be named",
     )
     sp.set_defaults(func=cmd_chat)
 
@@ -5797,7 +5744,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # restructured into `eesel integrations <integration> actions`. Keep `tools`
     # working (suppressed from help) so existing scripts don't break.
     sp_tools = sub.add_parser("tools", help=argparse.SUPPRESS)
-    sp_tools.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name (default: active agent)")
+    sp_tools.add_argument("agent", nargs="?", help="Agent id, id-prefix, or name; the sole agent is used if there's only one, otherwise name it")
     sp_tools.add_argument("--json", action="store_true", help="Emit the raw tools payload")
     sp_tools.set_defaults(func=cmd_tools)
     # `tools` is the hidden top-level alias for `integrations <int> actions`; it's
@@ -5814,7 +5761,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     sp.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
     sp.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
-    sp.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    sp.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     # Bare `eesel integrations [--json] [--secrets]` lists integrations.
     # `eesel integrations <integration> actions ...` drops into the actions
     # sub-namespace. main() normalizes the latter form into the `actions`
@@ -5826,19 +5773,19 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")
     i_ls.add_argument("--json", action="store_true", help="Emit the raw integrations payload")
     i_ls.add_argument("--plain", action="store_true", help="Emit one tab-separated `id<TAB>type<TAB>connection<TAB>subdomain` row per integration")
-    i_ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_ls.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     i_av = ig_sub.add_parser("available", help="List connectable integration types and their connect options (read-only)")
     i_av.add_argument("--json", action="store_true", help="Emit the raw integration-definitions payload")
-    i_av.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_av.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     i_show = ig_sub.add_parser("show", help="Show one connected integration's detail, including sync status (read-only)")
     i_show.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_show.add_argument("--json", action="store_true", help="Emit the raw integration payload (with the latest syncRun)")
-    i_show.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_show.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     def _connect_args(p):
         p.add_argument("key", help="Integration type key to connect (e.g. zendesk, website) — see `eesel integrations available`")
         p.add_argument("--option", help="Which connection option to use (its `type` from `eesel integrations available`); required when a connector has several")
         p.add_argument("--field", action="append", metavar="KEY=VALUE", help="A setup field for a `submit` connection option, e.g. `--field subdomain=acme` (repeatable)")
-        p.add_argument("--agent", help="Agent id, id-prefix, or name to connect the integration for (default: active agent, or $EESEL_AGENT)")
+        p.add_argument("--agent", help="Agent id, id-prefix, or name to attribute the connection to (optional; integrations are a shared workspace pool)")
         # Headless guard: fail instead of opening a browser for a redirect/OAuth
         # option. Hidden — niche, for agent/CI runs that can't complete OAuth.
         p.add_argument("--no-input", action="store_true", help=argparse.SUPPRESS)
@@ -5869,11 +5816,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         choices=list(INTEGRATION_SYNC_TYPES),
         help="What to sync (default: help-center). One of: help-center, macros, tickets.",
     )
-    i_sy.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_sy.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     i_ss = ig_sub.add_parser("sync-status", help="Show sync-run status and progress (all runs, or one integration's)")
     i_ss.add_argument("id", nargs="?", help="Optional: full id, id prefix, or type of a connected integration to filter to")
     i_ss.add_argument("--json", action="store_true", help="Emit the raw sync-runs payload")
-    i_ss.add_argument("--agent", help="Agent id, id-prefix, or name to scope to (default: active agent, or $EESEL_AGENT)")
+    i_ss.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     def _remove_args(p):
         p.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
         p.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
@@ -5892,7 +5839,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # --agent (whose action set to read/write) lives on every verb so it can be
     # passed after the verb, e.g. `... actions enable reply --agent Bot`.
     def _agent_arg(p):
-        p.add_argument("--agent", help="Agent id, id-prefix, or name whose actions to read/write (default: active agent)")
+        p.add_argument("--agent", help="Agent id, id-prefix, or name whose actions to read/write; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
 
     a_ls = act_sub.add_parser("list", help="List the integration's actions for the agent (read-only)")
     _agent_arg(a_ls)
@@ -6204,7 +6151,7 @@ _ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "set", "edit")
 # The flat verbs the `agents` command already owns. When the token after
 # `agents` is one of these, the invocation is already in flat form — leave it.
 _AGENTS_FLAT_VERBS = frozenset(
-    {"list", "show", "instructions", "create", "add", "set", "edit", "remove", "use", "unset"}
+    {"list", "show", "instructions", "create", "add", "set", "edit", "remove"}
 )
 
 # Agent-scoped child nouns → (how the flat form takes the agent, which verbs accept it).
@@ -6223,7 +6170,7 @@ _AGENTS_FLAT_VERBS = frozenset(
 # alias are likewise out of scope for this pass.
 _AGENT_SCOPED_CHILDREN = {
     "integrations": ("flag", None),
-    "documents": ("flag", frozenset({"list", "show", "read", "add"})),
+    "documents": ("flag", frozenset({"list", "show", "read", "add", "remove", "export"})),
     "tasks": ("flag", frozenset({"list", "count", "analytics", "export"})),
     "skills": ("pos", None),
 }
