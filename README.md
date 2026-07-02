@@ -141,11 +141,12 @@ Triggers and scheduled jobs live together under `eesel automations`. An
 something happens in an integration. A **scheduled job** runs the agent on a
 cron and can also be fired manually.
 
-> **Moved:** triggers and scheduled jobs are now under one parent,
-> `eesel automations`: use `eesel automations triggers …` and
-> `eesel automations schedules …`. The top-level `eesel triggers` /
-> `eesel schedules` commands (and the old `eesel triggers --all` flag) have been
-> removed — update any scripts to the `eesel automations …` form.
+> **Moved:** triggers and scheduled jobs now live under one parent,
+> `eesel automations`. Note the split: what `eesel triggers` listed (scheduled /
+> cron jobs) is now `eesel automations schedules …`; event/webhook triggers are
+> `eesel automations triggers …`. The top-level `eesel triggers` / `eesel schedules`
+> commands (and the old `eesel triggers --all` flag) have been removed — update any
+> scripts to the `eesel automations …` form.
 
 ```bash
 eesel integrations                  # id, type, connection status, subdomain

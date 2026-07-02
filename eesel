@@ -65,12 +65,14 @@ import base64
 import difflib
 import hashlib
 import hmac
+import http.client
 import http.server
 import json
 import os
 import re
 import secrets as secrets_mod
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -535,11 +537,19 @@ def set_current(sid: str | None) -> None:
 
 
 def ensure_current_session(creds: dict, agent_id: str | None = None) -> dict:
-    """Return the active session, creating one if needed."""
+    """Return the active session, creating one if needed.
+
+    If a turn names an agent, only reuse an active session for that same agent;
+    otherwise the message would go to the session's agent, not the named one.
+    """
     sid = load_current()
     sess = load_session(sid) if sid else None
-    if sess:
+    if sess and (agent_id is None or sess.get("agent_id") == agent_id):
         return sess
+    if sess and agent_id is not None:
+        info(f"active session {sess['id']} belongs to agent "
+             f"{str(sess.get('agent_id'))[:8]}; starting a new session for agent "
+             f"{agent_id[:8]}.")
     return new_session(creds, agent_id=agent_id, name=None, switch_to=True)
 
 
@@ -1570,7 +1580,15 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
     )
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
-            start_resp = json.loads(resp.read())
+            raw = resp.read()
+            try:
+                start_resp = json.loads(raw)
+            except json.JSONDecodeError:
+                snippet = raw[:200].decode(errors="replace").strip()
+                sys.exit(
+                    f"POST {url} → {resp.status} but the response was not JSON "
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                )
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         err(f"sandbox/start → {e.code}: {body_text}")
@@ -1617,6 +1635,7 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
 
     text_buffers: dict[str, str] = {}
     text_order: list[str] = []
+    saw_error = False
 
     try:
         with urllib.request.urlopen(req, timeout=900) as resp:
@@ -1655,17 +1674,24 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
                     preview = (json.dumps(out) if not isinstance(out, str) else out)[:200]
                     print(_color(f"[tool] → {preview}", "2;37"), flush=True)
                 elif etype == "error":
+                    saw_error = True
                     print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
         err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
         # None signals failure so the caller can exit non-zero (see send_message).
+        return None
+    except (http.client.IncompleteRead, ConnectionError, TimeoutError, socket.timeout, ssl.SSLError) as e:
+        # ssl.SSLError (incl. SSLEOFError) covers an encrypted connection torn
+        # down mid-stream — the common abrupt drop on the HTTPS prod transport,
+        # which is neither a ConnectionError nor a URLError.
+        err(f"\nchat stream dropped mid-reply (server/connection?): {e}")
         return None
     except urllib.error.URLError as e:
         # Server unreachable mid-stream — exit cleanly like the shared http_*
         # helpers instead of leaking the connection error traceback.
         sys.exit(f"GET {url} failed (server reachable?): {e}")
 
-    return "".join(text_buffers[tid] for tid in text_order).strip()
+    return None if saw_error else "".join(text_buffers[tid] for tid in text_order).strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -5518,8 +5544,10 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
 
     # A parser can carry a `_eesel_relocations` map of {old-subcommand: hint} for
     # subcommands that moved to a different command group: when the moved name is
-    # given, point at the new home instead of a generic "did you mean". No parser
-    # sets this today, but the hook stays so a future move can wire one up.
+    # given, point at the new home instead of a generic "did you mean". The root
+    # parser sets this for `documents` (renamed to `files`) and `triggers` /
+    # `schedules` (now under `automations`); other parsers carry none, so their
+    # errors are unaffected.
     relocations = getattr(parser, "_eesel_relocations", None) or {}
 
     def error(message: str, _orig=original_error, _choices=choices, _reloc=relocations) -> None:
@@ -6052,6 +6080,16 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         _hidden_top.append("impersonate")
     hide_subcommands(sub, *_hidden_top)
 
+    p._eesel_relocations = {
+        "documents": "`documents` was renamed to `files` — use `eesel files …` "
+                     "(e.g. `eesel files list`).",
+        "triggers": "`triggers` moved under `automations`. The scheduled/cron jobs it "
+                    "listed are now `eesel automations schedules …`; event/webhook "
+                    "triggers are `eesel automations triggers …`.",
+        "schedules": "`schedules` moved under `automations` — use "
+                     "`eesel automations schedules …`.",
+    }
+
     # Wire "did you mean?" suggestions across every subcommand level at once.
     _install_suggestions(p)
     return p
@@ -6077,6 +6115,15 @@ _ACTIONS_SUBCOMMANDS = ("list", "show", "enable", "disable", "set")
 _AGENTS_FLAT_VERBS = frozenset(
     {"list", "show", "create", "set", "remove"}
 )
+
+_REMOVED_AGENTS_VERBS = {
+    "use": "`eesel agents use` is gone — there is no saved active agent. Scope each "
+           "command instead: `--agent <id>`, `EESEL_AGENT=<id>`, or the "
+           "`eesel agents <id> …` path.",
+    "unset": "`eesel agents unset` is gone — there is no saved active agent to clear. "
+             "Scope each command with `--agent`, `EESEL_AGENT`, or the "
+             "`eesel agents <id> …` path.",
+}
 
 # Agent-scoped child nouns → (how the flat form takes the agent, which verbs accept it).
 #   mode "flag" → append `--agent <id>`         (e.g. `integrations list --agent X`)
@@ -6156,6 +6203,12 @@ def _normalize_path_scope_argv(argv: list[str]) -> list[str]:
     # first token is a flat verb, it's already the flat form.
     if not rest or rest[0].startswith("-") or rest[0] in _AGENTS_FLAT_VERBS:
         return argv
+
+    # These were old stateful verbs, so keep them reserved for a useful removal
+    # message instead of treating them as agent names in the path grammar.
+    if rest[0] in _REMOVED_AGENTS_VERBS:
+        err(_REMOVED_AGENTS_VERBS[rest[0]])
+        sys.exit(2)
 
     agent = rest[0]            # the path scope: an agent id, id-prefix, or name
     if not agent.strip():
