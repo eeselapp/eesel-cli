@@ -10,11 +10,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
 import socket
+import ssl
 import sys
 import time
 from pathlib import Path
@@ -624,6 +626,36 @@ class TestSessions:
         first = eesel.new_session(fake_creds, agent_id="ag-1", name=None)
         second = eesel.ensure_current_session(fake_creds)
         assert first["id"] == second["id"]
+
+    def test_ensure_current_reuses_matching_agent(self, tmp_config, fake_creds):
+        first = eesel.new_session(fake_creds, agent_id="ag-1", name=None)
+        second = eesel.ensure_current_session(fake_creds, agent_id="ag-1")
+        assert first["id"] == second["id"]
+
+    def test_ensure_current_reuses_when_no_agent_requested(self, tmp_config, fake_creds):
+        first = eesel.new_session(fake_creds, agent_id="ag-1", name=None)
+        second = eesel.ensure_current_session(fake_creds, agent_id=None)
+        assert first["id"] == second["id"]
+
+    def test_ensure_current_starts_new_session_on_agent_mismatch(self, fake_creds, monkeypatch, capsys):
+        old = {"id": "old-session", "agent_id": "ag-old", "workspace_id": "ws-test-123", "messages": []}
+        new = {"id": "new-session", "agent_id": "ag-new", "workspace_id": "ws-test-123", "messages": []}
+        calls = {}
+
+        monkeypatch.setattr(eesel, "load_current", lambda: "old-session")
+        monkeypatch.setattr(eesel, "load_session", lambda sid: old)
+
+        def fake_new_session(creds, *, agent_id, name, switch_to, **kwargs):
+            calls.update(agent_id=agent_id, name=name, switch_to=switch_to, kwargs=kwargs)
+            return new
+
+        monkeypatch.setattr(eesel, "new_session", fake_new_session)
+
+        assert eesel.ensure_current_session(fake_creds, agent_id="ag-new") is new
+        assert calls == {"agent_id": "ag-new", "name": None, "switch_to": True, "kwargs": {}}
+        err = capsys.readouterr().err
+        assert "active session old-session belongs to agent ag-old" in err
+        assert "starting a new session for agent ag-new" in err
 
 
 class TestFilesCommand:
@@ -2610,19 +2642,33 @@ class TestSubcommandSuggestions:
         assert args.sessions_cmd == "list"
 
     def test_top_level_triggers_is_no_longer_a_choice(self, capsys):
-        # `triggers` moved under `automations`; it is no longer a top-level
-        # command, so a bare `triggers ...` fails as an invalid top-level choice.
+        # `triggers` moved under `automations`; the old top-level spelling
+        # should fail with the relocation hint, not a generic choice list.
         with pytest.raises(SystemExit):
             eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
         err = capsys.readouterr().err
-        assert "Choose from:" in err
+        assert "automations schedules" in err
 
     def test_relocated_name_skips_generic_did_you_mean(self, capsys):
-        # There is no relocation hint for the removed top-level `triggers`; it is
-        # simply reported as an invalid top-level choice.
         with pytest.raises(SystemExit):
             eesel.build_parser().parse_args(["triggers", "fire", "abc123"])
         err = capsys.readouterr().err
+        assert "automations schedules" in err
+        assert "Did you mean" not in err
+
+    def test_documents_relocation_points_to_files(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["documents", "list"])
+        err = capsys.readouterr().err
+        assert "renamed to `files`" in err
+        assert "eesel files" in err
+        assert "Did you mean" not in err
+
+    def test_schedules_relocation_points_to_automations_schedules(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.build_parser().parse_args(["schedules", "list"])
+        err = capsys.readouterr().err
+        assert "automations schedules" in err
         assert "Did you mean" not in err
 
     def test_triggers_typo_still_suggests_nearest(self, capsys):
@@ -2680,6 +2726,59 @@ class TestChatConnectionFailure:
         with pytest.raises(SystemExit) as excinfo:
             eesel.stream_reply(fake_creds, "task1", None)
         assert "server reachable?" in str(excinfo.value.code)
+
+    class _StreamResp:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            raise self.exc
+
+    def test_stream_connection_reset_returns_none(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda *a, **k: self._StreamResp(ConnectionResetError("reset")),
+        )
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert "chat stream dropped mid-reply" in capsys.readouterr().err
+
+    def test_stream_incomplete_read_returns_none(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda *a, **k: self._StreamResp(http.client.IncompleteRead(b"partial")),
+        )
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert "chat stream dropped mid-reply" in capsys.readouterr().err
+
+    def test_stream_tls_teardown_returns_none(self, fake_creds, monkeypatch, capsys):
+        # An encrypted connection torn down mid-reply raises ssl.SSLEOFError,
+        # which is an OSError but neither a ConnectionError nor a URLError. It is
+        # the common abrupt drop on the HTTPS prod transport and must fail the
+        # turn cleanly, not escape as a traceback.
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda *a, **k: self._StreamResp(ssl.SSLEOFError("EOF in violation of protocol")),
+        )
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert "chat stream dropped mid-reply" in capsys.readouterr().err
+
+    def test_stream_generic_ssl_error_returns_none(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(
+            eesel.urllib.request,
+            "urlopen",
+            lambda *a, **k: self._StreamResp(ssl.SSLError("decryption failed")),
+        )
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert "chat stream dropped mid-reply" in capsys.readouterr().err
 
 
 class TestArgParser:
@@ -6642,7 +6741,7 @@ class TestChatAgentFlag:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "other-agent", "name": "Other"}])
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--agent must not persist the active agent"))
         # Stop after agent resolution so we don't exercise the sandbox/streaming path.
-        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: (_ for _ in ()).throw(SystemExit("stop")))
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: (_ for _ in ()).throw(SystemExit("stop")))
         with pytest.raises(SystemExit):
             eesel.cmd_chat(_args(agent="Other", message="hi", cost=False, task=None, trigger=None))
 
@@ -6727,6 +6826,51 @@ class TestChatHonestExit:
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
         assert eesel.stream_reply(fake_creds, "task1", None) is None
+
+    class _RawResp:
+        def __init__(self, body: bytes, status: int = 200):
+            self._body = body
+            self.status = status
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def test_send_message_non_json_200_exits_cleanly(self, fake_creds, monkeypatch):
+        html = b"<html><body>login</body></html>"
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._RawResp(html))
+
+        with pytest.raises(SystemExit) as exc:
+            eesel.send_message(fake_creds, self._sess(), "hi")
+
+        msg = str(exc.value)
+        assert "not JSON" in msg
+        assert "JSONDecodeError" not in msg
+
+    class _SseResp:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    def test_stream_reply_returns_none_on_error_event(self, fake_creds, monkeypatch, capsys):
+        lines = [b'data: {"type":"error","errorText":"turn failed"}\n']
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._SseResp(lines))
+
+        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert "turn failed" in capsys.readouterr().err
 
     def test_oneshot_exits_1_when_turn_rejected(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
@@ -6818,6 +6962,22 @@ class TestPathScopeResolver:
         assert self.n("agents", "list") == ["agents", "list"]
         assert self.n("agents", "show", "blog") == ["agents", "show", "blog"]
         assert self.n("agents", "set", "blog", "--name", "X") == ["agents", "set", "blog", "--name", "X"]
+
+    def test_removed_agents_use_verb_errors_on_the_verb(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self.n("agents", "use", "a1b2")
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "`eesel agents use` is gone" in err
+        assert "is not an agent command" not in err
+
+    def test_removed_agents_unset_verb_errors_on_the_verb(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self.n("agents", "unset")
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "`eesel agents unset` is gone" in err
+        assert "is not an agent command" not in err
 
     def test_non_agents_command_unchanged(self):
         assert self.n("integrations", "list") == ["integrations", "list"]
