@@ -2583,6 +2583,93 @@ class TestImpersonatorFlagCaching:
         assert "impersonator : yes" in capsys.readouterr().out
 
 
+class TestImpersonationWorkspaceResync:
+    """Impersonating (or clearing) must re-pin `workspace_id` from `/workspaces`,
+    since the stored one belongs to whoever we were acting as before the swap."""
+
+    def _creds(self, **extra):
+        c = {
+            "env": "prod",
+            "api_url": "https://oracle.eesel.app",
+            "workspace_id": "stale-ws",
+            "token": "tok",
+            "expires_at": int(time.time()) + 3600,
+        }
+        c.update(extra)
+        eesel.save_creds(c)
+        return c
+
+    def test_resync_pins_first_workspace_and_persists(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "ws-A"}, {"workspaceId": "ws-B"}]}),
+        )
+        assert eesel.resync_impersonated_workspace(creds) == "ws-A"
+        assert eesel.load_creds()["workspace_id"] == "ws-A"
+
+    def test_resync_hits_workspaces_endpoint(self, tmp_config, monkeypatch):
+        creds = self._creds()
+        seen = {}
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **k: seen.update(method=method, url=url) or (200, {"result": [{"id": "ws-A"}]}),
+        )
+        eesel.resync_impersonated_workspace(creds)
+        assert seen == {"method": "GET", "url": "https://oracle.eesel.app/workspaces"}
+
+    def test_resync_tolerates_field_variants(self, tmp_config, monkeypatch):
+        # Bare-list body (wrapped as `result` by http_request_allow_error) with a
+        # snake_case id — both are accepted.
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **k: (200, {"result": [{"workspace_id": "ws-Z"}]}),
+        )
+        assert eesel.resync_impersonated_workspace(creds) == "ws-Z"
+
+    def test_resync_clears_and_warns_on_empty_list(self, tmp_config, monkeypatch, capsys):
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error", lambda method, url, **k: (200, {"workspaces": []})
+        )
+        assert eesel.resync_impersonated_workspace(creds) is None
+        # Stale id must not survive even when we can't pick a replacement.
+        assert "workspace_id" not in eesel.load_creds()
+        assert "No workspaces" in capsys.readouterr().err
+
+    def test_resync_clears_and_warns_on_error_status(self, tmp_config, monkeypatch, capsys):
+        creds = self._creds()
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error", lambda method, url, **k: (403, {"error": "nope"})
+        )
+        assert eesel.resync_impersonated_workspace(creds) is None
+        assert "workspace_id" not in eesel.load_creds()
+        assert "HTTP 403" in capsys.readouterr().err
+
+    def test_impersonate_target_repins_workspace(self, tmp_config, monkeypatch):
+        self._creds()
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"target": "auth0|xyz"})
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "target-ws"}]}),
+        )
+        rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "auth0|xyz"})())
+        assert rc == 0
+        assert eesel.load_creds()["workspace_id"] == "target-ws"
+
+    def test_impersonate_clear_repins_workspace(self, tmp_config, monkeypatch):
+        self._creds()
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {})
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "own-ws"}]}),
+        )
+        rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "clear"})())
+        assert rc == 0
+        assert eesel.load_creds()["workspace_id"] == "own-ws"
+
+
 class TestMainStaffGating:
     def _save(self, **extra):
         c = {
