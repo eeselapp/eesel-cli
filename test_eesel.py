@@ -2585,7 +2585,8 @@ class TestImpersonatorFlagCaching:
 
 class TestImpersonationWorkspaceResync:
     """Impersonating (or clearing) must re-pin `workspace_id` from `/workspaces`,
-    since the stored one belongs to whoever we were acting as before the swap."""
+    since the stored one belongs to whoever we were acting as before the swap.
+    `GET /workspaces` returns a single workspace object."""
 
     def _creds(self, **extra):
         c = {
@@ -2599,11 +2600,18 @@ class TestImpersonationWorkspaceResync:
         eesel.save_creds(c)
         return c
 
-    def test_resync_pins_first_workspace_and_persists(self, tmp_config, monkeypatch):
+    def _workspace(self, workspace_id="ws-A"):
+        return {
+            "createdAt": "Tue, 30 Jun 2026 22:44:57 GMT",
+            "workspaceId": workspace_id,
+            "workspaceName": "Default Workspace",
+            "workspaceOwnerUserId": "auth0|abc",
+        }
+
+    def test_resync_pins_workspace_and_persists(self, tmp_config, monkeypatch):
         creds = self._creds()
         monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "ws-A"}, {"workspaceId": "ws-B"}]}),
+            eesel, "http_request", lambda method, url, **k: self._workspace("ws-A")
         )
         assert eesel.resync_impersonated_workspace(creds) == "ws-A"
         assert eesel.load_creds()["workspace_id"] == "ws-A"
@@ -2612,59 +2620,42 @@ class TestImpersonationWorkspaceResync:
         creds = self._creds()
         seen = {}
         monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, **k: seen.update(method=method, url=url) or (200, {"result": [{"id": "ws-A"}]}),
+            eesel, "http_request",
+            lambda method, url, **k: seen.update(method=method, url=url) or self._workspace(),
         )
         eesel.resync_impersonated_workspace(creds)
         assert seen == {"method": "GET", "url": "https://oracle.eesel.app/workspaces"}
 
-    def test_resync_tolerates_field_variants(self, tmp_config, monkeypatch):
-        # Bare-list body (wrapped as `result` by http_request_allow_error) with a
-        # snake_case id — both are accepted.
+    def test_resync_clears_and_warns_on_empty_response(self, tmp_config, monkeypatch, capsys):
         creds = self._creds()
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, **k: (200, {"result": [{"workspace_id": "ws-Z"}]}),
-        )
-        assert eesel.resync_impersonated_workspace(creds) == "ws-Z"
-
-    def test_resync_clears_and_warns_on_empty_list(self, tmp_config, monkeypatch, capsys):
-        creds = self._creds()
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error", lambda method, url, **k: (200, {"workspaces": []})
-        )
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {})
         assert eesel.resync_impersonated_workspace(creds) is None
-        # Stale id must not survive even when we can't pick a replacement.
+        # Stale id must not survive even when the response carries no workspace.
         assert "workspace_id" not in eesel.load_creds()
-        assert "No workspaces" in capsys.readouterr().err
-
-    def test_resync_clears_and_warns_on_error_status(self, tmp_config, monkeypatch, capsys):
-        creds = self._creds()
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error", lambda method, url, **k: (403, {"error": "nope"})
-        )
-        assert eesel.resync_impersonated_workspace(creds) is None
-        assert "workspace_id" not in eesel.load_creds()
-        assert "HTTP 403" in capsys.readouterr().err
+        assert "No workspace" in capsys.readouterr().err
 
     def test_impersonate_target_repins_workspace(self, tmp_config, monkeypatch):
         self._creds()
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"target": "auth0|xyz"})
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "target-ws"}]}),
-        )
+
+        def fake_http(method, url, **k):
+            if "/sysadmin/" in url:
+                return {"target": "auth0|xyz"}
+            return self._workspace("target-ws")
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
         rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "auth0|xyz"})())
         assert rc == 0
         assert eesel.load_creds()["workspace_id"] == "target-ws"
 
     def test_impersonate_clear_repins_workspace(self, tmp_config, monkeypatch):
         self._creds()
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {})
-        monkeypatch.setattr(
-            eesel, "http_request_allow_error",
-            lambda method, url, **k: (200, {"workspaces": [{"workspaceId": "own-ws"}]}),
-        )
+
+        def fake_http(method, url, **k):
+            if "/sysadmin/" in url:
+                return {}
+            return self._workspace("own-ws")
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
         rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "clear"})())
         assert rc == 0
         assert eesel.load_creds()["workspace_id"] == "own-ws"
@@ -4238,8 +4229,11 @@ class TestImpersonateCommand:
         seen = {}
 
         def fake_http(method, url, *, token=None, body=None, **kw):
-            seen.update(method=method, url=url)
-            return {"message": "Impersonation target set", "target": "victim-9"}
+            if "/sysadmin/" in url:
+                seen.update(method=method, url=url)
+                return {"message": "Impersonation target set", "target": "victim-9"}
+            # The resync's `GET /workspaces` call.
+            return {"workspaceId": "victim-ws"}
 
         monkeypatch.setattr(eesel, "http_request", fake_http)
         args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
@@ -4256,8 +4250,11 @@ class TestImpersonateCommand:
         seen = {}
 
         def fake_http(method, url, *, token=None, body=None, **kw):
-            seen.update(method=method, url=url)
-            return {"message": "Impersonation target cleared"}
+            if "/sysadmin/" in url:
+                seen.update(method=method, url=url)
+                return {"message": "Impersonation target cleared"}
+            # The resync's `GET /workspaces` call.
+            return {"workspaceId": "own-ws"}
 
         monkeypatch.setattr(eesel, "http_request", fake_http)
         args = eesel.build_parser(staff=True).parse_args(["impersonate", "clear"])
