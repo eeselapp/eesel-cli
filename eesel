@@ -456,6 +456,9 @@ def require_creds() -> dict:
     if near_expiry and creds.get("refresh_token"):
         refreshed = refresh_prod_token(creds)
         if refreshed:
+            # Resolve the effective workspace before EESEL_AGENT, so an agent
+            # named by env resolves against the workspace we'll actually query.
+            _apply_effective_workspace(refreshed)
             return apply_agent_env_override(refreshed)
         # Refresh failed. If the access token is already dead we can't proceed;
         # if it's merely near expiry, fall through and use it for this command.
@@ -467,6 +470,7 @@ def require_creds() -> dict:
         err("Token expired. Run `eesel login` again.")
         sys.exit(1)
 
+    _apply_effective_workspace(creds)
     return apply_agent_env_override(creds)
 
 
@@ -1708,9 +1712,11 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     hiccup.
 
     `allowed` is whether the caller may impersonate. `target_user_id` is the
-    *active* target or None: the endpoint reports the effective user as
-    `target_uid` even when idle, so a target counts as active only when an
-    impersonator origin is present (i.e. a swap actually happened).
+    *active* target or None. When idle the endpoint echoes the caller's own uid
+    as both `impersonator_uid` and `target_uid`, so a target counts as active
+    only when the two differ — i.e. the caller is acting as a *different* user.
+    Testing `target_uid` alone would report a phantom self-impersonation for
+    every sysadmin, since the caller's own uid is always present there.
     """
     try:
         req = urllib.request.Request(
@@ -1723,8 +1729,65 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     except Exception:
         return None
     allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
-    target = data.get("target_uid") if data.get("impersonator_uid") else None
+    impersonator = data.get("impersonator_uid")
+    target_uid = data.get("target_uid")
+    target = target_uid if (impersonator and target_uid and target_uid != impersonator) else None
     return {"allowed": allowed, "target_user_id": target}
+
+
+def resolve_effective_workspace_id(creds: dict) -> str | None:
+    """Return the workspace id the caller currently operates in.
+
+    `POST /workspaces/token` derives the workspace from the *effective* identity
+    — the impersonation target if one is active, otherwise the caller — so it is
+    the authoritative answer to "which workspace am I acting in". Used to point
+    the CLI at an impersonated user's workspace and back again on clear.
+
+    Best-effort: returns None on any failure so callers can leave the stored
+    workspace untouched rather than overwrite it with a wrong value.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{creds['api_url']}/workspaces/token",
+            data=json.dumps({"client": "cli"}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {creds['token']}"},
+            method="POST",
+        )
+        # Short timeout: this is a best-effort optimization that runs before every
+        # authenticated command, so a slow endpoint must not stall the CLI for long.
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read() or b"{}")
+    except Exception:
+        return None
+    return data.get("workspaceId") or data.get("workspace_id")
+
+
+# Resolve the effective workspace at most once per CLI invocation.
+_effective_ws_resolved = False
+
+
+def _apply_effective_workspace(creds: dict) -> None:
+    """Point `workspace_id` at the workspace the caller currently acts in.
+
+    The stored `workspace_id` is fixed at login. While impersonating, every
+    request runs as the target — usually in a different workspace — so the stored
+    value returns 401. `resolve_effective_workspace_id` asks the server which
+    workspace the effective identity is in (the target while impersonating, the
+    caller's own otherwise); this also self-corrects a target that was cleared or
+    has expired. Applied in memory only and resolved at most once per process, so
+    nothing is persisted and there is nothing to restore.
+
+    Only Auth0 logins are checked — dev / workspace-token logins set their
+    workspace explicitly and must not be overridden. On any lookup failure the
+    stored workspace is left as-is.
+    """
+    global _effective_ws_resolved
+    if _effective_ws_resolved or not creds.get("refresh_token"):
+        return
+    _effective_ws_resolved = True
+    ws = resolve_effective_workspace_id(creds)
+    if ws:
+        creds["workspace_id"] = ws
 
 
 def cache_impersonator_flag(creds: dict) -> bool:
@@ -1768,10 +1831,15 @@ def cmd_whoami(args) -> int:
     if not creds:
         info("Not logged in.")
         return 0
+    # Resolve the workspace the CLI actually operates in — the impersonated
+    # user's while a target is active — for display only. Done on a copy so the
+    # is_impersonator save below can't persist it over the stored workspace.
+    shown = dict(creds)
+    _apply_effective_workspace(shown)
     expires_in = int((creds.get("expires_at") or 0) - time.time())
     print(f"env          : {creds.get('env')}")
     print(f"api_url      : {creds.get('api_url')}")
-    print(f"workspace_id : {creds.get('workspace_id')}")
+    print(f"workspace_id : {shown.get('workspace_id')}")
     # No stored "active agent": each agent-scoped command names its own agent
     # (path `agents <id> …`, `--agent`, or EESEL_AGENT), and a single-agent
     # workspace is used automatically.
@@ -3276,10 +3344,12 @@ def cmd_impersonate(args) -> int:
 
     Sets (or clears) a sticky impersonation target on the server. From the
     moment you set a target, every subsequent `eesel` command behaves as if
-    that user were calling — auth, workspace context, agents, integrations.
+    that user were calling — auth, workspace, agents, integrations. The CLI
+    resolves the target's workspace on demand (`_apply_effective_workspace`),
+    so workspace-scoped commands don't 401 against a workspace the impersonated
+    user can't see, and it self-corrects once the target is cleared or expires.
     Calls the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target`
-    and `/sysadmin/clear-impersonator-target`), reachable now that the CLI
-    authenticates with an Auth0 token.
+    and `/sysadmin/clear-impersonator-target`).
 
     Combine with `eesel chat --trigger heartbeat` to preview a target's
     heartbeat, or just `eesel chat` to run a general chat as them. WRITE
@@ -3288,6 +3358,11 @@ def cmd_impersonate(args) -> int:
 
     Sticks for ~1 hour, or until you `eesel impersonate clear`. Always
     visible in `eesel whoami`.
+
+    `set` and `clear` are sysadmin-gated and run through any active swap, so you
+    cannot switch or clear a target while impersonating a *non-sysadmin* user —
+    those calls return 401. Wait for the ~1 hour expiry or clear it from the
+    dashboard.
     """
     creds = require_creds()
     target = args.user_id
@@ -3298,14 +3373,13 @@ def cmd_impersonate(args) -> int:
 
     if target == "clear":
         url = f"{creds['api_url']}/sysadmin/clear-impersonator-target"
-        try:
-            http_request("GET", url, token=creds["token"])
-        except urllib.error.HTTPError as e:
-            try:
-                payload = json.loads(e.read().decode("utf-8") or "{}")
-            except Exception:
-                payload = {}
-            err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
+        status, payload = http_request_allow_error("GET", url, token=creds["token"])
+        if status != 200:
+            err(f"clear-impersonator-target → {status}: {payload.get('error') or 'failed'}")
+            if status in (401, 403):
+                info("Can't clear while impersonating a non-sysadmin user — the clear "
+                     "call itself runs as that user. It auto-expires in ~1 hour, or "
+                     "clear it from the dashboard.")
             return 1
         ok("Impersonation cleared.")
         return 0
@@ -3313,20 +3387,17 @@ def cmd_impersonate(args) -> int:
     # GET-with-side-effect, matching the /sysadmin/* convention. The target
     # user id goes in the `target` query param.
     url = f"{creds['api_url']}/sysadmin/set-impersonator-target?{urllib.parse.urlencode({'target': target})}"
-    try:
-        resp = http_request("GET", url, token=creds["token"])
-    except urllib.error.HTTPError as e:
-        try:
-            payload = json.loads(e.read().decode("utf-8") or "{}")
-        except Exception:
-            payload = {}
-        err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
-        if e.code in (401, 403):
-            info("This command requires a sysadmin/impersonator account. Your current login isn't on the allowlist.")
+    status, payload = http_request_allow_error("GET", url, token=creds["token"])
+    if status != 200:
+        err(f"set-impersonator-target → {status}: {payload.get('error') or 'failed'}")
+        if status in (401, 403):
+            info("Requires a sysadmin/impersonator account. You also can't set a new "
+                 "target while already impersonating a non-sysadmin user — clear the "
+                 "current one first (or wait for it to expire).")
         return 1
 
-    ok(f"Impersonating: {resp.get('target') or target}")
-    info("All subsequent `eesel` commands run as this user.")
+    ok(f"Impersonating: {payload.get('target') or target}")
+    info("All subsequent `eesel` commands run as this user, in their workspace.")
     info("Run `eesel whoami` to confirm. Clear with `eesel impersonate clear`.")
     return 0
 
