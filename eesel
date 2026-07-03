@@ -553,10 +553,16 @@ def ensure_current_session(creds: dict, agent_id: str | None = None) -> dict:
     return new_session(creds, agent_id=agent_id, name=None, switch_to=True)
 
 
-def find_session_by_task(task_id: str) -> dict | None:
-    """Find the local session bound to a backend task id, if any."""
+def find_session_by_task(task_id: str, agent_id: str | None = None) -> dict | None:
+    """Find the local session bound to a backend task id, if any.
+
+    If `agent_id` is given, only match a session that also belongs to that
+    agent, so `chat --task X --agent B` won't reuse a session the task was
+    bound to under a different agent (which would send the turn to the wrong
+    agent). Mirrors the agent filter in `ensure_current_session`.
+    """
     for sess in list_sessions():
-        if sess.get("task_id") == task_id:
+        if sess.get("task_id") == task_id and (agent_id is None or sess.get("agent_id") == agent_id):
             return sess
     return None
 
@@ -828,6 +834,14 @@ def format_cost_full(d: dict, sess: dict, label: str = "session") -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# A connection dropped mid-request raises one of these during resp.read() and is
+# NOT wrapped in urllib.error.URLError — a load-balancer reset, a backend
+# restart, or (ssl.SSLError, incl. SSLEOFError) an encrypted transport torn down.
+# Both the shared http_request helper and the chat stream reader catch this set,
+# so keep it in one place rather than letting the two copies drift.
+_DROPPED_CONN_ERRORS = (http.client.IncompleteRead, ConnectionError, TimeoutError, socket.timeout, ssl.SSLError)
+
+
 def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json", **(headers or {})}
@@ -840,7 +854,7 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
             if not raw:
                 return {}
             try:
-                return json.loads(raw)
+                parsed = json.loads(raw)
             except json.JSONDecodeError:
                 # A 2xx with a non-JSON body usually means a proxy/gateway or
                 # login page answered instead of the API (e.g. an HTML error
@@ -851,9 +865,25 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
                     f"{method} {url} → {resp.status} but the response was not JSON "
                     f"({len(raw)} bytes; a proxy or login page?): {snippet}"
                 )
+            # Callers expect an object, or a list from the list endpoints (the
+            # fetch_* helpers detect that). A bare scalar (string/number/bool/
+            # null) has no field to read and would crash the caller's `.get(...)`
+            # — surface a clean error instead of a raw AttributeError.
+            if not isinstance(parsed, (dict, list)):
+                snippet = raw[:200].decode(errors="replace").strip()
+                sys.exit(
+                    f"{method} {url} → {resp.status} returned an unexpected JSON "
+                    f"shape ({type(parsed).__name__}): {snippet}"
+                )
+            return parsed
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         sys.exit(f"{method} {url} → {e.code}: {body_text}")
+    except _DROPPED_CONN_ERRORS as e:
+        # A connection dropped mid-request (during resp.read()) is not a URLError.
+        # The chat stream already handles this family; the shared helper the rest
+        # of the CLI uses needs it too, or it tracebacks instead of erroring.
+        sys.exit(f"{method} {url} failed (connection dropped?): {e}")
     except urllib.error.URLError as e:
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
 
@@ -1338,6 +1368,19 @@ def resolve_integration(integrations: list[dict], target: str) -> dict | None:
     return matches[0] if matches else None
 
 
+def _print_ambiguous_integrations(target: str, matches: list[dict]) -> None:
+    """Print the "ambiguous target" error, one line per candidate. Shared by the
+    resolvers that refuse to act on an arbitrary match when a value (e.g. a bare
+    integration type) matches more than one connected instance."""
+    err(f"'{target}' is ambiguous — it matches {len(matches)} integrations:")
+    for it in matches:
+        line = f"  {it.get('id', '?')}  {it.get('integrationType', '?')}"
+        if it.get("identifier"):
+            line += f"  {it['identifier']}"
+        err(line)
+    err("Re-run with a full integration id to disambiguate.")
+
+
 def resolve_integration_strict(integrations: list[dict], target: str) -> dict | None:
     """Resolve `target` to exactly one integration for a destructive command, or
     print why it could not (no match, or ambiguous with the candidates listed)
@@ -1349,13 +1392,7 @@ def resolve_integration_strict(integrations: list[dict], target: str) -> dict | 
     if not matches:
         err(f"No connected integration matches '{target}'. Run `eesel integrations list`.")
         return None
-    err(f"'{target}' is ambiguous — it matches {len(matches)} integrations:")
-    for it in matches:
-        line = f"  {it.get('id', '?')}  {it.get('integrationType', '?')}"
-        if it.get("identifier"):
-            line += f"  {it['identifier']}"
-        err(line)
-    err("Re-run with a full integration id to disambiguate.")
+    _print_ambiguous_integrations(target, matches)
     return None
 
 
@@ -1544,6 +1581,17 @@ def pick_agent(creds: dict, *, prompt: bool = True) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _save_dropping_unanswered(sess: dict, message: str) -> None:
+    """Persist the session after a failed turn, dropping the user message we
+    appended for it. Every turn resends the whole local history, so a saved
+    unanswered message would be re-sent next turn — rolling it back prevents
+    that. Only pops when we actually appended one (an empty auto-fire message
+    isn't appended, so there's nothing to remove)."""
+    if message:
+        sess["messages"].pop()
+    save_session(sess)
+
+
 def send_message(creds: dict, sess: dict, message: str) -> str | None:
     # Empty user messages are how trigger-preview sessions auto-fire (kicked off
     # by `eesel new --trigger X` with no user typing yet). The backend filters
@@ -1592,10 +1640,7 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
         err(f"sandbox/start → {e.code}: {body_text}")
-        # Only roll back if we actually appended (i.e. non-empty user message).
-        if message:
-            sess["messages"].pop()
-        save_session(sess)
+        _save_dropping_unanswered(sess, message)
         # Return None (not "") to signal failure: a successful turn can legitimately
         # produce empty text, so callers distinguish failure from empty-success on
         # `is None`, and `eesel chat "…"` can exit non-zero on a rejected turn.
@@ -1608,6 +1653,13 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
         # session is left untouched by exiting before save_session.
         sys.exit(f"POST {url} failed (server reachable?): {e}")
 
+    if not isinstance(start_resp, dict):
+        # A 200 that decoded to JSON but isn't an object (a proxy shim, say):
+        # we can't read taskId/streamUrl from it. Roll back and fail cleanly
+        # rather than crashing on `.get`.
+        _save_dropping_unanswered(sess, message)
+        sys.exit(f"POST {url} → {resp.status} returned an unexpected (non-object) body.")
+
     task_id = start_resp.get("taskId", sess["task_id"])
     sess["task_id"] = task_id
     stream_url = start_resp.get("streamUrl")
@@ -1615,6 +1667,14 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
     print(_color("eesel ", "36") + "→ ", end="", flush=True)
     text = stream_reply(creds, task_id, stream_url)
     print()  # newline after stream
+
+    if text is None:
+        # The turn started but the reply failed (a dropped stream or an error
+        # event — stream_reply returns None only on failure; a genuinely empty
+        # reply is ""). Roll back the user message so the next turn doesn't
+        # re-send it.
+        _save_dropping_unanswered(sess, message)
+        return None
 
     if text:
         sess["messages"].append({"sender": "assistant", "message": text})
@@ -1650,6 +1710,12 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
                     evt = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # A well-formed `data:` line can still decode to a non-object
+                # (a bare string, number, or list). Every branch below does
+                # `evt.get(...)`, so skip anything that isn't a JSON object
+                # rather than letting the `.get` raise mid-reply.
+                if not isinstance(evt, dict):
+                    continue
                 etype = evt.get("type")
                 if etype == "text-start":
                     tid = evt.get("id", "_")
@@ -1661,7 +1727,13 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
                     if tid not in text_buffers:
                         text_buffers[tid] = ""
                         text_order.append(tid)
+                    # `delta` is normally a text piece, but a stream can emit a
+                    # frame whose delta is null or a non-string. Skip those
+                    # instead of doing `str += None` / `sys.stdout.write(None)`,
+                    # which would raise TypeError and crash the reply.
                     delta = evt.get("delta", "")
+                    if not isinstance(delta, str):
+                        continue
                     text_buffers[tid] += delta
                     sys.stdout.write(delta)
                     sys.stdout.flush()
@@ -1680,10 +1752,10 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
         err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
         # None signals failure so the caller can exit non-zero (see send_message).
         return None
-    except (http.client.IncompleteRead, ConnectionError, TimeoutError, socket.timeout, ssl.SSLError) as e:
-        # ssl.SSLError (incl. SSLEOFError) covers an encrypted connection torn
-        # down mid-stream — the common abrupt drop on the HTTPS prod transport,
-        # which is neither a ConnectionError nor a URLError.
+    except _DROPPED_CONN_ERRORS as e:
+        # An encrypted connection torn down mid-stream (ssl.SSLError/SSLEOFError)
+        # is the common abrupt drop on the HTTPS prod transport, and is neither a
+        # ConnectionError nor a URLError — see _DROPPED_CONN_ERRORS.
         err(f"\nchat stream dropped mid-reply (server/connection?): {e}")
         return None
     except urllib.error.URLError as e:
@@ -2494,8 +2566,8 @@ def cmd_integrations(args) -> int:
     `available` lists the connectable catalog. `show <integration>` prints one
     integration's detail. `connect` connects a new integration; `sync` triggers
     a data refresh; `sync-status` reports sync-run progress; `remove` disconnects
-    one. `add` and `disconnect` are hidden back-compat aliases for `connect` and
-    `remove`.
+    one. (The old `add` / `disconnect` verbs were renamed to `connect` / `remove`
+    and no longer exist.)
     """
     creds = require_creds()
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
@@ -2673,7 +2745,7 @@ def _fetch_sync_runs(creds: dict) -> list:
     must not be used to read status.
     """
     data = http_request("GET", f"{creds['api_url']}/v2/sync-runs", token=creds["token"])
-    return data.get("jobs") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    return (data.get("jobs") or []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
 
 def _runs_for_integration(runs: list, integration_id: str) -> list:
@@ -2917,7 +2989,7 @@ def _integrations_sync_status(args, creds: dict) -> int:
 
 
 def _integrations_remove(args, creds: dict) -> int:
-    """Remove a connected integration. Reached via `remove` or `disconnect`.
+    """Remove a connected integration (the `remove` verb).
 
     Two scopes, mirroring the dashboard's two menu items:
 
@@ -3012,26 +3084,33 @@ def _action_matches_integration(row: dict, integration: str) -> bool:
     return integration == key or integration == iid or (iid != "—" and iid.startswith(integration))
 
 
-def _resolve_integration_id(creds: dict, agent_id: str, integration: str) -> str | None:
-    """Resolve the integration positional to a connected instance id, or None.
+def _resolve_integration_id(creds: dict, agent_id: str, integration: str) -> tuple[str | None, bool]:
+    """Resolve the integration positional to a connected instance id.
 
-    For write commands the server scopes a shared action to one connected
-    instance via `integration_id`. The positional may already be that id, or it
-    may be an integration type (e.g. `zendesk`) that we look up against the
-    workspace's connected integrations. Returns None when nothing matches; the
-    write still proceeds unscoped, which is correct for actions that aren't
-    tied to a specific instance (e.g. built-in `ai_actions`).
+    Returns ``(integration_id, ok)``. For write commands the server scopes a
+    shared action to one connected instance via `integration_id`. The positional
+    may already be that id, or an integration type (e.g. `zendesk`) looked up
+    against the workspace's connected integrations.
+
+    `integration_id` is None when nothing matches, in which case the write
+    proceeds unscoped — correct for actions not tied to a specific instance
+    (e.g. built-in `ai_actions`). `ok` is False only when the value matches more
+    than one connected instance: the candidates are printed and the caller must
+    abort rather than scope the write to an arbitrary instance, mirroring the
+    strict resolvers the destructive commands use.
+
+    Matching goes through `match_integrations` (exact id, id-prefix, then type),
+    the same rule the read view and the strict destructive resolver use.
     """
-    integrations = fetch_integrations(creds, agent_id=agent_id)
-    # Exact instance-id match first.
-    for it in integrations:
-        if it.get("id") and it.get("id") == integration:
-            return it["id"]
-    # Then by integration type, e.g. `zendesk` → its connected instance id.
-    for it in integrations:
-        if it.get("integrationType") == integration and it.get("id"):
-            return it["id"]
-    return None
+    matches = match_integrations(fetch_integrations(creds, agent_id=agent_id), integration)
+    if not matches:
+        return None, True
+    if len(matches) == 1:
+        # A single match with no instance id (e.g. built-in `ai_actions`) means
+        # "proceed unscoped", which is exactly `(None, True)`.
+        return matches[0].get("id"), True
+    _print_ambiguous_integrations(integration, matches)
+    return None, False
 
 
 def cmd_integration_actions(args) -> int:
@@ -3046,6 +3125,13 @@ def cmd_integration_actions(args) -> int:
     """
     creds = require_creds()
     sub = getattr(args, "actions_cmd", None) or "list"
+    # The write verbs act on a named action; a blank name (e.g. `disable ""`,
+    # or `disable "$VAR"` with VAR unset) must be refused before any resolution
+    # or network call, so it can't fall through to deleting the sole action.
+    if sub in ("enable", "set", "disable") and not (getattr(args, "action", "") or "").strip():
+        err(f"No action name given for `{sub}`. Pass the action's key or name "
+            f"(see `eesel integrations <integration> actions list`).")
+        return 1
     if sub == "show":
         return _actions_show(args, creds)
     if sub == "enable":
@@ -3068,6 +3154,12 @@ def _resolve_action_key(creds: dict, agent_id: str, integration: str, action: st
     matches uniquely, so callers can report a clear error or fall back to the raw
     value (e.g. enabling a not-yet-configured action by its exact key)."""
     scoped = [t for t in fetch_tools(creds, agent_id) if _action_matches_integration(_tool_row(t), integration)]
+    if not (action or "").strip():
+        # A blank action is a prefix of every tool, so without this guard it
+        # would "uniquely" match the sole configured action and let disable act
+        # on it with no real target given. Mirror the blank guard the other
+        # match_* resolvers have; the command layer also refuses a blank name.
+        return None, scoped
     exact = next((t for t in scoped if t.get("tool_key") == action), None)
     if exact:
         return action, scoped
@@ -3100,7 +3192,7 @@ def _actions_list(args, creds: dict) -> int:
     tools = fetch_tools(creds, agent_id)
     scoped = [t for t in tools if _action_matches_integration(_tool_row(t), integration)]
     if getattr(args, "json", False):
-        print(json.dumps(scoped, indent=2))
+        print(json.dumps(_redact_secrets(scoped), indent=2))
         return 0
     if not scoped:
         info(f"(no '{integration}' actions configured for {agent.get('name', agent_id)})")
@@ -3201,7 +3293,9 @@ def _actions_enable(args, creds: dict) -> int:
     # configured action can still be enabled by its exact key.
     tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
     action_key = tool_key or args.action
-    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    integration_id, scope_ok = _resolve_integration_id(creds, agent_id, args.integration)
+    if not scope_ok:
+        return 1
     _configure_tool(creds, agent_id, action_key, {}, integration_id)
     ok(f"Enabled '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
     info("Set its permission/settings with `eesel integrations <integration> actions set`.")
@@ -3230,7 +3324,9 @@ def _actions_edit(args, creds: dict) -> int:
     agent_id = agent["agent_id"]
     tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
     action_key = tool_key or args.action
-    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    integration_id, scope_ok = _resolve_integration_id(creds, agent_id, args.integration)
+    if not scope_ok:
+        return 1
     result = _configure_tool(creds, agent_id, action_key, config, integration_id)
     ok(f"Updated '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
     saved = result.get("config") if isinstance(result, dict) else None
@@ -3262,7 +3358,9 @@ def _actions_disable(args, creds: dict) -> int:
     # key for a row that isn't listed).
     tool_key, _ = _resolve_action_key(creds, agent_id, args.integration, args.action)
     action_key = tool_key or args.action
-    integration_id = _resolve_integration_id(creds, agent_id, args.integration)
+    integration_id, scope_ok = _resolve_integration_id(creds, agent_id, args.integration)
+    if not scope_ok:
+        return 1
     url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(action_key, safe='')}"
     if integration_id:
         url += f"?{urllib.parse.urlencode({'integration_id': integration_id})}"
@@ -3403,7 +3501,7 @@ def cmd_chat(args) -> int:
         # Reuse the local session bound to that task if we have one (keeps local
         # history accumulating), otherwise create a fresh session pinned to it.
         # The backend resumes the conversation from its own task state either way.
-        sess = find_session_by_task(task_id)
+        sess = find_session_by_task(task_id, agent_id=creds.get("agent_id"))
         if sess:
             set_current(sess["id"])
         else:
@@ -3725,8 +3823,13 @@ def render_task_runs(runs: list[dict], *, full: bool = False) -> None:
     for i, run in enumerate(runs, 1):
         if multi:
             print(_color(f"\n── run {i}/{len(runs)} ──", "2;37"))
-        for item in run.get("items", []):
-            render_history_item(item, full=full)
+        # Skip a run or item the server sent in an unexpected shape (not a dict)
+        # rather than crashing `render_history_item`'s `.get` on it — the same
+        # odd-response hardening applied to the analytics renderer.
+        items = run.get("items") if isinstance(run, dict) else None
+        for item in items or []:
+            if isinstance(item, dict):
+                render_history_item(item, full=full)
 
 
 def render_history_item(item: dict, *, full: bool = False) -> None:
@@ -3787,7 +3890,15 @@ def render_task_analytics(data: dict) -> None:
         info("(no tasks in range)")
         return
 
-    res = data.get("resolution_counts") or {}
+    # Each section below is expected as a keyed object. The server can send one
+    # as a list (a natural shape for a distribution), which would crash the
+    # dict access (.get / .values / .items) after some lines were already
+    # printed. Coerce a wrong-shape section to empty so it's skipped, not fatal.
+    def _obj(key):
+        v = data.get(key)
+        return v if isinstance(v, dict) else {}
+
+    res = _obj("resolution_counts")
     resolved = int(res.get("resolved") or 0)
     escalated = int(res.get("escalated") or 0)
     pending = int(res.get("pending") or 0)
@@ -3798,18 +3909,19 @@ def render_task_analytics(data: dict) -> None:
     else:
         print(f"resolution: resolved {resolved} / escalated {escalated} / pending {pending}")
 
-    csat = data.get("csat_distribution") or {}
+    csat = _obj("csat_distribution")
     if any(csat.values()):
         parts = ", ".join(f"{k} {v}" for k, v in csat.items())
         print(f"csat: {parts}")
 
-    by_agent = data.get("tasks_by_agent") or {}
+    by_agent = _obj("tasks_by_agent")
     if by_agent:
         print("by agent:")
-        for entry in sorted(by_agent.values(), key=lambda e: e.get("count") or 0, reverse=True):
+        entries = [e for e in by_agent.values() if isinstance(e, dict)]
+        for entry in sorted(entries, key=lambda e: e.get("count") or 0, reverse=True):
             print(f"  {entry.get('count') or 0:>6}  {entry.get('name') or '?'}")
 
-    by_channel = data.get("tasks_by_channel") or {}
+    by_channel = _obj("tasks_by_channel")
     if by_channel:
         print("by channel:")
         for name, count in sorted(by_channel.items(), key=lambda kv: kv[1] or 0, reverse=True):
@@ -4599,6 +4711,14 @@ def _files_acl(args) -> int:
         return 0
 
     if sub == "set":
+        # Refuse a blank/whitespace prefix before sending it. An empty string is
+        # a prefix of every document key, so a stored empty prefix would grant
+        # the agent access to everything — the exact over-grant this command
+        # exists to scope. Mirror the blank-target guards used across the CLI.
+        if any(not (p or "").strip() for p in args.prefix):
+            err("--prefix was given but is empty. Pass a non-empty key prefix "
+                "(an empty prefix would grant access to every document).")
+            return 1
         # PUT replaces the entire prefix set (it does not append). The server
         # always re-adds the agent's own `files/{agent_id}` prefix, so it can't
         # be removed even if omitted here.
@@ -5770,6 +5890,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # subparser below before parsing, so the integration positional can't be
     # mistaken for a subcommand name.
     sp.set_defaults(func=cmd_integrations, integrations_cmd=None)
+    # The old `add` / `disconnect` verbs were renamed. Point a user who types
+    # the old name at the right replacement — `disconnect` is `remove`, not the
+    # edit-distance-nearest `connect` a bare suggestion would offer.
+    sp._eesel_relocations = {
+        "add": "`add` was renamed — use `eesel integrations connect …`.",
+        "disconnect": "`disconnect` was renamed — use `eesel integrations remove …`.",
+    }
     ig_sub = sp.add_subparsers(dest="integrations_cmd")
     i_ls = ig_sub.add_parser("list", help="List every connected integration with status columns (read-only)")
     i_ls.add_argument("--secrets", action="store_true", help="Also print sensitive properties (access tokens etc). Sysadmin/impersonator accounts only")

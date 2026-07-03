@@ -1017,7 +1017,7 @@ class TestFilesCommand:
         request_mock.assert_not_called()
         download_mock.assert_not_called()
 
-    def test_document_export_preserves_matching_workspace_prefix(self, tmp_config, fake_creds, tmp_path, monkeypatch):
+    def test_document_export_strips_matching_workspace_prefix(self, tmp_config, fake_creds, tmp_path, monkeypatch):
         workspace_id = "c11e2c42-b77e-45f1-88d1-cf9b22974c90"
         fake_creds["workspace_id"] = workspace_id
         eesel.save_creds(fake_creds)
@@ -6770,7 +6770,7 @@ class TestChatTaskFlag:
         full_id = "330c8f22-aaaa-bbbb-cccc-dddddddddddd"
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "fetch_tasks", lambda creds, **k: ([{"task_id": full_id}], None, None))
-        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: None)
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid, agent_id=None: None)
         created = {}
 
         def fake_new_session(creds, **k):
@@ -6791,7 +6791,7 @@ class TestChatTaskFlag:
             eesel, "fetch_tasks",
             lambda creds, **k: ([{"task_id": "330c8f22-aaaa"}, {"task_id": "330c8f22-bbbb"}], None, None),
         )
-        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid: pytest.fail("must not look up a session before resolving"))
+        monkeypatch.setattr(eesel, "find_session_by_task", lambda tid, agent_id=None: pytest.fail("must not look up a session before resolving"))
         monkeypatch.setattr(eesel, "new_session", lambda *a, **k: pytest.fail("must not bind a session on an ambiguous prefix"))
         rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
         assert rc == 1
@@ -7269,3 +7269,312 @@ class TestPathScopeUnknownHeadErrors:
         # A flag (not a word) after the agent is ambiguous; leave it untouched
         # rather than erroring, so argparse handles it as before.
         assert self.n("agents", "blog", "--json") == ["agents", "blog", "--json"]
+
+
+# ── Fix-list hardening (crash-hardening + target guards) ────────────────────
+
+
+class _FixResp:
+    """A urlopen() context manager whose read() returns a fixed body."""
+
+    def __init__(self, body: bytes, status: int = 200):
+        self._body, self.status = body, status
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _ReadRaises:
+    """A urlopen() context manager whose read() raises mid-request — a
+    connection dropped after the response started."""
+
+    def __init__(self, exc):
+        self.exc, self.status = exc, 200
+
+    def read(self):
+        raise self.exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _SseFrames:
+    """A urlopen() context manager iterating fixed SSE byte-lines."""
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+class TestHttpRequestDropAndShape:
+    """The shared helper must fail cleanly (not traceback) on a connection
+    dropped mid-request and on a 200 body that is neither an object nor a list."""
+
+    def test_connection_reset_mid_read_exits_cleanly(self, monkeypatch):
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _ReadRaises(ConnectionResetError("reset")))
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://x/y")
+        assert "connection dropped" in str(exc.value)
+
+    def test_incomplete_read_exits_cleanly(self, monkeypatch):
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _ReadRaises(http.client.IncompleteRead(b"partial")))
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://x/y")
+        assert "connection dropped" in str(exc.value)
+
+    def test_bare_scalar_body_exits_cleanly(self, monkeypatch):
+        # Valid JSON, but a bare string has no field a caller's .get() could read.
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _FixResp(b'"just a string"'))
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://x/y")
+        assert "unexpected JSON shape" in str(exc.value)
+
+    def test_object_body_still_returned(self, monkeypatch):
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _FixResp(b'{"ok": true}'))
+        assert eesel.http_request("GET", "http://x/y") == {"ok": True}
+
+    def test_list_body_still_passes_through(self, monkeypatch):
+        # The list endpoints legitimately return a JSON array; callers detect it.
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _FixResp(b"[1, 2, 3]"))
+        assert eesel.http_request("GET", "http://x/y") == [1, 2, 3]
+
+
+class TestFetchSyncRunsGuard:
+    """`integrations show` looks up the latest sync run; an empty/absent feed
+    must yield an empty list, not None (which would crash the downstream loop)."""
+
+    def test_dict_without_jobs_returns_empty_list(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"other": 1})
+        assert eesel._fetch_sync_runs(fake_creds) == []
+
+    def test_jobs_null_returns_empty_list(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"jobs": None})
+        assert eesel._fetch_sync_runs(fake_creds) == []
+
+    def test_latest_sync_run_is_none_when_feed_empty(self, fake_creds, monkeypatch):
+        # A freshly-connected integration that hasn't synced is exactly this shape.
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"jobs": None})
+        assert eesel._latest_sync_run(fake_creds, "int-zendesk-1") is None
+
+
+class TestRenderTaskAnalyticsShape:
+    def test_wrong_shape_sections_do_not_crash(self, capsys):
+        # A section arriving as a list (a natural distribution shape) must be
+        # skipped, not crash after the first lines were already printed.
+        data = {
+            "total_tasks": 5,
+            "resolution_counts": [1, 2],
+            "csat_distribution": ["a", "b"],
+            "tasks_by_agent": [{"count": 3}],
+            "tasks_by_channel": [["chat", 2]],
+        }
+        eesel.render_task_analytics(data)  # must not raise
+        assert "total tasks: 5" in capsys.readouterr().out
+
+
+class TestStreamReplyMalformedFrames:
+    def test_null_delta_does_not_crash(self, fake_creds, monkeypatch):
+        lines = [
+            b'data: {"type":"text-start","id":"a"}\n',
+            b'data: {"type":"text-delta","id":"a","delta":"hi"}\n',
+            b'data: {"type":"text-delta","id":"a","delta":null}\n',
+            b'data: {"type":"text-delta","id":"a","delta":" there"}\n',
+        ]
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: _SseFrames(lines))
+        assert eesel.stream_reply(fake_creds, "task1", None) == "hi there"
+
+    def test_non_object_frame_is_skipped(self, fake_creds, monkeypatch):
+        lines = [
+            b'data: "a bare string"\n',
+            b"data: [1,2,3]\n",
+            b'data: {"type":"text-delta","id":"a","delta":"ok"}\n',
+        ]
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: _SseFrames(lines))
+        assert eesel.stream_reply(fake_creds, "task1", None) == "ok"
+
+
+class TestSendMessageRollback:
+    def _sess(self):
+        return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-1",
+                "task_id": "t1", "messages": []}
+
+    def _start_ok(self, monkeypatch):
+        body = b'{"taskId":"t1","streamUrl":"http://s/stream"}'
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: _FixResp(body))
+
+    def test_failed_stream_rolls_back_user_message(self, fake_creds, monkeypatch):
+        # The turn started but the reply failed; the un-answered user message must
+        # not remain, or the next turn re-sends it (every turn resends the history).
+        self._start_ok(monkeypatch)
+        monkeypatch.setattr(eesel, "stream_reply", lambda *a, **k: None)
+        monkeypatch.setattr(eesel, "save_session", lambda s: None)
+        sess = self._sess()
+        assert eesel.send_message(fake_creds, sess, "hello") is None
+        assert sess["messages"] == []
+
+    def test_successful_turn_keeps_both_messages(self, fake_creds, monkeypatch):
+        self._start_ok(monkeypatch)
+        monkeypatch.setattr(eesel, "stream_reply", lambda *a, **k: "the answer")
+        monkeypatch.setattr(eesel, "save_session", lambda s: None)
+        sess = self._sess()
+        assert eesel.send_message(fake_creds, sess, "hello") == "the answer"
+        assert sess["messages"] == [
+            {"sender": "user", "message": "hello"},
+            {"sender": "assistant", "message": "the answer"},
+        ]
+
+    def test_empty_but_successful_reply_keeps_user_message(self, fake_creds, monkeypatch):
+        # An empty string is a successful (quiet) turn, not a failure: the user
+        # message stays, only the assistant message is skipped.
+        self._start_ok(monkeypatch)
+        monkeypatch.setattr(eesel, "stream_reply", lambda *a, **k: "")
+        monkeypatch.setattr(eesel, "save_session", lambda s: None)
+        sess = self._sess()
+        assert eesel.send_message(fake_creds, sess, "hello") == ""
+        assert sess["messages"] == [{"sender": "user", "message": "hello"}]
+
+    def test_non_object_start_body_rolls_back_and_exits(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: _FixResp(b'"not an object"'))
+        monkeypatch.setattr(eesel, "save_session", lambda s: None)
+        sess = self._sess()
+        with pytest.raises(SystemExit):
+            eesel.send_message(fake_creds, sess, "hello")
+        assert sess["messages"] == []
+
+
+class TestFindSessionByTaskAgentFilter:
+    def _sessions(self):
+        return [
+            {"id": "s-a", "task_id": "task-1", "agent_id": "agent-A"},
+            {"id": "s-b", "task_id": "task-2", "agent_id": "agent-B"},
+        ]
+
+    def test_no_agent_filter_matches_by_task(self, monkeypatch):
+        monkeypatch.setattr(eesel, "list_sessions", lambda: self._sessions())
+        assert eesel.find_session_by_task("task-1")["id"] == "s-a"
+
+    def test_matching_agent_returns_session(self, monkeypatch):
+        monkeypatch.setattr(eesel, "list_sessions", lambda: self._sessions())
+        assert eesel.find_session_by_task("task-1", agent_id="agent-A")["id"] == "s-a"
+
+    def test_mismatched_agent_returns_none(self, monkeypatch):
+        # Task-1's session belongs to agent-A; asking as agent-B must not reuse it,
+        # or the turn goes to the wrong agent.
+        monkeypatch.setattr(eesel, "list_sessions", lambda: self._sessions())
+        assert eesel.find_session_by_task("task-1", agent_id="agent-B") is None
+
+
+class TestActionsTargetGuards:
+    """Blank and ambiguous targets in `integrations <x> actions` write verbs must
+    refuse and touch nothing, like the strict resolvers elsewhere in the CLI."""
+
+    def _agents(self):
+        return [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+
+    def test_disable_blank_action_refused_before_any_call(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not DELETE on a blank action"))
+        monkeypatch.setattr(eesel, "confirm", lambda prompt: pytest.fail("must not prompt on a blank action"))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="disable", integration="zendesk", agent="Support Bot", action="", force=True))
+        assert rc == 1
+        assert "No action name" in capsys.readouterr().err
+
+    def test_resolve_action_key_blank_returns_none(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: list(_TOOLS))
+        key, _ = eesel._resolve_action_key(fake_creds, "agent-test-456", "zendesk", "   ")
+        assert key is None
+
+    def test_enable_ambiguous_integration_type_refused(self, fake_creds, monkeypatch, capsys):
+        two_zendesk = [
+            {"id": "int-zendesk-1", "integrationType": "zendesk", "identifier": "acme.zendesk.com"},
+            {"id": "int-zendesk-2", "integrationType": "zendesk", "identifier": "beta.zendesk.com"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self._agents())
+        monkeypatch.setattr(eesel, "fetch_integrations", lambda creds, agent_id=None: list(two_zendesk))
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: [])
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not write on an ambiguous type"))
+        rc = eesel.cmd_integration_actions(_args(
+            actions_cmd="enable", integration="zendesk", agent="Support Bot", action="zendesk_search"))
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "ambiguous" in err
+        assert "int-zendesk-1" in err and "int-zendesk-2" in err
+
+
+class TestFilesAclBlankPrefix:
+    def test_blank_prefix_refused_no_put(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_agent_or_error",
+                            lambda creds, target: {"agent_id": "agent-test-456", "name": "Support Bot"})
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: pytest.fail("must not PUT a blank prefix"))
+        rc = eesel._files_acl(_args(acl_cmd="set", agent="Support Bot", prefix=[""]))
+        assert rc == 1
+        assert "empty" in capsys.readouterr().err
+
+    def test_valid_prefix_still_puts(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_agent_or_error",
+                            lambda creds, target: {"agent_id": "agent-test-456", "name": "Support Bot"})
+        calls = []
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, body))
+            return {"key_prefixes": ["files/x"]}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        rc = eesel._files_acl(_args(acl_cmd="set", agent="Support Bot", prefix=["files/x"]))
+        assert rc == 0
+        assert calls[0][0] == "PUT"
+
+
+class TestActionsListRedaction:
+    def test_list_json_redacts_secrets(self, fake_creds, monkeypatch, capsys):
+        # `actions list --json` must mask secrets, matching `actions show --json`.
+        secret_tool = {
+            "tool_id": "t1", "tool_key": "zendesk_x", "name": "X",
+            "tool_action": "write", "permission_mode": "ask",
+            "integration_id": "int-zendesk-1", "is_connected": True,
+            "config": {"tool_data": {"integration_key": "zendesk"}, "access_token": "tok-LEAK"},
+        }
+        monkeypatch.setattr(eesel, "_resolve_actions_agent",
+                            lambda creds, agent: {"agent_id": "agent-test-456", "name": "Support Bot"})
+        monkeypatch.setattr(eesel, "fetch_tools", lambda creds, aid: [secret_tool])
+        rc = eesel._actions_list(_args(integration="zendesk", agent="Support Bot", json=True), fake_creds)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "tok-LEAK" not in out
+        assert "***" in out
+
+
+class TestRenderTaskRunsShape:
+    def test_non_dict_items_are_skipped(self, capsys):
+        # A run whose items list carries a non-dict element (odd server shape)
+        # must not crash render_history_item's .get access.
+        runs = [{"items": ["a bare string", {"type": "message", "role": "user", "content": "hi"}, None]}]
+        eesel.render_task_runs(runs)  # must not raise
+        assert "hi" in capsys.readouterr().out
+
+    def test_non_dict_run_is_skipped(self, capsys):
+        eesel.render_task_runs(["not a run dict", {"items": []}])  # must not raise

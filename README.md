@@ -36,7 +36,7 @@ eesel login                         # opens dashboard.eesel.ai, signs in as you 
 eesel whoami
 eesel agents list                   # --json or --plain for machine-readable output
 eesel agents show <id-or-name>      # full detail (type, status, instructions)
-eesel agents instructions <id-or-name>   # just the system prompt (also `eesel instructions`)
+eesel agents <id-or-name> show --instructions   # just the system prompt (also `eesel instructions`)
 eesel agents create --name "QA Bot" --instructions "..."
 eesel agents set <id-or-name> --name "..."   # change name and/or instructions
 eesel agents remove <id-or-name>    # delete an agent (asks to confirm; --force to skip)
@@ -82,11 +82,11 @@ eesel files list                                            # all files
 eesel files list --prefix outputs/skills                    # filter by key prefix
 eesel files list --search "blog title"                      # filter by name/key
 
-eesel files read                                            # arrow-key menu, then print
-eesel files read <id-or-key>                                # print one file to stdout
-eesel files read --prefix files/                            # menu, filtered to files/…
-eesel files read <id> --format html                         # read as HTML (default: md)
-eesel files read <id> > draft.md                            # body→stdout, so redirect works
+eesel files show                                            # arrow-key menu, then print
+eesel files show <id-or-key>                                # print one file to stdout
+eesel files show --prefix files/                            # menu, filtered to files/…
+eesel files show <id> --format html                         # show as HTML (default: md)
+eesel files show <id> > draft.md                            # body→stdout, so redirect works
 
 eesel files export --file-key <key> --format md -o post.md
 eesel files export --file-id <id-or-prefix> --format html -o post.html
@@ -94,9 +94,10 @@ eesel files export --file-id <id-or-prefix> --format html -o post.html
 
 `--format` accepts `md` or `html`. For `export`, `-o` is optional; without
 it the file lands in the current directory using the file's filename.
-`read` prints the body to stdout (the header goes to stderr, so redirects
+`show` prints the body to stdout (the header goes to stderr, so redirects
 capture just the content) and, with no id, opens an arrow-key picker.
-(The singular `eesel document …` still works as a hidden back-compat alias.)
+(`eesel files read` is a hidden alias of `show`, and the singular
+`eesel document …` still works as a hidden back-compat alias.)
 
 Files are scoped to one agent — its `files/…` and `outputs/skills/…`
 keys — so scope the command with `EESEL_AGENT` or `--agent` first.

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify — eesel CLI v0.4.1 vs v0.3.0: the full command-namespace overhaul (ENG-4700)</title>
+<meta name="description" content="Comprehensive verify of the eesel CLI upgrade from the last customer release (v0.3.0) to v0.4.1: the whole ENG-4700 namespace overhaul plus honest chat failures. The upgrade is safe and non-destructive; a wider sweep found a real crash-hardening fix-list.">
+<style>
+  :root{--bg:#0f1115;--card:#181b22;--card2:#1d212a;--ink:#e6e8ec;--mut:#9aa3b2;--line:#2a2f3a;
+    --red:#ff6b6b;--amb:#ffb454;--grn:#5ad17a;--blu:#6db3f2;--vio:#c8a8d8;--chip:#222733;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:32px 20px}
+  .wrap{max-width:960px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:18px}
+  a{color:var(--blu)}
+  code{background:#0c0e12;border:1px solid var(--line);border-radius:4px;padding:1px 5px;font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cdd6e4}
+  pre{background:#0c0e12;border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto;font:12px/1.45 ui-monospace,Menlo,monospace;color:#cdd6e4}
+
+  .rel{display:inline-block;background:#12261a;border:1px solid #264d33;color:var(--grn);border-radius:6px;padding:2px 9px;font:12px/1.3 ui-monospace,Menlo,monospace;font-weight:700}
+  .prob{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+  .prob h2{margin:0 0 8px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em}
+  .tt{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:stretch;margin-top:12px}
+  @media(max-width:720px){.tt{grid-template-columns:1fr}.tt .arr{display:none}}
+  .tt .col{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:var(--card2);font-size:13px}
+  .tt .col h4{margin:0 0 7px;font:11px/1 ui-monospace,Menlo,monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+  .tt .today{border-left:3px solid var(--amb)} .tt .tomorrow{border-left:3px solid var(--grn)}
+  .tt .arr{align-self:center;color:var(--mut);font-size:22px;font-family:ui-monospace,Menlo,monospace}
+  .tt ul{margin:0;padding-left:16px} .tt li{margin:4px 0;color:var(--mut)}
+  .tt li b{color:var(--ink);font-weight:600}
+
+  .verdict{border:1px solid var(--line);border-left:5px solid var(--amb);background:var(--card);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+  .verdict h2{margin:0 0 8px;font-size:17px}
+  .kv{margin:10px 0 0}
+  .kv b{color:var(--blu)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 2px}
+  .chip{background:var(--chip);border:1px solid var(--line);border-radius:20px;padding:3px 11px;font-size:12px;color:var(--mut)}
+  .chip.ok{color:var(--grn);border-color:#264d33}
+  .chip.warn{color:var(--amb);border-color:#4d3f1a}
+  .chip.bad{color:var(--red);border-color:#4d2626}
+  .legend{font-size:11px;color:var(--mut);margin-top:8px}
+
+  details{border:1px solid var(--line);background:var(--card);border-radius:10px;margin:10px 0;overflow:hidden}
+  summary{cursor:pointer;padding:13px 18px;font-weight:600;list-style:none;user-select:none}
+  summary::-webkit-details-marker{display:none}
+  summary:hover{background:#1d212a}
+  .body{padding:4px 18px 16px;border-top:1px solid var(--line)}
+  .tree{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--mut)}
+  .tree b{color:var(--ink)}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin:6px 0}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:#1d212a;color:var(--mut);font-weight:600}
+  .ev{font-size:11px;font-weight:700;border-radius:4px;padding:1px 6px;white-space:nowrap}
+  .ev.live{background:#1c3a26;color:var(--grn)}
+  .ev.test{background:#1c2c3a;color:var(--blu)}
+  .ev.read{background:#2e2730;color:var(--vio)}
+  .ev.no{background:#3a2e1a;color:var(--amb)}
+  .v-ok{color:var(--grn);font-weight:700}
+  .v-warn{color:var(--amb);font-weight:700}
+  .v-bad{color:var(--red);font-weight:700}
+  .f{border-left:3px solid var(--line);padding:8px 0 8px 14px;margin:16px 0}
+  .f.fix{border-color:var(--red)}
+  .f.dec{border-color:var(--amb)}
+  .f.low{border-color:var(--blu)}
+  .f h4{margin:0 0 4px;font-size:14.5px}
+  .f .meta{color:var(--mut);font-size:12px;margin-bottom:6px}
+  .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:4px;padding:1px 7px;margin-right:6px;vertical-align:middle}
+  .tag.fix{background:#4d2626;color:var(--red)}
+  .tag.dec{background:#3a2e1a;color:var(--amb)}
+  .tag.low{background:#1c2c3a;color:var(--blu)}
+  ul{margin:6px 0;padding-left:20px}
+  li{margin:5px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Verify — eesel CLI · the full command overhaul from v0.3.0 to v0.4.1</h1>
+<div class="sub">
+  <span class="rel">v0.3.0 → v0.4.1</span> &nbsp; the last customer release <code>194113b</code> → the release under test <code>a1fa55d</code> in <code>eeselapp/eesel-cli</code> ·
+  the <a href="https://linear.app/eesel/issue/ENG-4700">ENG-4700</a> CLI overhaul ·
+  re-verified by running the real <code>eesel</code> binary, driving its network code against local sockets, and diffing old-vs-new against the actual v0.3.0 binary
+</div>
+
+<!-- ================= PROBLEM ================= -->
+<div class="prob">
+  <h2>The problem this solves</h2>
+  <p>Between the last release customers installed (<b>v0.3.0</b>) and now (<b>v0.4.1</b>), the CLI's whole command
+  vocabulary was reworked so that similar things are said the same way everywhere. Nouns were renamed and regrouped
+  (<code>documents</code> → <code>files</code>; <code>triggers</code> and <code>schedules</code> gathered under a new
+  <code>automations</code> parent; the old top-level <code>tools</code> became <code>integrations … actions</code>),
+  the write verb became <code>set</code> everywhere (was a mix of <code>edit</code>/<code>update</code>), destructive
+  commands moved to <code>--force</code> (was <code>--yes</code>), six command groups were added
+  (<code>mcp</code>, <code>workspace</code>, <code>skills</code>, <code>automations</code>, <code>billing</code>,
+  <code>settings</code>), and the idea of a remembered "active agent" — an <em>agent</em> being a configured AI
+  assistant in the workspace, the thing that files, skills, and integrations are scoped to — was dropped in favour of
+  naming the agent on each command. On top of all that, two follow-up fixes: moved commands now tell you where they went, and chat now fails
+  honestly instead of dumping a Python traceback or returning a half-finished answer as success.</p>
+  <p style="color:var(--mut);font-size:13px;margin-bottom:0">This is a <b>comprehensive re-verification</b> of that whole
+  upgrade, measured against the last release customers actually run. The most important question for an upgrading
+  customer: do their existing scripts, built on the old command names, still do something safe? (The CLI has no version
+  string in code — its version is the git tag, so "v0.4.1" names the commit <code>a1fa55d</code>, staged pending
+  publish.) <a href="https://linear.app/eesel/issue/ENG-4700">ENG-4700</a> is the parent ticket.</p>
+
+  <div class="tt">
+    <div class="col today"><h4>On v0.3.0 (before)</h4>
+      <ul>
+        <li>A customer scripts <code>document</code>, <code>tools</code>, <code>triggers</code>, <code>instructions</code>, a saved active agent</li>
+        <li>Write verbs are a mix of <code>edit</code>/<code>update</code>; deletes use <code>--yes</code></li>
+        <li>A moved/removed command → a generic error; a failed chat → a traceback or a fake "success"</li>
+      </ul>
+    </div>
+    <div class="arr">&rarr;</div>
+    <div class="col tomorrow"><h4>On v0.4.1 (after)</h4>
+      <ul>
+        <li>One consistent vocabulary: <code>files</code>, <code>integrations … actions</code>, <code>automations</code>; agent named per command. Old names still work (hidden alias) or point you to the new one</li>
+        <li><code>set</code> to write, <code>--force</code> to skip a prompt — everywhere</li>
+        <li>Moved command → one line naming its new home; failed chat → clean message + non-zero exit</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ================= VERDICT ================= -->
+<div class="verdict">
+  <h2>Verdict: <span class="v-warn">Works — the upgrade ships safely</span>, and a wider sweep found a real fix-list</h2>
+  <div>Verified live by a nine-lens panel — one reviewer per command area plus cross-cutting correctness, conventions,
+  and safety — each working in isolation so none graded its own work, and each diffing the <em>actual</em> v0.3.0
+  binary against v0.4.1. <b>The upgrade itself is honest and non-destructive:</b> every old v0.3.0 command a customer
+  might have scripted was run against the new binary, and <b>none</b> silently does nothing, the wrong thing, or a
+  destructive thing — each either still works through a hidden alias or fails loudly with a pointer to the new spelling.
+  The two dangerous cases were checked hardest and both hold. The new grammar lets you write a command as
+  <code>eesel agents &lt;id&gt; &lt;verb&gt;</code>, which the CLI <em>rewrites</em> internally into the flag form
+  <code>&lt;verb&gt; --agent &lt;id&gt;</code> — the risk being that an <em>old</em> command, reinterpreted under that
+  rewrite, could land on a <em>different, destructive</em> command the user never typed. It can't: an old
+  <code>agents use remove zendesk</code> can <em>never</em> be rewritten into a destructive integration removal, and an
+  empty agent scope can never become a workspace-wide uninstall. Existing sessions, config, and credentials survive the
+  upgrade untouched. The full test suite is green (646 tests).</div>
+  <div style="margin-top:10px"><b>But going wider than a spot-check found real defects in the shipped surface</b> —
+  none catastrophic (nothing silently loses data or mass-deletes), but confirmed live: a handful of commands crash with
+  a raw traceback on an odd-but-plausible server response (including the flagship <code>chat</code>), a failed chat
+  stream leaves the local history in a state that re-sends the message next turn, and two spots in
+  <code>integrations … actions</code> act on the wrong or a blank target. This is why the verdict is "ships safely, with
+  a fix-list" rather than an unqualified green: the upgrade path is safe, but the code has a crash-hardening backlog
+  worth clearing before wide rollout.</div>
+
+  <div class="kv"><b>What changes for users:</b> a single, consistent command vocabulary; old command names either keep
+  working quietly or tell you exactly where they moved; every write is <code>set</code> and every skip-the-prompt is
+  <code>--force</code>; the agent is named per command instead of remembered; six new command groups; and a chat that
+  reports failure honestly.</div>
+
+  <div class="kv"><b>What must not change (and didn't):</b> a customer's existing v0.3.0 scripts don't silently
+  misbehave — verified command-by-command against the old binary. Destructive commands still refuse a blank or
+  ambiguous target (they name the candidates instead of guessing), and still confirm before acting unless
+  <code>--force</code> is given. On-disk sessions, credentials, and config are read correctly after the upgrade and
+  left byte-for-byte unchanged.</div>
+
+  <div class="kv"><b>Watch this:</b> two things to fix before a wide rollout — an odd streaming frame can crash
+  <code>chat</code> mid-reply (finding&nbsp;1), and a failed chat turn corrupts the local session history so the message
+  re-sends next turn (finding&nbsp;2). Close behind: <code>integrations show</code> crashes on an integration with no
+  recent syncs (finding&nbsp;3), and disabling an action with a blank name deletes the only action (finding&nbsp;4).</div>
+
+  <div class="row">
+    <span class="chip ok">646 unit tests green</span>
+    <span class="chip ok">back-compat: 0 silent/destructive (live) ✓</span>
+    <span class="chip ok">destructive rewrite blocked ✓</span>
+    <span class="chip ok">sessions/config preserved on upgrade ✓</span>
+    <span class="chip bad">flagship chat crashes on odd frame</span>
+    <span class="chip warn">stream failure corrupts local history</span>
+    <span class="chip warn">2 integrations-actions matcher gaps</span>
+  </div>
+  <div class="legend">Evidence grades:
+    <span class="ev live">LIVE</span> watched it run (real binary / real socket / real v0.3.0 binary) ·
+    <span class="ev test">TEST</span> a unit test exercised it ·
+    <span class="ev read">READ</span> traced in code only ·
+    <span class="ev no">NOT RUN</span> couldn't reach it</div>
+</div>
+
+<!-- ================= FOOTPRINT ================= -->
+<details>
+<summary>🗺️ Footprint — the whole CLI, reworked (v0.3.0 → v0.4.1)</summary>
+<div class="body">
+<p>This is not a patch — it's the CLI's command surface rebuilt: ~10,800 lines added and ~1,650 removed across three
+files, ~90 commits. Most of it landed and was verified incrementally as it went; this pass re-checks the whole thing as
+one upgrade against the last customer release. There is no version-number edit anywhere — the release is the git tag
+<code>v0.4.1</code> at this commit.</p>
+<pre class="tree">eesel-cli/  (git diff v0.3.0..a1fa55d — ~10.8k added / ~1.6k removed, 3 files)
+├── <b>eesel</b>          (most of the change)   the CLI itself — every command group reworked:
+│                        · agents        list / show / create / set / remove + the "name the agent per command" model
+│                        ·                and the `eesel agents &lt;id&gt; &lt;verb&gt;` path grammar; `use`/`unset` removed
+│                        · files          renamed from documents; add / remove / acl are new; `document` kept as alias
+│                        · automations    triggers + schedules regrouped here; top-level names now redirect
+│                        · integrations   connect / remove / sync + `actions` (the old `tools`); per-agent vs workspace scope
+│                        · skills mcp settings workspace billing tasks — new or reworked groups
+│                        · chat/sessions  honest failures, honest exit codes, agent named per command (no saved agent)
+│                        · auth           logs in with Auth0 in production, and mints a separate "workspace token"
+│                        ·                for the few endpoints the normal login token can't be used with
+├── <b>test_eesel.py</b>  (grew a lot)       the suite grew to 646 tests, all green under Python 3.14
+└── <b>README.md</b>      (rewritten)        rewritten to the new command surface (a few stale spots — see findings)
+</pre>
+<p>Shape: one coherent system, not a pile of patches (the conventions lens confirmed this). A single set of shared
+helpers is reused everywhere — the "did you mean" suggestion handler, the alias-hiding helper, one config parser, one
+strict target resolver, one confirm-or-<code>--force</code> gate. The one special case — the
+<code>eesel agents &lt;id&gt; &lt;verb&gt;</code> syntax — reuses the same command code as everything else instead of
+branching into its own. The defects below are gaps in that surface, not a wrong-shaped architecture.</p>
+</div>
+</details>
+
+<!-- ================= AC ================= -->
+<details open>
+<summary>✅ Acceptance criteria — by command area (all live unless noted)</summary>
+<div class="body">
+<p style="color:var(--mut);font-size:13px">Because the "change" is the whole CLI, the acceptance criteria are
+"each command area does what it should, and the upgrade from v0.3.0 is honest." Each row is one area's verdict; the
+defects that sit inside a passing area are called out in the panel below and linked by number.</p>
+<table>
+<tr><th>Area</th><th>Evidence</th><th>Result</th></tr>
+<tr><td><b>agents + the per-command agent model</b> — list/show/create/set/remove; the <code>agents &lt;id&gt; &lt;verb&gt;</code> path grammar; explicit agent required; <code>use</code>/<code>unset</code> removed and intercepted before the grammar</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-ok">PASS.</span> All verbs resolve; a scoped command with no agent errors cleanly (never silently picks one); empty agent scope rejected before routing. <em>Note:</em> there is no verb to toggle an agent on/off after creation (finding 12).</td></tr>
+<tr><td><b>files</b> (renamed from documents) — list/show/add/remove + ACL; <code>document</code> alias; <code>documents</code> redirect</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-ok">PASS.</span> Rename works, <code>document</code> alias works, <code>documents</code> redirects (exit 2). Remove is strictly non-destructive (exact match only). One gap: a blank ACL prefix isn't refused client-side (finding 9).</td></tr>
+<tr><td><b>automations</b> — triggers + schedules regrouped; <code>schedules add</code> requires <code>--prompt</code>; top-level <code>triggers</code>/<code>schedules</code> redirect</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-ok">PASS.</span> Structure resolves; removed verbs fail cleanly; an old cron-listing <code>triggers</code> user is pointed at the <em>right</em> home (<code>automations schedules</code>) — the hint names both. Ambiguous remove refused.</td></tr>
+<tr><td><b>integrations + actions</b> (the old <code>tools</code>) — connect/remove/sync; per-agent revoke vs workspace uninstall</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-warn">PASS with defects.</span> Rename enforced, <code>tools</code> alias works, per-agent vs workspace scope is real and guarded. But two matcher gaps in <code>actions</code> (findings 4, 5) and a crash on empty sync history (finding 3).</td></tr>
+<tr><td><b>skills · mcp · settings · tasks · workspace · billing</b> (mostly new since v0.3.0)</td>
+    <td><span class="ev live">LIVE</span> <span class="ev test">TEST</span></td>
+    <td><span class="v-ok">PASS.</span> Structure/exit codes right; <code>skills set</code> merges (doesn't replace); <code>tasks analytics</code> uses the correct token; <code>billing</code> is read-only (can't mutate). Odd server bodies can crash some read commands (finding 6).</td></tr>
+<tr><td><b>chat · sessions · new · cost</b> — honest failures, honest exit codes, agent per command</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-warn">PASS with defects.</span> Non-JSON 200, server error, plaintext/TLS drops, timeout all fail cleanly; exit codes honest; saved-active-agent model correctly dropped. But an odd streaming frame crashes chat (finding 1) and a failed turn corrupts local history (finding 2).</td></tr>
+<tr><td><b>Back-compat</b> — every changed/removed v0.3.0 command is safe on the new binary</td>
+    <td><span class="ev live">LIVE</span></td>
+    <td><span class="v-ok">PASS.</span> Command-by-command table below: every old command → works via alias, or fails loud. Zero silent/destructive. Sessions/config/creds preserved.</td></tr>
+<tr><td><b>auth</b> — Auth0 tokens in prod; minted workspace token for HS256 endpoints; <code>login --dev</code></td>
+    <td><span class="ev read">READ</span> <span class="ev test">TEST</span> <span class="ev no">NOT RUN</span></td>
+    <td><span class="v-ok">PASS (partial).</span> Token minting/exchange verified by code + tests; the browser prod login and the dev-Postgres login flow couldn't run here (no browser, dev stack down).</td></tr>
+<tr><td><b>A genuinely successful chat turn end-to-end</b></td>
+    <td><span class="ev no">NOT RUN</span></td>
+    <td>Carried forward. Dev stack billing-capped, no prod browser login. The failure paths were exercised live; the success path is reached in the socket runs right up to the injected failure.</td></tr>
+</table>
+</div>
+</details>
+
+<!-- ================= BACK-COMPAT TABLE ================= -->
+<details open>
+<summary>🔐 Back-compat — every old v0.3.0 command, run against the new binary (the headline for an upgrade)</summary>
+<div class="body">
+<p style="color:var(--mut);font-size:13px">The safety lens enumerated the v0.3.0 command surface from the old binary
+and ran each changed/removed invocation against v0.4.1 in a clean home. Verdict key: <b>alias</b> = still works quietly ·
+<b>loud</b> = fails with a helpful pointer and a non-zero exit · <b>silent/wrong</b> = does nothing or the wrong thing
+(a defect — none found).</p>
+<table>
+<tr><th>Old v0.3.0 command</th><th>On the v0.4.1 binary</th><th>Verdict</th></tr>
+<tr><td><code>document …</code> / <code>document read &lt;id&gt;</code></td><td>Hidden alias resolves and runs</td><td class="v-ok">alias</td></tr>
+<tr><td><code>tools …</code></td><td>Hidden alias → <code>integrations … actions</code>, runs</td><td class="v-ok">alias</td></tr>
+<tr><td><code>instructions [agent]</code></td><td>Hidden alias → <code>agents &lt;id&gt; show --instructions</code>, runs</td><td class="v-ok">alias</td></tr>
+<tr><td><code>sessions delete &lt;id&gt;</code></td><td>Hidden alias of <code>sessions remove</code>, runs</td><td class="v-ok">alias</td></tr>
+<tr><td><code>documents …</code> (plural)</td><td>Loud relocation hint → <code>files</code>, exit 2</td><td class="v-ok">loud</td></tr>
+<tr><td>top-level <code>triggers …</code> / <code>schedules …</code></td><td>Loud relocation hint → <code>automations …</code>, exit 2</td><td class="v-ok">loud</td></tr>
+<tr><td><code>agents use &lt;id&gt;</code> / <code>agents unset</code></td><td>Loud "it's gone — scope per command", exit 2</td><td class="v-ok">loud</td></tr>
+<tr><td><code>agents use remove zendesk</code> <span style="color:var(--amb)">(the dangerous-rewrite case)</span></td><td><code>use</code> rejected exit 2 <em>before</em> any rewrite — never becomes <code>integrations remove</code></td><td class="v-ok">loud ✓ defended</td></tr>
+<tr><td><code>agents "$UNSET" remove zendesk</code> (empty agent)</td><td>Loud "empty agent in path", exit 2 — never a workspace-wide uninstall</td><td class="v-ok">loud ✓ defended</td></tr>
+<tr><td><code>integrations add</code> / <code>disconnect</code></td><td>Loud "invalid choice" + suggestion, exit 2</td><td class="v-ok">loud</td></tr>
+<tr><td><code>--yes</code> on a destructive command</td><td>the arg parser rejects it, exit 2 — confirmation <em>not</em> silently bypassed, nothing destroyed</td><td class="v-ok">loud</td></tr>
+<tr><td>on-disk sessions / credentials / config from v0.3.0</td><td>Read correctly after upgrade; files left byte-for-byte unchanged</td><td class="v-ok">preserved</td></tr>
+</table>
+<p style="color:var(--grn);font-size:13px;margin:8px 0 0"><b>Zero silent/destructive outcomes.</b> The one suggestion
+that points the wrong way (<code>integrations disconnect</code> → "did you mean connect?" instead of "remove") is a UX
+nit, not a safety issue — it still exits 2 and does nothing (finding 11).</p>
+</div>
+</details>
+
+<!-- ================= PANEL ================= -->
+<details open>
+<summary>🔍 Panel findings — a ranked fix-list (none catastrophic; nothing silently loses data or mass-deletes)</summary>
+<div class="body">
+<p style="color:var(--mut);font-size:13px">Nine independent reviews, each in its own clean context, examining one area
+or concern apiece. Findings survived a skeptical second look; pure style and anything the test suite already catches were
+dropped. Numbered for reference. Everything here is a defect present in the <em>shipped</em> surface — it does not change
+the "upgrade is safe" verdict above, but it is a real backlog. Tags: <span class="tag fix">FIX</span> = should be fixed ·
+<span class="tag dec">DECIDE</span> = a call for a human · <span class="tag low">KNOW</span> = worth being aware of ·
+<span class="tag low">DOCS</span> = a documentation correction.</p>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 1 · An odd streaming frame crashes <code>chat</code> mid-reply <span class="ev live">LIVE</span></h4>
+<div class="meta">the stream reader, <code>stream_reply</code> · introduced-area: the chat-resilience rewrite touched this code · confidence: high</div>
+Chat is the flagship command. While a reply is streaming, if the server sends one malformed frame — a text piece that
+is empty/null instead of a string, or a data line that isn't an object — the CLI crashes with a raw Python traceback
+mid-answer. The resilience work hardened the <em>connection-drop</em> and <em>error-event</em> cases but left each
+individual frame's decoding unguarded. Confirmed end-to-end against a local socket: a good start, then one null text
+piece, then a traceback escapes. Streaming backends realistically emit empty or odd frames, so this is the top thing to
+harden.
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 2 · A failed chat turn corrupts local history and re-sends the message next time <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>send_message</code> · worsened by the overhaul · confidence: high</div>
+When a turn starts successfully but the reply then fails (a server error, or a dropped stream), the CLI saves the
+session with the user's message but no answer. Only one narrower failure path (the request to start the turn being
+rejected) rolls the message back. Because every turn re-sends the whole local conversation, the next message re-sends
+that un-answered one. Confirmed live: after a failed turn the session holds a lone user message and <code>sessions show</code>
+renders two user turns in a row. This is <em>worse</em> than v0.3.0, which crashed before saving anything — so the new
+honest-failure handling introduced a persistence bug alongside the fix. Whether the re-send double-runs depends on the
+backend, but the local history is already visibly wrong.
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 3 · <code>integrations show</code> crashes on an integration with no recent syncs <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>_fetch_sync_runs</code> → <code>_latest_sync_run</code> · new in the overhaul · confidence: high</div>
+Showing an integration always looks up its latest sync run. The one sync-runs fetcher is missing the "treat an empty
+body as an empty list" guard that its siblings have, so an empty or null response makes the code iterate over
+<code>None</code> and crash. A freshly-connected integration that hasn't synced yet is exactly this shape — so
+<code>integrations show</code> on a new integration tracebacks.
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 4 · Disabling an action with a blank name deletes the only action <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>_resolve_action_key</code> · new in the overhaul · destructive-ish · confidence: high</div>
+The matcher that finds which action to enable/disable is the one matcher missing the "refuse a blank target" guard that
+every other resolver in the CLI has. A blank name matches everything, so on an integration with a single configured
+action it resolves as "unique" and deletes it — and <code>--force</code> skips the confirmation. Confirmed live: an
+empty-quotes disable removed the sole action. This is the same empty-variable class the reshaper and every other matcher
+defend against; this one spot was missed.
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 5 · Action enable/disable picks an arbitrary instance when a type has several <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>_resolve_integration_id</code> · new in the overhaul · confidence: high</div>
+When you have more than one integration of the same type, the resolver used by <code>actions enable/disable</code>
+returns the first match instead of refusing the ambiguity and listing candidates — unlike every strict resolver used by
+the destructive commands. So the action gets toggled on the wrong instance. Needs two instances of one type to trigger,
+which is why it slipped, but the fix is to route it through the same strict resolver the rest of the CLI uses.
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 6 · Odd or dropped server responses crash many commands with a raw traceback <span class="ev live">LIVE</span></h4>
+<div class="meta">the shared HTTP helper <code>http_request</code>; several render functions · root-cause cluster · confidence: high</div>
+Two related gaps, both live-confirmed. (a) The shared request helper assumes every 200 body is a JSON object; a 200 that
+is valid JSON but a different shape (a bare value or list) makes many read commands — billing, workspace, settings, mcp
+list, tasks, files acl — traceback instead of erroring cleanly. (b) The shared helper catches only the "HTTP error"
+and "unreachable" exception families; a connection <em>dropped mid-request</em> (a load-balancer reset, a backend
+restart) is a different family and escapes as a traceback on <em>every non-chat network command</em>. Notably the chat
+path was hardened for exactly this drop case — but that hardening wasn't carried back to the shared helper the rest of
+the CLI uses, and the overhaul multiplied how many commands route through it. One catch clause on the shared helper
+closes most of this class (including findings 1 and 3, which are the same "odd response → crash" shape in other spots).
+</div>
+
+<div class="f fix">
+<h4><span class="tag fix">FIX</span> 7 · <code>chat --task &lt;id&gt;</code> ignores the requested agent <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>find_session_by_task</code> · new inconsistency · confidence: high</div>
+The agent-match fix — reuse a session only if it belongs to the requested agent — was added to the normal
+session-picking path but not to the path that resumes a session by task id. So <code>chat --task X --agent B</code>
+talks to whatever agent that task's session was bound to, not B. Same bug the overhaul set out to fix, left in one code
+path.
+</div>
+
+<div class="f low">
+<h4><span class="tag low">KNOW</span> 8 · <code>tasks analytics</code> can crash after printing half the report <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>render_task_analytics</code> · new in the overhaul · confidence: high</div>
+The analytics renderer assumes two of its sections arrive as keyed objects; if the server sends them as lists (a natural
+shape for a distribution) the command prints the first couple of lines and then tracebacks. Same "odd server shape →
+crash" family as finding 6.
+</div>
+
+<div class="f dec">
+<h4><span class="tag dec">DECIDE</span> 9 · A blank knowledge access-control (ACL) prefix isn't refused before it's sent <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>files acl set</code> · confidence: medium (server behaviour unverified)</div>
+<code>files acl set &lt;agent&gt; --prefix ""</code> returns success and sends an empty prefix to the server. An empty
+string is a prefix of every document key, so if the server stores it the agent gets access to everything — the exact
+over-grant this command is supposed to prevent. The CLI guards blank targets everywhere else but not here. The command
+does read back and print the server's stored state, so the user isn't misled — but whether the empty prefix is
+neutralised depends on server-side normalisation we couldn't test (no live stack). Add the same blank guard the rest of
+the CLI has, and/or confirm the server drops it.
+</div>
+
+<div class="f low">
+<h4><span class="tag low">KNOW</span> 10 · Two chat stream residuals — both fail-closed or pre-existing <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>stream_reply</code> · carried over · confidence: high</div>
+(a) A reply that streams completely and is then followed by a late error event is discarded and the turn marked failed —
+safe direction (the answer was shown; only persistence/exit treat it as failed), a byproduct of the new honesty gate.
+(b) A stream that closes cleanly partway through, with no completion marker, still returns its partial text as a success —
+pre-existing, and indistinguishable from a real clean close because there's no end-of-stream marker the CLI checks. Both
+hinge on the backend's stream contract; neither blocks the upgrade.
+</div>
+
+<div class="f low">
+<h4><span class="tag low">DOCS</span> 11 · Documentation and hints that contradict the shipped surface <span class="ev live">LIVE</span> <span class="ev read">READ</span></h4>
+<div class="meta">README + several docstrings + one test name · independently raised by three lenses · confidence: high</div>
+Truth-in-documentation gaps — safe, but a reader is misled: the README quick-start's very first example
+(<code>eesel agents instructions &lt;id&gt;</code>) is a <em>broken</em> command (it's read as an agent name and errors);
+the README's files section teaches a hidden alias (<code>read</code>) as the primary verb and never mentions the
+canonical <code>show</code>; three integrations docstrings still call the removed <code>add</code>/<code>disconnect</code>
+verbs "hidden aliases" when they're gone; a renamed-verb error suggests the wrong replacement
+(<code>disconnect</code> → "connect" instead of "remove"); one test's name asserts the opposite of what it checks; and
+<code>actions list --json</code> prints secrets that <code>actions show --json</code> redacts (matches v0.3.0, worth
+aligning).
+</div>
+
+<div class="f dec">
+<h4><span class="tag dec">DECIDE</span> 12 · There's no way to turn an agent on or off after creating it <span class="ev live">LIVE</span></h4>
+<div class="meta"><code>agents</code> verbs are list/show/create/set/remove · product gap · confidence: high</div>
+The agents group has no enable/disable verb, and <code>set</code> doesn't expose the active flag — so once an agent is
+created there's no CLI way to toggle its on/off state. Internally consistent (nothing claims otherwise), but a customer
+reading release notes might expect it. A product decision, not a bug.
+</div>
+
+<h4 style="margin-top:20px;color:var(--mut);font-size:13px">Safety — every lens checked</h4>
+<table>
+<tr><th>Lens</th><th>Verdict</th></tr>
+<tr><td>Resilience</td><td><span class="ev live">LIVE</span> Chat's own failure handling is solid and its catch is correctly narrow (it won't swallow a Ctrl-C or a real code bug). The gap is that the <em>shared</em> HTTP helper every other command uses wasn't given the same drop-handling, so non-chat commands still traceback on a mid-request disconnect (finding 6).</td></tr>
+<tr><td>Operational load</td><td><span class="ev read">READ</span> No runaway loops or write fan-out. One amplifier: the <code>automations</code> list/show/fire/remove commands make one request per agent (uncapped) — linear, fine for small workspaces, a multiplier on agent-heavy ones.</td></tr>
+<tr><td>Cost</td><td><span class="ev read">READ</span> New billable surfaces vs v0.3.0: an integration sync/connect, adding a file (indexing), a task export. No client-side auto-retry, so no automatic double-billing; the only re-bill edge is a user manually re-running after a chat drop that already billed. Impersonation (a staff-only feature for running commands as another user) has its write-safety enforced on the server, not by the CLI — worth confirming that contract holds.</td></tr>
+<tr><td>Customer impact / back-compat</td><td><span class="ev live">LIVE</span> The strongest result here — see the back-compat table. Zero silent/destructive outcomes across every changed/removed command; the two dangerous reshape cases are provably defended; sessions/config/creds preserved.</td></tr>
+</table>
+</div>
+</details>
+
+<!-- ================= NEEDS HUMAN ================= -->
+<details open>
+<summary>🙋 Needs a human / to decide</summary>
+<div class="body">
+<p style="color:var(--mut);font-size:13px">The upgrade is safe to ship. These are the fixes and calls to make; the
+first two are the ones worth clearing before a wide rollout:</p>
+<ul>
+<li><b>[ ] Fix the chat crash + the history corruption (findings 1 &amp; 2).</b> Guard each streaming frame's decode so
+one odd frame can't traceback the flagship command; and roll back (or otherwise reconcile) the un-answered user message
+when a turn fails, so the next turn doesn't re-send it. Pass = a malformed frame and a failed turn both leave chat
+clean and the local history correct.</li>
+<li><b>[ ] Harden the shared HTTP helper (findings 3, 6, 8).</b> One catch clause for dropped connections plus an
+"empty body → empty" guard closes the whole "odd/absent server response → traceback" class across billing, workspace,
+settings, mcp, tasks, files acl, integrations show, and tasks analytics. Pass = these commands report a clean error and
+non-zero exit on a dropped connection and a wrong-shape body.</li>
+<li><b>[ ] Add the missing target guards in <code>integrations actions</code> (findings 4 &amp; 5).</b> Refuse a blank
+action name, and refuse an ambiguous integration type instead of picking the first — route both through the strict
+resolver the rest of the CLI already uses. Pass = a blank disable and a multi-instance type both refuse and list
+candidates, deleting nothing.</li>
+<li><b>[ ] Apply the agent filter to <code>chat --task</code> (finding 7)</b> so resuming by task id honours the
+requested agent, matching the fix already in the normal path.</li>
+<li><b>[ ] Confirm the ACL empty-prefix behaviour (finding 9)</b> — add the client-side blank guard and/or confirm the
+server neutralises an empty prefix, so an agent can't be granted match-everything access.</li>
+<li><b>[ ] Fix the misleading docs (finding 11)</b> — the broken README quick-start example, the hidden-verb-as-primary
+sections, the stale "alias" docstrings, and the <code>actions list --json</code> secret leak.</li>
+<li><b>[ ] Decide on the agent on/off verb (finding 12)</b> and the two chat stream residuals (finding 10) against the
+backend's stream contract.</li>
+<li><b>[ ] (carried forward) A real successful chat turn</b> — blocked here by the billing-capped dev stack and no prod
+browser login. Untouched by this work; a standing item.</li>
+</ul>
+</div>
+</details>
+
+<div class="sub" style="margin-top:20px">
+Verified by running the real <code>eesel</code> binary for every command path (these run entirely locally — no login or
+network needed), by driving the CLI's real request and stream-reading code against real local test servers (a non-JSON
+200, an event stream carrying an error, a stream cut off mid-reply over plaintext and encrypted connections, a read
+timeout, malformed frames, empty/odd response bodies, dropped connections), and by diffing behaviour against the actual
+v0.3.0 binary command-by-command. Read-only network commands were also exercised against production where safe. The CLI
+carries no version string in code, so there is no version field to check — the release is the git tag <code>v0.4.1</code>
+at commit <code>a1fa55d</code>. The one unrun item — a genuinely successful chat turn — is a path this work doesn't
+change.
+</div>
+
+</div>
+</body>
+</html>
