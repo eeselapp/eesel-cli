@@ -3376,6 +3376,43 @@ def _actions_disable(args, creds: dict) -> int:
     return 0
 
 
+def fetch_current_workspace(creds: dict) -> dict:
+    """`GET /workspaces` — the workspace the current login resolves to, as a
+    single row (`workspaceId`, `workspaceName`, `workspaceOwnerUserId`, …).
+
+    Distinct from `fetch_workspace`, which fetches a *named* workspace by id
+    (`/workspaces/{id}`). This unindexed route resolves the workspace from the
+    token's identity, so under an active impersonation it returns the *target*
+    user's workspace — which is how we learn which one to pin after a swap,
+    without knowing its id up front.
+    """
+    return http_request("GET", f"{creds['api_url']}/workspaces", token=creds["token"])
+
+
+def resync_impersonated_workspace(creds: dict) -> str | None:
+    """Drop the stored workspace and re-pin it from `GET /workspaces`.
+
+    The stored `workspace_id` belongs to whoever we were acting as *before* an
+    impersonation change, so it's stale the instant the target flips (this is
+    the bug that made impersonated commands hit the wrong workspace). We clear
+    it first — and persist that — so a mid-flight failure leaves no
+    wrong-but-plausible id behind, then pin the workspace the now re-scoped
+    login resolves to. Returns the new id, or None if the response carried no
+    workspace (workspace left unset, with a warning).
+    """
+    creds.pop("workspace_id", None)
+    save_creds(creds)
+
+    workspace_id = fetch_current_workspace(creds).get("workspaceId")
+    if not workspace_id:
+        warn("No workspace visible for this login — workspace context left unset.")
+        return None
+
+    creds["workspace_id"] = workspace_id
+    save_creds(creds)
+    return workspace_id
+
+
 def cmd_impersonate(args) -> int:
     """`eesel impersonate <user_id>` and `eesel impersonate clear`.
 
@@ -3419,6 +3456,11 @@ def cmd_impersonate(args) -> int:
             creds["workspace_id"] = creds.pop("impersonator_workspace_id")
             save_creds(creds)
         ok("Impersonation cleared.")
+        # The workspace was pinned to the impersonated target; now that we're
+        # back to our own login, re-pin it (clears the stale one either way).
+        ws = resync_impersonated_workspace(creds)
+        if ws:
+            info(f"Workspace reset to {ws}.")
         return 0
 
     # GET-with-side-effect, matching the /sysadmin/* convention. The target
