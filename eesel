@@ -1780,9 +1780,10 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     hiccup.
 
     `allowed` is whether the caller may impersonate. `target_user_id` is the
-    *active* target or None: the endpoint reports the effective user as
-    `target_uid` even when idle, so a target counts as active only when an
-    impersonator origin is present (i.e. a swap actually happened).
+    *active* target or None. The endpoint always echoes the effective user as
+    `target_uid`, so when idle it equals `impersonator_uid` (the caller's own
+    id). A swap is active only when `target_uid` names someone *other* than the
+    caller; otherwise there is no impersonation to report.
     """
     try:
         req = urllib.request.Request(
@@ -1795,7 +1796,13 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     except Exception:
         return None
     allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
-    target = data.get("target_uid") if data.get("impersonator_uid") else None
+    impersonator_uid = data.get("impersonator_uid")
+    target_uid = data.get("target_uid")
+    # Active only when an impersonator origin is present *and* points at someone
+    # other than the caller. Two idle shapes both resolve to None: no origin at
+    # all (`impersonator_uid` absent), and an origin that echoes the caller
+    # (`target_uid == impersonator_uid`, what the endpoint returns after a clear).
+    target = target_uid if (impersonator_uid and target_uid and target_uid != impersonator_uid) else None
     return {"allowed": allowed, "target_user_id": target}
 
 
@@ -3405,6 +3412,12 @@ def cmd_impersonate(args) -> int:
                 payload = {}
             err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
             return 1
+        # Restore the impersonator's own workspace that `impersonate <id>` pinned
+        # aside (see below). Without this the caller keeps talking to the target's
+        # workspace after clearing, and their own agent commands would then 401.
+        if creds.get("impersonator_workspace_id"):
+            creds["workspace_id"] = creds.pop("impersonator_workspace_id")
+            save_creds(creds)
         ok("Impersonation cleared.")
         return 0
 
@@ -3424,6 +3437,29 @@ def cmd_impersonate(args) -> int:
         return 1
 
     ok(f"Impersonating: {resp.get('target') or target}")
+
+    # The server now runs every request from this login as the target user. The
+    # impersonator's own `workspace_id` (captured at login) belongs to the
+    # impersonator, not the target — so calls that pass it, like
+    # `/agents?workspace_id=…`, 401 because the target can't access it. Pin the
+    # target's workspace instead: `/workspaces` reports it now that the swap is
+    # already active, and we stash the impersonator's own workspace so
+    # `impersonate clear` can put it back.
+    status_code, ws = http_request_allow_error("GET", f"{creds['api_url']}/workspaces", token=creds["token"])
+    target_ws = (ws.get("workspaceId") or ws.get("workspace_id")) if status_code == 200 else None
+    if target_ws and target_ws != creds.get("workspace_id"):
+        # setdefault so re-impersonating a different target without clearing in
+        # between keeps the original (impersonator) workspace as the restore point.
+        creds.setdefault("impersonator_workspace_id", creds.get("workspace_id"))
+        creds["workspace_id"] = target_ws
+        # A cached workspace token is scoped to the old workspace; drop it so the
+        # next chat/tasks turn mints one for the target's workspace.
+        creds.pop("_workspace_token", None)
+        save_creds(creds)
+    elif not target_ws:
+        warn("Could not resolve the target's workspace; agent commands may 401. "
+             "Re-run `eesel impersonate` once the target is active, or check the target id.")
+
     info("All subsequent `eesel` commands run as this user.")
     info("Run `eesel whoami` to confirm. Clear with `eesel impersonate clear`.")
     return 0

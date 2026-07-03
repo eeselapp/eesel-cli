@@ -4119,6 +4119,17 @@ class TestImpersonateStatus:
         )
         assert out == {"allowed": True, "target_user_id": None}
 
+    def test_origin_echoing_caller_reports_no_target(self, tmp_config, monkeypatch):
+        # After a clear the endpoint still reports an origin, but it points at
+        # the caller themselves (target_uid == impersonator_uid). That is idle,
+        # not an active swap, so no target should be reported.
+        out = self._status(
+            monkeypatch,
+            {"is_impersonator": True, "is_sysadmin": True,
+             "impersonator_uid": "self-1", "target_uid": "self-1"},
+        )
+        assert out == {"allowed": True, "target_user_id": None}
+
     def test_sysadmin_flag_alone_grants_allowed(self, tmp_config, monkeypatch):
         out = self._status(
             monkeypatch,
@@ -4154,7 +4165,12 @@ class TestImpersonateCommand:
             seen.update(method=method, url=url)
             return {"message": "Impersonation target set", "target": "victim-9"}
 
+        # Setting a target resolves the target's workspace from /workspaces.
         monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **kw: (200, {"workspaceId": "ws-target"}),
+        )
         args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
         rc = args.func(args)
         assert rc == 0
@@ -4163,6 +4179,41 @@ class TestImpersonateCommand:
         assert "target=victim-9" in seen["url"]
         # ok()/info() write to stderr.
         assert "Impersonating: victim-9" in capsys.readouterr().err
+
+    def test_set_pins_target_workspace_and_stashes_own(self, tmp_config, monkeypatch):
+        # Under impersonation every request runs as the target, so the caller's
+        # own workspace_id would 401. Setting a target must pin the target's
+        # workspace and keep the caller's own as the restore point.
+        eesel.save_creds(self._creds())
+        monkeypatch.setattr(
+            eesel, "http_request",
+            lambda *a, **kw: {"target": "victim-9"},
+        )
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **kw: (200, {"workspaceId": "ws-target"}),
+        )
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
+        assert args.func(args) == 0
+        creds = eesel.load_creds()
+        assert creds["workspace_id"] == "ws-target"
+        assert creds["impersonator_workspace_id"] == "ws-1"
+
+    def test_set_warns_when_target_workspace_unresolved(self, tmp_config, monkeypatch, capsys):
+        # If /workspaces can't be read, the workspace is left as-is and the user
+        # is warned rather than silently pinning a wrong/absent workspace.
+        eesel.save_creds(self._creds())
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **kw: {"target": "victim-9"})
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **kw: (500, {"error": "boom"}),
+        )
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
+        assert args.func(args) == 0
+        creds = eesel.load_creds()
+        assert creds["workspace_id"] == "ws-1"
+        assert "impersonator_workspace_id" not in creds
+        assert "workspace" in capsys.readouterr().err.lower()
 
     def test_clear_hits_clear_endpoint(self, tmp_config, monkeypatch, capsys):
         eesel.save_creds(self._creds())
@@ -4179,6 +4230,20 @@ class TestImpersonateCommand:
         assert seen["method"] == "GET"
         assert seen["url"].endswith("/sysadmin/clear-impersonator-target")
         assert "cleared" in capsys.readouterr().err.lower()
+
+    def test_clear_restores_stashed_workspace(self, tmp_config, monkeypatch):
+        # Clearing puts the caller's own workspace back, so their own commands
+        # stop talking to the (now former) target's workspace.
+        creds = self._creds()
+        creds["workspace_id"] = "ws-target"
+        creds["impersonator_workspace_id"] = "ws-own"
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **kw: {"message": "cleared"})
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "clear"])
+        assert args.func(args) == 0
+        restored = eesel.load_creds()
+        assert restored["workspace_id"] == "ws-own"
+        assert "impersonator_workspace_id" not in restored
 
 
 class TestIntegrationsCommand:
