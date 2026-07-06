@@ -384,19 +384,23 @@ def linked_worktree(tmp_path, monkeypatch):
     return root
 
 
-def _stub_dev_session(monkeypatch, session_resp=DEV_SESSION_RESP, agents=None):
-    """Route both HTTP calls a linked command makes: POST /dev/session mints the
-    token; GET /agents is the command itself. Returns the recorded calls."""
+def _stub_dev_session(monkeypatch, session_resp=DEV_SESSION_RESP, session_status=200, agents=None):
+    """Route the two HTTP calls a linked command makes: POST /dev/session (via
+    `http_request_allow_error`, so it can react to status) mints the token; GET
+    /agents (via `http_request`) is the command itself. Returns recorded calls."""
     calls = []
+
+    def fake_allow(method, url, *, token=None, body=None, timeout=60):
+        calls.append({"method": method, "url": url, "token": token, "body": body})
+        return session_status, session_resp
 
     def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
         calls.append({"method": method, "url": url, "token": token, "body": body})
-        if url.endswith("/dev/session"):
-            return session_resp
         if "/agents" in url:
             return {"agents": agents or []}
         return {}
 
+    monkeypatch.setattr(eesel, "http_request_allow_error", fake_allow)
     monkeypatch.setattr(eesel, "http_request", fake)
     return calls
 
@@ -485,12 +489,26 @@ class TestResolveDevBaseUrl:
         assert eesel.resolve_dev_base_url() == "https://other.preprod.eesel.xyz"
 
     def test_reads_file_walking_up_and_strips_slash(self, tmp_path, monkeypatch):
+        # The config lives at the worktree root; a deep subdir still finds it.
         monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        (tmp_path / ".git").mkdir()
         (tmp_path / "eesel.dev.json").write_text(json.dumps({"base_url": PREPROD_URL + "/"}))
         deep = tmp_path / "a" / "b"
         deep.mkdir(parents=True)
         monkeypatch.chdir(deep)
         assert eesel.resolve_dev_base_url() == PREPROD_URL
+
+    def test_ignores_stray_config_above_worktree_root(self, tmp_path, monkeypatch):
+        # A forgotten eesel.dev.json above the repo (e.g. in $HOME) must NOT
+        # hijack commands inside an unrelated repo below it.
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        (tmp_path / "eesel.dev.json").write_text(json.dumps({"base_url": PREPROD_URL}))
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        sub = repo / "src"
+        sub.mkdir()
+        monkeypatch.chdir(sub)
+        assert eesel.resolve_dev_base_url() is None
 
     def test_errors_on_missing_base_url(self, tmp_path, monkeypatch, capsys):
         monkeypatch.delenv("EESEL_BASE_URL", raising=False)
@@ -499,12 +517,21 @@ class TestResolveDevBaseUrl:
         with pytest.raises(SystemExit):
             eesel.resolve_dev_base_url()
 
+    def test_errors_on_non_string_base_url(self, tmp_path, monkeypatch):
+        # A hand-edited non-string base_url gives a clean error, not a traceback.
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "eesel.dev.json").write_text(json.dumps({"base_url": 123}))
+        with pytest.raises(SystemExit):
+            eesel.resolve_dev_base_url()
+
 
 class TestDevSessionCreds:
     def test_refuses_non_preprod_before_any_network(self, monkeypatch):
-        # AC#6: hard-refuse a non-preprod host with NO network call.
+        # AC#6: hard-refuse a non-preprod host with NO network call (neither helper).
         called = []
         monkeypatch.setattr(eesel, "http_request", lambda *a, **k: called.append(1) or {})
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: called.append(1) or (200, {}))
         with pytest.raises(SystemExit):
             eesel.dev_session_creds("https://oracle.eesel.app")
         assert called == []
@@ -517,6 +544,7 @@ class TestDevSessionCreds:
         assert creds["token"] == "branch-jwt-xyz"
         assert creds["env"] == "preprod"
         assert creds["agent_id"] is None
+        assert creds["ephemeral"] is True  # marked so save_creds refuses to persist it
         assert calls[0]["method"] == "POST"
         assert calls[0]["url"] == PREPROD_URL + "/dev/session"
 
@@ -524,6 +552,13 @@ class TestDevSessionCreds:
         _stub_dev_session(monkeypatch, session_resp={"workspace_id": "ws-1"})
         with pytest.raises(SystemExit):
             eesel.dev_session_creds(PREPROD_URL)
+
+    def test_errors_on_non_200(self, monkeypatch, capsys):
+        # A torn-down / non-dev env 404s on /dev/session — clean actionable error.
+        _stub_dev_session(monkeypatch, session_status=404, session_resp={"error": "not found"})
+        with pytest.raises(SystemExit):
+            eesel.dev_session_creds(PREPROD_URL)
+        assert "404" in capsys.readouterr().err
 
 
 class TestCmdLink:
@@ -638,13 +673,11 @@ class TestLinkedCommandContract:
         monkeypatch.delenv("EESEL_BASE_URL", raising=False)
         monkeypatch.delenv("EESEL_AGENT", raising=False)
 
-        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
-            if url.endswith("/dev/session"):
-                slug = url.split("//", 1)[1].split(".", 1)[0]
-                return {"workspace_id": f"ws-{slug}", "user_id": "u", "auth_token": f"tok-{slug}"}
-            return {}
+        def fake_allow(method, url, *, token=None, body=None, timeout=60):
+            slug = url.split("//", 1)[1].split(".", 1)[0]
+            return 200, {"workspace_id": f"ws-{slug}", "user_id": "u", "auth_token": f"tok-{slug}"}
 
-        monkeypatch.setattr(eesel, "http_request", fake)
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_allow)
         monkeypatch.chdir(tmp_path / "alpha")
         a = eesel.require_creds()
         monkeypatch.chdir(tmp_path / "bravo")
@@ -676,6 +709,45 @@ class TestWhoamiLinked:
         args = eesel.build_parser(staff=False).parse_args(["whoami"])
         assert args.func(args) == 0
         assert "http://localhost:8080" in capsys.readouterr().out
+
+
+class TestEphemeralCreds:
+    def test_save_creds_refuses_ephemeral(self, tmp_config):
+        eesel.save_creds({"env": "preprod", "token": "x", "ephemeral": True})
+        assert not eesel.CREDS_FILE.exists()  # never written to disk
+
+    def test_linked_worktree_does_not_clobber_real_login(
+        self, tmp_config, fake_creds, linked_worktree, monkeypatch
+    ):
+        # A real login is on disk; inside a linked worktree, minted creds flow
+        # through require_creds and any downstream save (e.g. impersonate's
+        # resync) must NOT overwrite the stored login.
+        _stub_dev_session(monkeypatch)
+        minted = eesel.require_creds()
+        assert minted.get("ephemeral") is True
+        eesel.save_creds(minted)  # the impersonate-resync path, on branch creds
+        assert eesel.load_creds()["token"] == "test-jwt-token"  # real login intact
+        assert eesel.load_creds()["api_url"] == "http://localhost:8080"
+
+
+class TestHttpTimeoutHandling:
+    def test_http_request_exits_clean_on_timeout(self, monkeypatch):
+        def boom(req, timeout=None):
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "https://x.preprod.eesel.xyz/dev/logs")
+        assert "timed out" in str(exc.value)  # clean message, not a traceback
+
+    def test_allow_error_exits_clean_on_timeout(self, monkeypatch):
+        def boom(req, timeout=None):
+            raise socket.timeout("timed out")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request_allow_error("POST", "https://x.preprod.eesel.xyz/dev/session")
+        assert "timed out" in str(exc.value)
 
 
 class TestRefreshProdToken:
