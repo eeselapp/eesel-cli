@@ -356,6 +356,328 @@ class _FakeResp:
         return json.dumps(self._data).encode()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Per-worktree branch-env link (`eesel link`, ENG-5002)
+# ──────────────────────────────────────────────────────────────────────────
+
+PREPROD_URL = "https://my-slug.preprod.eesel.xyz"
+# The exact shape server/app/api/dev_session.py returns (contract under test).
+DEV_SESSION_RESP = {
+    "workspace_id": "ws-branch-abc",
+    "user_id": "auth0|preview-dev-user",
+    "auth_token": "branch-jwt-xyz",
+}
+
+
+@pytest.fixture
+def linked_worktree(tmp_path, monkeypatch):
+    """A git worktree linked to a branch env, with cwd in a deep subdir — so
+    tests exercise the walk-up discovery from where an agent actually runs."""
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    (root / "eesel.dev.json").write_text(json.dumps({"base_url": PREPROD_URL}))
+    deep = root / "server" / "app" / "api"
+    deep.mkdir(parents=True)
+    monkeypatch.chdir(deep)
+    monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+    monkeypatch.delenv("EESEL_AGENT", raising=False)
+    return root
+
+
+def _stub_dev_session(monkeypatch, session_resp=DEV_SESSION_RESP, agents=None):
+    """Route both HTTP calls a linked command makes: POST /dev/session mints the
+    token; GET /agents is the command itself. Returns the recorded calls."""
+    calls = []
+
+    def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+        calls.append({"method": method, "url": url, "token": token, "body": body})
+        if url.endswith("/dev/session"):
+            return session_resp
+        if "/agents" in url:
+            return {"agents": agents or []}
+        return {}
+
+    monkeypatch.setattr(eesel, "http_request", fake)
+    return calls
+
+
+class TestIsPreprodUrl:
+    def test_accepts_branch_env(self):
+        assert eesel.is_preprod_url("https://foo.preprod.eesel.xyz")
+        assert eesel.is_preprod_url("https://a-b-c.preprod.eesel.xyz/")
+
+    def test_rejects_prod_and_dev(self):
+        assert not eesel.is_preprod_url("https://oracle.eesel.app")
+        assert not eesel.is_preprod_url("https://dashboard.eesel.ai")
+        assert not eesel.is_preprod_url("http://localhost:8080")
+
+    def test_rejects_http_scheme(self):
+        # branch envs are https; a plaintext preprod host is still refused.
+        assert not eesel.is_preprod_url("http://foo.preprod.eesel.xyz")
+
+    def test_rejects_lookalike_hosts(self):
+        # a real dot must precede the suffix, and it must be the trailing host.
+        assert not eesel.is_preprod_url("https://preprod.eesel.xyz")
+        assert not eesel.is_preprod_url("https://evil-preprod.eesel.xyz")
+        assert not eesel.is_preprod_url("https://foo.preprod.eesel.xyz.evil.com")
+
+    def test_rejects_no_scheme(self):
+        assert not eesel.is_preprod_url("oracle.eesel.app")
+        assert not eesel.is_preprod_url("foo.preprod.eesel.xyz")
+
+
+class TestWalkUpFind:
+    def test_finds_in_current_dir(self, tmp_path):
+        (tmp_path / "eesel.dev.json").write_text("{}")
+        assert eesel.walk_up_find("eesel.dev.json", tmp_path) == tmp_path.resolve()
+
+    def test_finds_by_walking_up_from_deep_subdir(self, tmp_path):
+        (tmp_path / "eesel.dev.json").write_text("{}")
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        assert eesel.walk_up_find("eesel.dev.json", deep) == tmp_path.resolve()
+
+    def test_returns_none_when_absent(self, tmp_path):
+        deep = tmp_path / "a" / "b"
+        deep.mkdir(parents=True)
+        assert eesel.walk_up_find("eesel.dev.json", deep) is None
+
+    def test_finds_git_dir(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        deep = tmp_path / "x"
+        deep.mkdir()
+        assert eesel.walk_up_find(".git", deep) == tmp_path.resolve()
+
+
+class TestAddToGitignore:
+    def test_creates_when_missing(self, tmp_path):
+        eesel.add_to_gitignore(tmp_path, "eesel.dev.json")
+        assert (tmp_path / ".gitignore").read_text() == "eesel.dev.json\n"
+
+    def test_appends_newline_when_file_lacks_trailing(self, tmp_path):
+        gi = tmp_path / ".gitignore"
+        gi.write_text("node_modules")  # no trailing newline
+        eesel.add_to_gitignore(tmp_path, "eesel.dev.json")
+        assert gi.read_text() == "node_modules\neesel.dev.json\n"
+
+    def test_preserves_existing_and_appends(self, tmp_path):
+        gi = tmp_path / ".gitignore"
+        gi.write_text("node_modules\n__pycache__/\n")
+        eesel.add_to_gitignore(tmp_path, "eesel.dev.json")
+        assert gi.read_text() == "node_modules\n__pycache__/\neesel.dev.json\n"
+
+    def test_idempotent(self, tmp_path):
+        eesel.add_to_gitignore(tmp_path, "eesel.dev.json")
+        eesel.add_to_gitignore(tmp_path, "eesel.dev.json")
+        assert (tmp_path / ".gitignore").read_text().count("eesel.dev.json") == 1
+
+
+class TestResolveDevBaseUrl:
+    def test_none_when_no_link_and_no_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.chdir(tmp_path)
+        assert eesel.resolve_dev_base_url() is None
+
+    def test_env_var_wins_over_file(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "eesel.dev.json").write_text(json.dumps({"base_url": PREPROD_URL}))
+        monkeypatch.setenv("EESEL_BASE_URL", "https://other.preprod.eesel.xyz/")
+        assert eesel.resolve_dev_base_url() == "https://other.preprod.eesel.xyz"
+
+    def test_reads_file_walking_up_and_strips_slash(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        (tmp_path / "eesel.dev.json").write_text(json.dumps({"base_url": PREPROD_URL + "/"}))
+        deep = tmp_path / "a" / "b"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+        assert eesel.resolve_dev_base_url() == PREPROD_URL
+
+    def test_errors_on_missing_base_url(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "eesel.dev.json").write_text(json.dumps({"nope": 1}))
+        with pytest.raises(SystemExit):
+            eesel.resolve_dev_base_url()
+
+
+class TestDevSessionCreds:
+    def test_refuses_non_preprod_before_any_network(self, monkeypatch):
+        # AC#6: hard-refuse a non-preprod host with NO network call.
+        called = []
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: called.append(1) or {})
+        with pytest.raises(SystemExit):
+            eesel.dev_session_creds("https://oracle.eesel.app")
+        assert called == []
+
+    def test_mints_creds_from_dev_session(self, monkeypatch):
+        calls = _stub_dev_session(monkeypatch)
+        creds = eesel.dev_session_creds(PREPROD_URL)
+        assert creds["api_url"] == PREPROD_URL
+        assert creds["workspace_id"] == "ws-branch-abc"
+        assert creds["token"] == "branch-jwt-xyz"
+        assert creds["env"] == "preprod"
+        assert creds["agent_id"] is None
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == PREPROD_URL + "/dev/session"
+
+    def test_errors_when_response_missing_token(self, monkeypatch):
+        _stub_dev_session(monkeypatch, session_resp={"workspace_id": "ws-1"})
+        with pytest.raises(SystemExit):
+            eesel.dev_session_creds(PREPROD_URL)
+
+
+class TestCmdLink:
+    def _link(self, url):
+        args = eesel.build_parser(staff=False).parse_args(["link", url])
+        return args.func(args)
+
+    def test_writes_url_only_config_and_gitignores_it(self, tmp_path, monkeypatch):
+        # AC#1: writes eesel.dev.json = exactly {"base_url": ...}, and gitignores it.
+        (tmp_path / ".git").mkdir()
+        monkeypatch.chdir(tmp_path)
+        assert self._link(PREPROD_URL) == 0
+        data = json.loads((tmp_path / "eesel.dev.json").read_text())
+        assert data == {"base_url": PREPROD_URL}  # URL only — no token, no workspace id
+        assert "eesel.dev.json" in (tmp_path / ".gitignore").read_text().splitlines()
+
+    def test_strips_trailing_slash(self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        monkeypatch.chdir(tmp_path)
+        self._link(PREPROD_URL + "/")
+        assert json.loads((tmp_path / "eesel.dev.json").read_text())["base_url"] == PREPROD_URL
+
+    def test_writes_at_worktree_root_from_subdir(self, tmp_path, monkeypatch):
+        # AC#4 (write side): run from a deep subdir, config lands at the .git root.
+        (tmp_path / ".git").mkdir()
+        deep = tmp_path / "a" / "b"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+        self._link(PREPROD_URL)
+        assert (tmp_path / "eesel.dev.json").exists()
+        assert not (deep / "eesel.dev.json").exists()
+
+    def test_refuses_non_preprod(self, tmp_path, monkeypatch, capsys):
+        # AC#6 (link side): won't even write a config for a non-branch host.
+        monkeypatch.chdir(tmp_path)
+        assert self._link("https://oracle.eesel.app") == 1
+        assert not (tmp_path / "eesel.dev.json").exists()
+
+    def test_falls_back_to_cwd_outside_git(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)  # no .git under tmp
+        self._link(PREPROD_URL)
+        assert (tmp_path / "eesel.dev.json").exists()
+
+
+class TestRequireCredsBranchOverride:
+    def test_linked_worktree_mints_without_login_and_stores_nothing(
+        self, tmp_config, linked_worktree, monkeypatch
+    ):
+        # The core promise: no credentials.json on disk, yet a linked worktree
+        # resolves creds by minting from /dev/session — and stores nothing.
+        _stub_dev_session(monkeypatch)
+        assert eesel.load_creds() is None  # genuinely not logged in
+        creds = eesel.require_creds()
+        assert creds["api_url"] == PREPROD_URL
+        assert creds["workspace_id"] == "ws-branch-abc"
+        assert creds["token"] == "branch-jwt-xyz"
+        assert not eesel.CREDS_FILE.exists()  # nothing written to disk
+
+    def test_env_var_override(self, tmp_config, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.setenv("EESEL_BASE_URL", "https://envwin.preprod.eesel.xyz")
+        calls = _stub_dev_session(monkeypatch)
+        creds = eesel.require_creds()
+        assert creds["api_url"] == "https://envwin.preprod.eesel.xyz"
+        assert calls[0]["url"].endswith("/dev/session")
+
+    def test_no_link_falls_through_to_stored_login(
+        self, tmp_config, fake_creds, tmp_path, monkeypatch
+    ):
+        # AC#5 must-not-change: no eesel.dev.json + no EESEL_BASE_URL → the stored
+        # login is used exactly as before, with no /dev/session mint.
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+        monkeypatch.chdir(tmp_path)
+        called = []
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: called.append(a) or {})
+        creds = eesel.require_creds()
+        assert creds["api_url"] == "http://localhost:8080"  # the stored dev login
+        assert creds["token"] == "test-jwt-token"
+        assert called == []  # no network mint happened
+
+
+class TestLinkedCommandContract:
+    def test_agents_list_hits_branch_env_with_minted_token(
+        self, tmp_config, linked_worktree, monkeypatch, capsys
+    ):
+        # AC#2: after linking, a read command hits the branch env — the request
+        # carries that env's workspace id and the token minted from /dev/session.
+        calls = _stub_dev_session(
+            monkeypatch,
+            agents=[{"agent_id": "branch-agent-1", "name": "Branch Bot", "is_active": True}],
+        )
+        args = eesel.build_parser(staff=False).parse_args(["agents", "list"])
+        assert args.func(args) == 0
+        mint = next(c for c in calls if c["url"].endswith("/dev/session"))
+        fetch = next(c for c in calls if "/agents" in c["url"])
+        assert mint["method"] == "POST"
+        assert fetch["url"].startswith(PREPROD_URL + "/agents")
+        assert "workspace_id=ws-branch-abc" in fetch["url"]
+        assert fetch["token"] == "branch-jwt-xyz"
+        assert "Branch Bot" in capsys.readouterr().out
+
+    def test_two_worktrees_hit_their_own_envs(self, tmp_config, tmp_path, monkeypatch):
+        # AC#3: two worktrees linked to two slugs each resolve to their own env
+        # from their own directory — nothing global shared between them.
+        for slug in ("alpha", "bravo"):
+            root = tmp_path / slug
+            (root / ".git").mkdir(parents=True)
+            url = f"https://{slug}.preprod.eesel.xyz"
+            (root / "eesel.dev.json").write_text(json.dumps({"base_url": url}))
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+        def fake(method, url, *, token=None, body=None, timeout=60, headers=None):
+            if url.endswith("/dev/session"):
+                slug = url.split("//", 1)[1].split(".", 1)[0]
+                return {"workspace_id": f"ws-{slug}", "user_id": "u", "auth_token": f"tok-{slug}"}
+            return {}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        monkeypatch.chdir(tmp_path / "alpha")
+        a = eesel.require_creds()
+        monkeypatch.chdir(tmp_path / "bravo")
+        b = eesel.require_creds()
+        assert (a["api_url"], a["workspace_id"], a["token"]) == (
+            "https://alpha.preprod.eesel.xyz", "ws-alpha", "tok-alpha")
+        assert (b["api_url"], b["workspace_id"], b["token"]) == (
+            "https://bravo.preprod.eesel.xyz", "ws-bravo", "tok-bravo")
+
+
+class TestWhoamiLinked:
+    def test_whoami_reports_linked_env(self, tmp_config, linked_worktree, monkeypatch, capsys):
+        _stub_dev_session(monkeypatch)
+        args = eesel.build_parser(staff=False).parse_args(["whoami"])
+        assert args.func(args) == 0
+        out = capsys.readouterr().out
+        assert "preprod" in out
+        assert PREPROD_URL in out
+        assert "ws-branch-abc" in out
+        assert "eesel.dev.json" in out  # shows the link source
+
+    def test_whoami_unlinked_shows_stored_login(
+        self, tmp_config, fake_creds, tmp_path, monkeypatch, capsys
+    ):
+        # AC#5: no link → whoami reports the stored login as before.
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda creds: None)
+        args = eesel.build_parser(staff=False).parse_args(["whoami"])
+        assert args.func(args) == 0
+        assert "http://localhost:8080" in capsys.readouterr().out
+
+
 class TestRefreshProdToken:
     def _creds(self, **over):
         creds = {

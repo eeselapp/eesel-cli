@@ -105,6 +105,17 @@ CREDS_FILE = CONFIG_DIR / "credentials.json"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 CURRENT_FILE = CONFIG_DIR / "current.json"
 
+# Per-worktree branch-env link (`eesel link`). A gitignored file at the worktree
+# root holds only the branch env's URL; the token is minted fresh per run from
+# that env's `/dev/session`, so nothing secret is ever stored. Discovered by
+# walking up from cwd like git finds `.git`, so N worktrees hold N independent
+# targets with no shared global login to race over.
+WORKTREE_CONFIG_NAME = "eesel.dev.json"
+# Branch envs only. `/dev/session` mints a full-access workspace token with no
+# auth, so the CLI refuses to hit it against any host that isn't a preprod
+# branch env — a fast local guard on top of the server's own env gate.
+PREPROD_HOST_SUFFIX = ".preprod.eesel.xyz"
+
 # Mirrors server/app/auth/dev_secrets.py — only used in --dev mode.
 DEV_JWT_SECRET = "dev-fallback-secret-key-not-for-production"
 POSTGRES_CONTAINER = "slack-postgres_db_dev-1"
@@ -326,6 +337,103 @@ def save_creds(creds: dict) -> None:
         pass
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Per-worktree branch-env link (`eesel link`)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def walk_up_find(name: str, start: Path | None = None) -> Path | None:
+    """Walk up from `start` (default cwd) looking for a file or dir named `name`,
+    like git finds `.git`. Return the directory that contains it, or None."""
+    here = (start or Path.cwd()).resolve()
+    for d in (here, *here.parents):
+        if (d / name).exists():
+            return d
+    return None
+
+
+def is_preprod_url(url: str) -> bool:
+    """True only for `https://<slug>.preprod.eesel.xyz` — a branch env, never
+    prod/dev. Uses the parsed hostname so a port or `user@` can't smuggle a
+    different host past the check."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    host = parsed.hostname or ""
+    return parsed.scheme == "https" and host.endswith(PREPROD_HOST_SUFFIX)
+
+
+def resolve_dev_base_url() -> str | None:
+    """The branch-env target for commands run here, if any. `EESEL_BASE_URL`
+    wins (one-off scripts); otherwise the nearest `eesel.dev.json` walking up
+    from cwd (the per-worktree `eesel link`). None → no override, so normal
+    prod/dev login applies unchanged."""
+    env_url = os.environ.get("EESEL_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    root = walk_up_find(WORKTREE_CONFIG_NAME)
+    if not root:
+        return None
+    path = root / WORKTREE_CONFIG_NAME
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        err(f"Could not read {path}: {e}")
+        sys.exit(1)
+    url = data.get("base_url")
+    if not url:
+        err(f'{path} has no "base_url" — re-run `eesel link <url>`.')
+        sys.exit(1)
+    return url.rstrip("/")
+
+
+def dev_session_creds(base_url: str) -> dict:
+    """Mint throwaway credentials for a branch env from its `/dev/session`.
+
+    Nothing is stored: the URL is the only durable state (in `eesel.dev.json`),
+    and the token is minted fresh on every command. Hard-refuses any host that
+    isn't a preprod branch env *before any network call*, so it can never be
+    pointed at prod or a local dev stack. Returns the creds shape every command
+    reads (api_url, workspace_id, token, …), so downstream code works unchanged."""
+    if not is_preprod_url(base_url):
+        err(
+            f"Refusing to mint a dev token for {base_url!r} — only "
+            f"https://<slug>{PREPROD_HOST_SUFFIX} branch envs are allowed."
+        )
+        sys.exit(1)
+    resp = http_request("POST", f"{base_url}/dev/session")
+    workspace_id = resp.get("workspace_id")
+    token = resp.get("auth_token")
+    if not workspace_id or not token:
+        err(
+            f"{base_url}/dev/session did not return a workspace token "
+            f"(is this env in development mode? got keys: {sorted(resp)})."
+        )
+        sys.exit(1)
+    return {
+        "env": "preprod",
+        "api_url": base_url,
+        "dashboard_url": base_url,
+        "workspace_id": workspace_id,
+        "agent_id": None,
+        "token": token,
+        # Minted fresh per run, so there's no expiry to manage or refresh.
+        "expires_at": 0,
+    }
+
+
+def add_to_gitignore(root: Path, entry: str) -> None:
+    """Ensure `entry` is in `root/.gitignore`, so a per-worktree dev config is
+    never committed. Idempotent; appends without disturbing existing lines."""
+    gi = root / ".gitignore"
+    existing = gi.read_text() if gi.exists() else ""
+    if entry in existing.splitlines():
+        return
+    prefix = "" if existing == "" or existing.endswith("\n") else "\n"
+    gi.write_text(existing + prefix + entry + "\n")
+
+
 def refresh_prod_token(creds: dict) -> dict | None:
     """Exchange the stored Auth0 refresh token for a fresh access token.
 
@@ -437,6 +545,14 @@ def require_creds_scoped(args) -> dict:
 
 
 def require_creds() -> dict:
+    # A worktree linked to a branch env (or an `EESEL_BASE_URL` override) mints a
+    # throwaway token from that env's `/dev/session` per run. This reads nothing
+    # from ~/.config, so a linked worktree needs no `eesel login` at all — and
+    # five worktrees each target their own env with nothing global to race over.
+    base_url = resolve_dev_base_url()
+    if base_url:
+        return apply_agent_env_override(dev_session_creds(base_url))
+
     creds = load_creds()
     if not creds:
         err("Not logged in. Run `eesel login` first.")
@@ -1764,6 +1880,20 @@ def cmd_logout(args) -> int:
 
 
 def cmd_whoami(args) -> int:
+    # A linked worktree overrides the stored login, so report what commands here
+    # actually hit — not the stale global login. Minting also confirms the env is
+    # reachable and surfaces its workspace id, the way to check a link worked.
+    base_url = resolve_dev_base_url()
+    if base_url:
+        creds = dev_session_creds(base_url)
+        src = "EESEL_BASE_URL" if os.environ.get("EESEL_BASE_URL") else WORKTREE_CONFIG_NAME
+        print(f"env          : {creds['env']} (linked via {src})")
+        print(f"api_url      : {creds['api_url']}")
+        print(f"workspace_id : {creds['workspace_id']}")
+        print("agent        : scoped per command (`agents <id> …`, --agent, or EESEL_AGENT)")
+        print("token        : minted fresh per run from /dev/session (nothing stored)")
+        return 0
+
     creds = load_creds()
     if not creds:
         info("Not logged in.")
@@ -1798,6 +1928,27 @@ def cmd_whoami(args) -> int:
             else:
                 print("impersonator : yes (no target set)")
 
+    return 0
+
+
+def cmd_link(args) -> int:
+    url = args.url.rstrip("/")
+    if not is_preprod_url(url):
+        err(
+            f"Refusing to link {url!r} — only https://<slug>{PREPROD_HOST_SUFFIX} "
+            "branch envs can be linked."
+        )
+        return 1
+    # Anchor the config at the worktree root (walk up to `.git`) so a subdirectory
+    # command still finds it — falling back to cwd outside a git repo.
+    root = walk_up_find(".git") or Path.cwd()
+    path = root / WORKTREE_CONFIG_NAME
+    path.write_text(json.dumps({"base_url": url}) + "\n")
+    add_to_gitignore(root, WORKTREE_CONFIG_NAME)
+    ok(f"Linked this worktree → {url}")
+    info(f"  wrote {path} (gitignored)")
+    info("  every eesel command here now targets that branch env; the token is minted")
+    info("  fresh per run from /dev/session — nothing is stored. Unlink: delete that file.")
     return 0
 
 
@@ -5664,6 +5815,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("whoami", help="Show the current login")
     sp.set_defaults(func=cmd_whoami)
+
+    sp = sub.add_parser(
+        "link",
+        help="Point this worktree at a branch (preprod) env — no login, no token on disk",
+        description="Write a gitignored eesel.dev.json at the worktree root so every "
+                    "eesel command here targets the given branch env. The token is minted "
+                    "fresh per run from the env's /dev/session; nothing secret is stored. "
+                    "Unlink by deleting eesel.dev.json.",
+    )
+    sp.add_argument("url", help="Branch env base URL, e.g. https://<slug>.preprod.eesel.xyz")
+    sp.set_defaults(func=cmd_link)
 
     sp = sub.add_parser(
         "agents",

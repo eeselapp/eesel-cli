@@ -274,6 +274,32 @@ ever fails (e.g. the token was revoked), re-run `eesel login`.
 token, not the Auth0 token. Mint one with `eesel mcp token` and pass it as the
 `Authorization: Bearer` header — see the MCP setup guide.
 
+## Branch envs — `eesel link`
+
+Point one git worktree at its own branch deploy so every command there targets
+that env — no browser login, no token on disk:
+
+```bash
+eesel link https://<slug>.preprod.eesel.xyz   # run once, at the worktree root
+eesel agents list                             # now hits that branch env
+eesel whoami                                   # shows the linked env + its workspace id
+```
+
+`link` writes a gitignored `eesel.dev.json` (just `{"base_url": "..."}`) at the
+worktree root. Every command walks up from the current directory to find it —
+like `git` finds `.git` — and mints a throwaway token from that env's
+`/dev/session` on each run, so nothing secret is ever stored. Different
+worktrees hold different targets, so N agents can each drive their own env at
+once with nothing global to race over.
+
+- Only `*.preprod.eesel.xyz` hosts are allowed; the CLI refuses anything else
+  before making a network call, so it can't be pointed at prod.
+- `EESEL_BASE_URL=https://<slug>.preprod.eesel.xyz` does the same for a one-off
+  command, and wins over the file.
+- With no `eesel.dev.json` and no `EESEL_BASE_URL`, everything behaves exactly
+  as a normal `eesel login` / `--dev`.
+- Unlink by deleting `eesel.dev.json`.
+
 ## Local state
 
 ```
