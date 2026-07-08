@@ -1796,7 +1796,7 @@ def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) 
         "tool_calls": result["tool_calls"],
     }
     if result["error"]:
-        envelope["error"] = "chat stream failed mid-reply"
+        envelope["error"] = result.get("error_text") or "chat stream failed mid-reply"
     return envelope
 
 
@@ -1831,12 +1831,16 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
     tool_calls: dict[str, dict] = {}
     tool_order: list[str] = []
     saw_error = False
+    # The failure reason, surfaced into the --json envelope's `error` field so an
+    # agent parsing only stdout learns *why* a turn failed (not just that it did).
+    error_text: "str | None" = None
 
     def _result() -> dict:
         return {
             "text": "".join(text_buffers[tid] for tid in text_order).strip(),
             "tool_calls": [tool_calls[cid] for cid in tool_order],
             "error": saw_error,
+            "error_text": error_text,
         }
 
     try:
@@ -1897,11 +1901,14 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
                         print(_color(f"[tool] → {preview}", "2;37"), flush=True)
                 elif etype == "error":
                     saw_error = True
+                    error_text = evt.get("errorText") or "chat stream reported an error"
                     print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
-        err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
+        detail = e.read().decode(errors="replace")
+        err(f"raw-stream → {e.code}: {detail}")
         # error=True signals failure so the caller can exit non-zero (see send_message).
         saw_error = True
+        error_text = f"raw-stream → {e.code}: {detail}"
         return _result()
     except (http.client.IncompleteRead, ConnectionError, TimeoutError, socket.timeout, ssl.SSLError) as e:
         # ssl.SSLError (incl. SSLEOFError) covers an encrypted connection torn
@@ -1909,6 +1916,7 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
         # which is neither a ConnectionError nor a URLError.
         err(f"\nchat stream dropped mid-reply (server/connection?): {e}")
         saw_error = True
+        error_text = f"chat stream dropped mid-reply: {e}"
         return _result()
     except urllib.error.URLError as e:
         # Server unreachable mid-stream — exit cleanly like the shared http_*

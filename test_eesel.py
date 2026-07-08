@@ -7493,7 +7493,9 @@ class TestChatJson:
         env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
         assert env["status"] == "error"
         assert env["task_id"] == "task-xyz"
-        assert "error" in env
+        # The specific server reason is threaded into the envelope so an agent
+        # parsing only stdout learns *why* it failed, not just that it did.
+        assert env["error"] == "turn failed"
 
     def test_prestream_http_error_gives_error_envelope(self, fake_creds, monkeypatch):
         import io
