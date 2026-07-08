@@ -3169,8 +3169,9 @@ class TestTriggersAllRemoved:
 
 class TestChatConnectionFailure:
     """A server that isn't reachable at all (connection refused / DNS / timeout)
-    must give the same clean one-line "server reachable?" exit the shared http_*
-    helpers give — not a raw connection-error traceback."""
+    must fail honestly — a clean "server reachable?" error envelope (status
+    "error", the reason in `error`) and no raw connection-error traceback — so
+    `eesel chat --json` always emits one parseable object on any failure."""
 
     def _sess(self):
         return {
@@ -3181,23 +3182,23 @@ class TestChatConnectionFailure:
             "messages": [],
         }
 
-    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_sandbox_start_unreachable_gives_error_envelope(self, fake_creds, monkeypatch):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        with pytest.raises(SystemExit) as excinfo:
-            eesel.send_message(fake_creds, self._sess(), "hello")
-        assert "server reachable?" in str(excinfo.value.code)
+        env = eesel.send_message(fake_creds, self._sess(), "hello")
+        assert env["status"] == "error"
+        assert "server reachable?" in env["error"]
 
-    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_stream_unreachable_flags_error(self, fake_creds, monkeypatch):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        with pytest.raises(SystemExit) as excinfo:
-            eesel.stream_reply(fake_creds, "task1", None)
-        assert "server reachable?" in str(excinfo.value.code)
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
+        assert "server reachable?" in result["error_text"]
 
     class _StreamResp:
         def __init__(self, exc):
@@ -7327,16 +7328,14 @@ class TestChatHonestExit:
         def __exit__(self, *a):
             return False
 
-    def test_send_message_non_json_200_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_send_message_non_json_200_gives_error_envelope(self, fake_creds, monkeypatch):
         html = b"<html><body>login</body></html>"
         monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._RawResp(html))
 
-        with pytest.raises(SystemExit) as exc:
-            eesel.send_message(fake_creds, self._sess(), "hi")
-
-        msg = str(exc.value)
-        assert "not JSON" in msg
-        assert "JSONDecodeError" not in msg
+        env = eesel.send_message(fake_creds, self._sess(), "hi")
+        assert env["status"] == "error"
+        assert "not JSON" in env["error"]
+        assert "JSONDecodeError" not in env["error"]  # no raw traceback leaked
 
     class _SseResp:
         def __init__(self, lines):
@@ -7496,6 +7495,22 @@ class TestChatJson:
         # The specific server reason is threaded into the envelope so an agent
         # parsing only stdout learns *why* it failed, not just that it did.
         assert env["error"] == "turn failed"
+
+    def test_midstream_unreachable_gives_error_envelope(self, fake_creds, monkeypatch):
+        # A server that vanishes mid-stream (URLError on the raw-stream GET) must
+        # still yield one parseable error envelope, not a bare exit with empty
+        # stdout — the sandbox/start POST succeeds, then the stream dies.
+        def _open(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if url.endswith("/agents/sandbox/start"):
+                return _FakeResp({"taskId": "task-xyz", "streamUrl": None})
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", _open)
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert env["task_id"] == "task-xyz"
+        assert "server reachable?" in env["error"]
 
     def test_prestream_http_error_gives_error_envelope(self, fake_creds, monkeypatch):
         import io

@@ -1699,9 +1699,10 @@ def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) 
     ``render`` (True by default) streams the reply + tool activity live to stdout
     for a human behind an ``eesel →`` prefix; the human path ignores the return
     beyond ``status``. ``render=False`` (the ``--json`` path) leaves stdout
-    untouched so the caller can emit the envelope as the sole JSON object. Server
-    unreachable (no HTTP response) still exits cleanly via ``sys.exit`` rather
-    than returning.
+    untouched so the caller can emit the envelope as the sole JSON object. Every
+    failure — server unreachable, rejected turn, mid-stream drop — returns an
+    error envelope (``status`` "error", the reason in ``error``); it never raises
+    or ``sys.exit``s, so ``--json`` always emits one parseable object.
     """
     # Empty user messages are how trigger-preview sessions auto-fire (kicked off
     # by `eesel new --trigger X` with no user typing yet). The backend filters
@@ -1736,6 +1737,19 @@ def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) 
         },
         method="POST",
     )
+
+    def _fail(reason: str) -> dict:
+        # A pre-stream failure (couldn't start the turn): roll back the just-
+        # appended user message (it never reached the model), save, log to
+        # stderr, and return an error envelope. Both paths fail honestly — the
+        # human exits non-zero off `status`, the --json caller gets one parseable
+        # object — instead of a traceback or a silent empty stdout.
+        if message:
+            sess["messages"].pop()
+        save_session(sess)
+        err(reason)
+        return {"task_id": sess.get("task_id"), "status": "error", "reply": "", "tool_calls": [], "error": reason}
+
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             raw = resp.read()
@@ -1743,34 +1757,16 @@ def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) 
                 start_resp = json.loads(raw)
             except json.JSONDecodeError:
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
-                    f"POST {url} → {resp.status} but the response was not JSON "
+                return _fail(
+                    f"sandbox/start → {resp.status} but the response was not JSON "
                     f"({len(raw)} bytes; a proxy or login page?): {snippet}"
                 )
     except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        err(f"sandbox/start → {e.code}: {body_text}")
-        # Only roll back if we actually appended (i.e. non-empty user message).
-        if message:
-            sess["messages"].pop()
-        save_session(sess)
-        # A rejected turn is an error envelope: the human path exits non-zero off
-        # status; the --json path gets a parseable object + non-zero exit rather
-        # than a silent empty stdout.
-        return {
-            "task_id": sess.get("task_id"),
-            "status": "error",
-            "reply": "",
-            "tool_calls": [],
-            "error": f"sandbox/start → {e.code}: {body_text}",
-        }
+        return _fail(f"sandbox/start → {e.code}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
-        # The server isn't reachable at all (connection refused, DNS failure,
-        # timeout) — no HTTP response to surface. Exit cleanly like the shared
-        # http_* helpers rather than letting the connection error traceback
-        # escape. The user message was only appended in memory, so the on-disk
-        # session is left untouched by exiting before save_session.
-        sys.exit(f"POST {url} failed (server reachable?): {e}")
+        # Server unreachable (connection refused / DNS / timeout) — no HTTP
+        # response to surface, but still a clean error envelope, not a traceback.
+        return _fail(f"sandbox/start failed (server reachable?): {e}")
 
     task_id = start_resp.get("taskId", sess["task_id"])
     sess["task_id"] = task_id
@@ -1919,9 +1915,12 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
         error_text = f"chat stream dropped mid-reply: {e}"
         return _result()
     except urllib.error.URLError as e:
-        # Server unreachable mid-stream — exit cleanly like the shared http_*
-        # helpers instead of leaking the connection error traceback.
-        sys.exit(f"GET {url} failed (server reachable?): {e}")
+        # Server unreachable mid-stream — a failed turn like the branches above,
+        # so the caller can exit non-zero and (in --json) emit an error envelope.
+        err(f"\nchat stream dropped mid-reply (server reachable?): {e}")
+        saw_error = True
+        error_text = f"chat stream dropped mid-reply (server reachable?): {e}"
+        return _result()
 
     return _result()
 
