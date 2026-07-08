@@ -7625,10 +7625,20 @@ class TestNewAgentScope:
         monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "trig-1", "agent_id": "sched-agent", "config": {"title": "hb"}})
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("new --schedule must not persist the active agent"))
         monkeypatch.setattr(eesel, "new_session", lambda creds, **k: (created.update(k) or {"id": "sess-1", "name": "sess-1", "trigger_id": k.get("trigger_id"), "trigger_title": k.get("trigger_title")}))
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "ok", "task_id": "t1", "tool_calls": []})
         rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
         assert rc == 0
         assert created["agent_id"] == "sched-agent"  # session pinned to the trigger's agent, in memory only
+
+    def test_new_schedule_exits_nonzero_when_preview_fire_fails(self, fake_creds, monkeypatch):
+        # The auto-fire preview turn failing must surface as a non-zero exit, not
+        # a silent 0 — a script chaining on `eesel new --trigger X` should stop.
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "trig-1", "agent_id": "sched-agent", "config": {"title": "hb"}})
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "name": "sess-1", "trigger_id": k.get("trigger_id"), "trigger_title": k.get("trigger_title")})
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "error", "reply": "", "task_id": "t1", "tool_calls": [], "error": "boom"})
+        rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
+        assert rc == 1
 
 
 class TestPathScopeResolver:
