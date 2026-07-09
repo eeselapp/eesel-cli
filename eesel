@@ -3521,12 +3521,13 @@ def cmd_impersonate(args) -> int:
 
     Sets (or clears) a sticky impersonation target on the server. From the
     moment you set a target, every subsequent `eesel` command behaves as if
-    that user were calling — auth, workspace, agents, integrations. The CLI
-    resolves the target's workspace on demand (`_apply_effective_workspace`),
-    so workspace-scoped commands don't 401 against a workspace the impersonated
-    user can't see, and it self-corrects once the target is cleared or expires.
-    Calls the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target`
-    and `/sysadmin/clear-impersonator-target`).
+    that user were calling — auth, workspace, agents, integrations. On each of
+    those later commands the pre-dispatch guard resolves the target's workspace
+    and points the CLI at it, so workspace-scoped commands don't 401 against a
+    workspace the impersonated user can't see; once the target is cleared or
+    expires, the guard stops arming and commands run as yourself again. Calls
+    the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target` and
+    `/sysadmin/clear-impersonator-target`).
 
     Combine with `eesel chat --trigger heartbeat` to preview a target's
     heartbeat, or just `eesel chat` to run a general chat as them. WRITE
