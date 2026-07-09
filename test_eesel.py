@@ -78,14 +78,6 @@ def fake_creds(tmp_config):
 
 
 @pytest.fixture(autouse=True)
-def _offline_effective_workspace(monkeypatch):
-    # require_creds()/whoami resolve the impersonated workspace via a network
-    # call; mark it already-resolved so unit tests stay offline by default.
-    # Tests that exercise the resolution reset this and stub the resolver.
-    monkeypatch.setattr(eesel, "_effective_ws_resolved", True, raising=False)
-
-
-@pytest.fixture(autouse=True)
 def _reset_impersonation_target():
     # The guard sets the _impersonation_target module global directly (not via
     # monkeypatch), so force it clear around every test to stop the backstop
@@ -3007,8 +2999,10 @@ class TestImpersonatorFlagCaching:
             "refresh_token": "rt",
             "expires_at": int(time.time()) + 3600,
         })
-        monkeypatch.setattr(eesel, "_effective_ws_resolved", False)
-        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "ws-B-target")
+        # The guard has already resolved the target's workspace onto the module
+        # global; whoami reuses it for display.
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "victim-9", "workspace": "ws-B-target"}, raising=False)
         monkeypatch.setattr(
             eesel, "_get_impersonate_status",
             lambda c: {"allowed": True, "target_user_id": "victim-9"},
@@ -3268,6 +3262,43 @@ class TestImpersonationWriteBlockEndToEnd:
         cap = capsys.readouterr()
         assert "Refused" in cap.err
         assert cap.out == ""  # no partial output on stdout
+
+    def test_read_runs_in_the_targets_workspace(self, tmp_config, monkeypatch):
+        # End to end: while impersonating, a read command runs in the TARGET's
+        # workspace — the guard resolves it once and require_creds reuses it.
+        self._save_staff()
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: seen.setdefault("ws", creds["workspace_id"]) and [] or [])
+        eesel.main(["agents", "list"])
+        assert seen["ws"] == "cust-ws"  # ran against the target, not "own-ws"
+
+
+class TestEffectiveWorkspaceZeroCost:
+    """A non-impersonating login makes no workspace-resolution call and keeps
+    its stored (login) workspace — the "zero cost for normal customers" contract."""
+
+    def test_normal_login_makes_no_resolution_call(self, tmp_config, monkeypatch):
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "login-ws",
+            "token": "tok", "refresh_token": "rt",  # a normal prod login (not staff)
+            "expires_at": int(time.time()) + 3600,
+        })
+
+        def boom(*a, **k):
+            raise AssertionError("a normal login must not resolve the workspace")
+
+        # Neither the impersonation-status probe nor the workspace mint may fire.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", boom)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: seen.setdefault("ws", creds["workspace_id"]) and [] or [])
+        eesel.main(["agents", "list"])
+        assert seen["ws"] == "login-ws"  # stored login workspace, unchanged
 
 
 class TestSubcommandSuggestions:
@@ -4879,47 +4910,29 @@ class TestResolveEffectiveWorkspaceId:
 
 
 class TestEffectiveWorkspace:
-    """`_apply_effective_workspace` re-points workspace_id at the effective
-    identity's workspace, for Auth0 logins only, at most once per process."""
+    """`_apply_effective_workspace` re-points workspace_id at the impersonated
+    target's workspace when one is active, reusing the workspace the guard
+    already resolved (no network call of its own), and is a no-op otherwise."""
 
-    def test_auth0_login_adopts_resolved_workspace(self, monkeypatch):
-        monkeypatch.setattr(eesel, "_effective_ws_resolved", False)
-        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "ws-effective")
-        creds = {"api_url": "x", "token": "auth0", "refresh_token": "rt", "workspace_id": "ws-stored"}
+    def test_adopts_the_active_targets_workspace(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "victim-9", "workspace": "ws-target"}, raising=False)
+        creds = {"api_url": "x", "token": "auth0", "workspace_id": "ws-stored"}
         eesel._apply_effective_workspace(creds)
-        assert creds["workspace_id"] == "ws-effective"
+        assert creds["workspace_id"] == "ws-target"
 
-    def test_dev_login_without_refresh_token_is_left_alone(self, monkeypatch):
-        monkeypatch.setattr(eesel, "_effective_ws_resolved", False)
+    def test_no_target_leaves_workspace_untouched_without_a_network_call(self, monkeypatch):
+        # The key "zero cost for normal customers" guarantee: with no active
+        # target, this neither resolves nor changes the stored workspace.
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
 
-        def boom(c):
-            raise AssertionError("must not resolve for a non-Auth0 login")
+        def boom(*a, **k):
+            raise AssertionError("must not resolve the workspace when not impersonating")
 
         monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
-        creds = {"api_url": "x", "token": "dev", "workspace_id": "ws-dev"}
-        eesel._apply_effective_workspace(creds)
-        assert creds["workspace_id"] == "ws-dev"
-
-    def test_lookup_failure_leaves_workspace_unchanged(self, monkeypatch):
-        monkeypatch.setattr(eesel, "_effective_ws_resolved", False)
-        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: None)
-        creds = {"api_url": "x", "token": "auth0", "refresh_token": "rt", "workspace_id": "ws-stored"}
+        creds = {"api_url": "x", "token": "auth0", "workspace_id": "ws-stored"}
         eesel._apply_effective_workspace(creds)
         assert creds["workspace_id"] == "ws-stored"
-
-    def test_resolves_at_most_once_per_process(self, monkeypatch):
-        monkeypatch.setattr(eesel, "_effective_ws_resolved", False)
-        calls = {"n": 0}
-
-        def once(c):
-            calls["n"] += 1
-            return "ws-effective"
-
-        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", once)
-        creds = {"api_url": "x", "token": "auth0", "refresh_token": "rt", "workspace_id": "ws-stored"}
-        eesel._apply_effective_workspace(creds)
-        eesel._apply_effective_workspace(creds)
-        assert calls["n"] == 1
 
 
 class TestIntegrationsCommand:

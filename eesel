@@ -1906,8 +1906,9 @@ def resolve_effective_workspace_id(creds: dict) -> str | None:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {creds['token']}"},
             method="POST",
         )
-        # Short timeout: this is a best-effort optimization that runs before every
-        # authenticated command, so a slow endpoint must not stall the CLI for long.
+        # Short timeout: a slow endpoint must not stall the CLI for long. Called
+        # once per invocation, only while impersonating (from the pre-dispatch
+        # guard), never on a normal customer's commands.
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read() or b"{}")
     except Exception:
@@ -1915,32 +1916,20 @@ def resolve_effective_workspace_id(creds: dict) -> str | None:
     return data.get("workspaceId") or data.get("workspace_id")
 
 
-# Resolve the effective workspace at most once per CLI invocation.
-_effective_ws_resolved = False
-
-
 def _apply_effective_workspace(creds: dict) -> None:
-    """Point `workspace_id` at the workspace the caller currently acts in.
+    """Point `workspace_id` at the impersonated target's workspace, if active.
 
-    The stored `workspace_id` is fixed at login. While impersonating, every
-    request runs as the target — usually in a different workspace — so the stored
-    value returns 401. `resolve_effective_workspace_id` asks the server which
-    workspace the effective identity is in (the target while impersonating, the
-    caller's own otherwise); this also self-corrects a target that was cleared or
-    has expired. Applied in memory only and resolved at most once per process, so
-    nothing is persisted and there is nothing to restore.
-
-    Only Auth0 logins are checked — dev / workspace-token logins set their
-    workspace explicitly and must not be overridden. On any lookup failure the
-    stored workspace is left as-is.
+    The stored `workspace_id` is the caller's own, fixed at login and never
+    overwritten on disk — so outside impersonation it is already correct and
+    there is nothing to do (a normal customer's commands make no extra call).
+    While impersonating, requests run as the target, usually in a different
+    workspace, so the stored value would 401. The pre-dispatch guard
+    (`_guard_impersonated_command`) has already resolved the target's workspace
+    and stashed it on `_impersonation_target`; reuse that rather than resolving
+    again. Applied in memory only, so nothing is persisted.
     """
-    global _effective_ws_resolved
-    if _effective_ws_resolved or not creds.get("refresh_token"):
-        return
-    _effective_ws_resolved = True
-    ws = resolve_effective_workspace_id(creds)
-    if ws:
-        creds["workspace_id"] = ws
+    if _impersonation_target:
+        creds["workspace_id"] = _impersonation_target["workspace"]
 
 
 def cache_impersonator_flag(creds: dict) -> bool:
