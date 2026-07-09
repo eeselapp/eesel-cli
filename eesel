@@ -1090,7 +1090,11 @@ def _retry_with_current_workspace(method: str, url: str, *, token, body, timeout
     if not fresh or fresh == stale:
         return None
 
-    creds["workspace_id"] = fresh  # in memory, for the retry and the rest of this command
+    # Correct it in memory too, so a later http_request in this same command
+    # reuses the fixed workspace (best-effort — a `--agent` path holds a dict
+    # copy that won't see this). The retry below substitutes the id directly, so
+    # it doesn't rely on this; the disk write below is what fixes later runs.
+    creds["workspace_id"] = fresh
     # Persist only the workspace correction, re-reading disk so an in-memory
     # agent_id (never persisted, per require_creds) can't leak onto disk.
     disk = load_creds()
