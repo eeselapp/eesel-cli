@@ -1078,7 +1078,11 @@ def _retry_with_current_workspace(method: str, url: str, *, token, body, timeout
     stale = creds.get("workspace_id")
     if not stale:
         return None
-    in_url = stale in url
+    # Match the workspace id only where it stands as a whole URL segment or query
+    # value (after `/` or `=`, before `/`, `&`, `?`, or end) — never as a loose
+    # substring of some other opaque id — and exact-match it in the body.
+    ws_in_url = re.compile(r"(?<=[/=])" + re.escape(stale) + r"(?=[/&?]|$)")
+    in_url = ws_in_url.search(url) is not None
     in_body = _deep_contains(body, stale)
     if not (in_url or in_body):
         return None
@@ -1094,10 +1098,14 @@ def _retry_with_current_workspace(method: str, url: str, *, token, body, timeout
         disk["workspace_id"] = fresh
         save_creds(disk)
 
+    # The retry re-sends via _http_send, skipping the write-backstop. Safe: a
+    # customer-changing request can't reach this point while impersonating — the
+    # pre-dispatch guard and the backstop both exit before any request goes out —
+    # so self-heal only ever retries a read (or an allowlisted POST-shaped read).
     try:
         return _http_send(
             method,
-            url.replace(stale, fresh) if in_url else url,
+            ws_in_url.sub(fresh, url) if in_url else url,
             token=token,
             body=_deep_replace(body, stale, fresh) if in_body else body,
             timeout=timeout,

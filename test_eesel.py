@@ -3438,6 +3438,40 @@ class TestSelfHealWorkspace401:
         assert disk["workspace_id"] == "FRESH-WS"
         assert "agent_id" not in disk  # the heal must not leak the in-memory agent onto disk
 
+    def test_workspace_id_as_substring_is_not_matched(self, tmp_config, monkeypatch):
+        # The stale id appears only as a prefix of a larger opaque id, not as a
+        # whole URL segment — self-heal must not fire (no spurious resolve/retry).
+        self._arm(monkeypatch)
+
+        def boom(c):
+            raise AssertionError("must not re-resolve on a substring-only match")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents/STALE-WS-EXTRA/tools", token="tok")
+        assert n[0] == 1  # substring didn't count as the workspace → no retry
+
+    def test_workspace_id_as_path_segment_is_matched(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            seen.append(url)
+            if len(seen) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("GET", "https://api.example/workspaces/STALE-WS/mcp-servers", token="tok")
+        assert seen[1] == "https://api.example/workspaces/FRESH-WS/mcp-servers"  # segment healed
+
     def test_end_to_end_create_after_clear_self_heals(self, tmp_config, monkeypatch):
         # The reported case: not impersonating, a stale stored workspace, so the
         # operator's own `agents create` 401s — then self-heals and succeeds.
