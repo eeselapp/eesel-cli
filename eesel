@@ -572,6 +572,15 @@ def require_creds_scoped(args) -> dict:
     return apply_agent_flag_override(require_creds(), getattr(args, "agent", None))
 
 
+def _use_creds(creds: dict) -> dict:
+    """Apply the agent-by-env override and record the result as the creds this
+    command runs with, so the `http_request` 401 self-heal can re-resolve and
+    persist the workspace without threading creds through every caller."""
+    global _current_creds
+    _current_creds = creds = apply_agent_env_override(creds)
+    return creds
+
+
 def require_creds() -> dict:
     # A worktree linked to a branch env (or an `EESEL_BASE_URL` override) mints a
     # throwaway token from that env's `/dev/session` per run. This reads nothing
@@ -579,7 +588,7 @@ def require_creds() -> dict:
     # five worktrees each target their own env with nothing global to race over.
     base_url = resolve_dev_base_url()
     if base_url:
-        return apply_agent_env_override(dev_session_creds(base_url))
+        return _use_creds(dev_session_creds(base_url))
 
     creds = load_creds()
     if not creds:
@@ -603,7 +612,7 @@ def require_creds() -> dict:
             # Resolve the effective workspace before EESEL_AGENT, so an agent
             # named by env resolves against the workspace we'll actually query.
             _apply_effective_workspace(refreshed)
-            return apply_agent_env_override(refreshed)
+            return _use_creds(refreshed)
         # Refresh failed. If the access token is already dead we can't proceed;
         # if it's merely near expiry, fall through and use it for this command.
         if time.time() > expires_at:
@@ -615,7 +624,7 @@ def require_creds() -> dict:
         sys.exit(1)
 
     _apply_effective_workspace(creds)
-    return apply_agent_env_override(creds)
+    return _use_creds(creds)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -976,40 +985,126 @@ def format_cost_full(d: dict, sess: dict, label: str = "session") -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
-    # Belt-and-braces: refuse a customer-changing request while impersonating.
-    # Defined near main() alongside the pre-dispatch guard; a no-op unless a real
-    # impersonation target is active.
-    _impersonation_write_backstop(method, url)
+# The creds the active command runs with, stashed by require_creds so the 401
+# self-heal below can re-resolve and persist the workspace without threading
+# creds through every http_request caller. None until a command authenticates.
+_current_creds: dict | None = None
+
+
+def _http_send(method: str, url: str, *, token: str | None, body: dict | None, timeout: int, headers: dict | None) -> dict:
+    """One HTTP attempt. Returns the parsed JSON dict; lets HTTPError / URLError /
+    timeout propagate so callers can decide whether to retry or exit."""
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json", **(headers or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # A 2xx with a non-JSON body usually means a proxy/gateway or login
+            # page answered instead of the API (e.g. an HTML error page served
+            # with status 200). Surface a clean message rather than letting the
+            # JSONDecodeError traceback escape.
+            snippet = raw[:200].decode(errors="replace").strip()
+            sys.exit(
+                f"{method} {url} → {resp.status} but the response was not JSON "
+                f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+            )
+
+
+def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
+    # Belt-and-braces: refuse a customer-changing request while impersonating.
+    # Defined near main() alongside the pre-dispatch guard; a no-op unless a real
+    # impersonation target is active.
+    _impersonation_write_backstop(method, url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if not raw:
-                return {}
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                # A 2xx with a non-JSON body usually means a proxy/gateway or
-                # login page answered instead of the API (e.g. an HTML error
-                # page served with status 200). Surface a clean message rather
-                # than letting the JSONDecodeError traceback escape.
-                snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
-                    f"{method} {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
-                )
+        return _http_send(method, url, token=token, body=body, timeout=timeout, headers=headers)
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            healed = _retry_with_current_workspace(method, url, token=token, body=body, timeout=timeout, headers=headers)
+            if healed is not None:
+                return healed
         body_text = e.read().decode(errors="replace")
         sys.exit(f"{method} {url} → {e.code}: {body_text}")
     except (TimeoutError, socket.timeout):
         sys.exit(f"{method} {url} timed out after {timeout}s (server slow or hung?).")
     except urllib.error.URLError as e:
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
+
+
+def _deep_contains(obj, value: str) -> bool:
+    """True if `value` (a workspace id) appears as a string anywhere in `obj`."""
+    if isinstance(obj, str):
+        return obj == value
+    if isinstance(obj, dict):
+        return any(_deep_contains(v, value) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_deep_contains(v, value) for v in obj)
+    return False
+
+
+def _deep_replace(obj, old: str, new: str):
+    """Return `obj` with every string equal to `old` replaced by `new`."""
+    if isinstance(obj, str):
+        return new if obj == old else obj
+    if isinstance(obj, dict):
+        return {k: _deep_replace(v, old, new) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_replace(v, old, new) for v in obj]
+    return obj
+
+
+def _retry_with_current_workspace(method: str, url: str, *, token, body, timeout, headers) -> dict | None:
+    """Self-heal a stale workspace pin on a 401, then retry once.
+
+    A 401 on a request that carried the stored `workspace_id` usually means the
+    pin is stale: a lapsed impersonation target, a workspace the login was
+    removed from, or a value left on disk by an older CLI. Re-resolve the
+    workspace the current identity actually acts in (`POST /workspaces/token`),
+    persist the correction, substitute the id into the URL/body, and retry the
+    request once. Gated on the id actually being in the request, so a genuinely
+    unauthorized call fails fast instead of retrying blindly. Prod logins only;
+    returns None (caller then reports the original 401) when it doesn't apply or
+    the retry fails — never loops.
+    """
+    creds = _current_creds
+    if not creds or not creds.get("refresh_token"):
+        return None
+    stale = creds.get("workspace_id")
+    if not stale:
+        return None
+    in_url = stale in url
+    in_body = _deep_contains(body, stale)
+    if not (in_url or in_body):
+        return None
+    fresh = resolve_effective_workspace_id(creds)
+    if not fresh or fresh == stale:
+        return None
+
+    creds["workspace_id"] = fresh  # in memory, for the retry and the rest of this command
+    # Persist only the workspace correction, re-reading disk so an in-memory
+    # agent_id (never persisted, per require_creds) can't leak onto disk.
+    disk = load_creds()
+    if disk and not disk.get("ephemeral"):
+        disk["workspace_id"] = fresh
+        save_creds(disk)
+
+    try:
+        return _http_send(
+            method,
+            url.replace(stale, fresh) if in_url else url,
+            token=token,
+            body=_deep_replace(body, stale, fresh) if in_body else body,
+            timeout=timeout,
+            headers=headers,
+        )
+    except Exception:
+        return None
 
 
 def http_request_allow_error(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60) -> tuple[int, dict]:

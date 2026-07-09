@@ -79,12 +79,14 @@ def fake_creds(tmp_config):
 
 @pytest.fixture(autouse=True)
 def _reset_impersonation_target():
-    # The guard sets the _impersonation_target module global directly (not via
-    # monkeypatch), so force it clear around every test to stop the backstop
-    # leaking an armed target into unrelated tests.
+    # The guard sets _impersonation_target and require_creds sets _current_creds
+    # as module globals (not via monkeypatch), so force both clear around every
+    # test to stop the backstop / 401 self-heal leaking state between tests.
     eesel._impersonation_target = None
+    eesel._current_creds = None
     yield
     eesel._impersonation_target = None
+    eesel._current_creds = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3299,6 +3301,166 @@ class TestEffectiveWorkspaceZeroCost:
                             lambda creds: seen.setdefault("ws", creds["workspace_id"]) and [] or [])
         eesel.main(["agents", "list"])
         assert seen["ws"] == "login-ws"  # stored login workspace, unchanged
+
+
+def _http_error(code=401, body=b'{"message":"no editor access"}'):
+    import io
+    return eesel.urllib.error.HTTPError("https://api.example/x", code, "Unauthorized", {}, io.BytesIO(body))
+
+
+class TestSelfHealWorkspace401:
+    """A 401 on a request carrying the stored workspace_id re-resolves the
+    effective workspace, persists it, and retries once — for prod logins only,
+    without looping."""
+
+    def _creds(self, **extra):
+        c = {"api_url": "https://api.example", "token": "tok", "refresh_token": "rt", "workspace_id": "STALE-WS"}
+        c.update(extra)
+        return c
+
+    def _arm(self, monkeypatch, fresh="FRESH-WS", creds=None):
+        eesel.save_creds(creds or self._creds())
+        monkeypatch.setattr(eesel, "_current_creds", creds or eesel.load_creds())
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: fresh)
+
+    def test_read_heals_url_and_retries(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            seen.append(url)
+            if len(seen) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        out = eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert out == {"ok": True}
+        assert len(seen) == 2
+        assert "FRESH-WS" in seen[1] and "STALE-WS" not in seen[1]
+        assert eesel.load_creds()["workspace_id"] == "FRESH-WS"  # correction persisted
+
+    def test_write_heals_workspace_in_body(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        bodies = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            bodies.append(body)
+            if len(bodies) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("POST", "https://api.example/agents", token="tok",
+                           body={"workspace_id": "STALE-WS", "name": "x"})
+        assert bodies[1] == {"workspace_id": "FRESH-WS", "name": "x"}  # id swapped, rest intact
+
+    def test_401_without_workspace_in_request_fails_fast(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+
+        def boom(c):
+            raise AssertionError("must not re-resolve when the workspace wasn't in the request")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents", token="tok")  # no workspace id
+        assert n[0] == 1  # one attempt, no retry
+
+    def test_non_prod_login_does_not_self_heal(self, tmp_config, monkeypatch):
+        # No refresh token → not a prod login → self-heal never runs.
+        monkeypatch.setattr(eesel, "_current_creds",
+                            {"api_url": "https://api.example", "token": "t", "workspace_id": "STALE-WS"})
+
+        def boom(c):
+            raise AssertionError("must not re-resolve for a non-prod login")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="t")
+        assert n[0] == 1
+
+    def test_resolve_returns_same_workspace_no_retry(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch, fresh="STALE-WS")  # re-resolve gives the same id → nothing to heal
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert n[0] == 1
+
+    def test_retry_that_also_401s_does_not_loop(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)  # even the retry fails
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert n[0] == 2  # original + exactly one retry, then stop
+
+    def test_in_memory_agent_id_is_not_persisted_by_the_heal(self, tmp_config, monkeypatch):
+        eesel.save_creds(self._creds())          # disk has no agent_id
+        cur = eesel.load_creds()
+        cur["agent_id"] = "in-memory-agent"      # set only in memory, like --agent/EESEL_AGENT
+        monkeypatch.setattr(eesel, "_current_creds", cur)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "FRESH-WS")
+        seq = [_http_error(401)]
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            if seq:
+                raise seq.pop()
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        disk = eesel.load_creds()
+        assert disk["workspace_id"] == "FRESH-WS"
+        assert "agent_id" not in disk  # the heal must not leak the in-memory agent onto disk
+
+    def test_end_to_end_create_after_clear_self_heals(self, tmp_config, monkeypatch):
+        # The reported case: not impersonating, a stale stored workspace, so the
+        # operator's own `agents create` 401s — then self-heals and succeeds.
+        # _current_creds is set by the real require_creds (not stubbed).
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "STALE-WS",
+            "token": "tok", "refresh_token": "rt", "expires_at": int(time.time()) + 3600,
+        })
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "OWN-WS")
+        sends = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            sends.append((url, body))
+            if len(sends) == 1:
+                raise _http_error(401)  # server rejects the stale workspace
+            return {"agent_id": "a1"}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        rc = eesel.main(["agents", "create", "--name", "x"])
+        assert rc == 0
+        assert len(sends) == 2
+        assert sends[1][1]["workspace_id"] == "OWN-WS"       # retried with the real workspace
+        assert eesel.load_creds()["workspace_id"] == "OWN-WS"  # and it's persisted
 
 
 class TestSubcommandSuggestions:
