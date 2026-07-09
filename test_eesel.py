@@ -85,6 +85,16 @@ def _offline_effective_workspace(monkeypatch):
     monkeypatch.setattr(eesel, "_effective_ws_resolved", True, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_impersonation_target():
+    # The guard sets the _impersonation_target module global directly (not via
+    # monkeypatch), so force it clear around every test to stop the backstop
+    # leaking an armed target into unrelated tests.
+    eesel._impersonation_target = None
+    yield
+    eesel._impersonation_target = None
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # JWT helpers
 # ──────────────────────────────────────────────────────────────────────────
@@ -3042,6 +3052,199 @@ class TestMainStaffGating:
 
     def test_main_staff_false_when_not_logged_in(self, tmp_config, monkeypatch):
         assert self._run_capturing_staff(monkeypatch) is False
+
+
+def _ns(**kw):
+    """A throwaway argparse-Namespace stand-in carrying only the given attrs."""
+    return type("Args", (), kw)()
+
+
+class TestIsWriteCommand:
+    """`_is_write_command` classifies a parsed command as customer-changing or
+    not, by the verb stored under its `<name>_cmd` attribute."""
+
+    def test_agent_writes_and_reads(self):
+        assert eesel._is_write_command(_ns(agents_cmd="create"))
+        assert eesel._is_write_command(_ns(agents_cmd="set"))
+        assert eesel._is_write_command(_ns(agents_cmd="remove"))
+        assert not eesel._is_write_command(_ns(agents_cmd="list"))
+        assert not eesel._is_write_command(_ns(agents_cmd="show"))
+
+    def test_writes_across_commands(self):
+        assert eesel._is_write_command(_ns(mcp_cmd="add"))
+        assert eesel._is_write_command(_ns(workspace_cmd="set"))
+        assert eesel._is_write_command(_ns(workspace_cmd="extend-trial"))
+        assert eesel._is_write_command(_ns(tasks_cmd="export"))
+        assert eesel._is_write_command(_ns(actions_cmd="enable"))
+        assert eesel._is_write_command(_ns(integrations_cmd="sync"))
+        assert eesel._is_write_command(_ns(notifications_cmd="set"))
+        assert eesel._is_write_command(_ns(file_cmd="add"))
+        assert eesel._is_write_command(_ns(acl_cmd="set"))
+
+    def test_reads_are_not_writes(self):
+        assert not eesel._is_write_command(_ns(mcp_cmd="list"))
+        assert not eesel._is_write_command(_ns(workspace_cmd="show"))
+        assert not eesel._is_write_command(_ns(tasks_cmd="list"))
+        assert not eesel._is_write_command(_ns(billing_cmd="show"))
+        assert not eesel._is_write_command(_ns(integrations_cmd="sync-status"))
+
+    def test_chat_and_control_commands_are_not_writes(self):
+        # chat/new (positional message, no `_cmd` attr) and impersonate (control)
+        # must never be classified as writes.
+        assert not eesel._is_write_command(_ns(message="hi"))
+        assert not eesel._is_write_command(_ns(user_id="auth0|x"))
+
+
+class TestImpersonationBackstop:
+    """The http_request backstop refuses a mutating request under a live target,
+    unless its path is a known read/plumbing exception."""
+
+    def _arm(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "auth0|cust", "workspace": "cust-ws"}, raising=False)
+
+    def test_mutating_call_blocked_before_network(self, monkeypatch, capsys):
+        self._arm(monkeypatch)
+
+        def boom(*a, **k):
+            raise AssertionError("request must not reach the network")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED  # distinct code 3
+        assert "Refused" in capsys.readouterr().err
+
+    def test_allowed_paths_pass_the_backstop(self, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda req, timeout=None: seen.append(req.full_url) or _FakeResp({}),
+        )
+        for path in ("/workspaces/token", "/workspace/tasks", "/workspace/tasks/analytics", "/dev/session"):
+            eesel.http_request("POST", f"https://api.example{path}", token="t")
+        assert len(seen) == 4  # every allowed path reached the network, none blocked
+
+    def test_export_is_not_confused_with_tasks_list(self, monkeypatch, capsys):
+        # `/workspace/tasks` (list) is allowed; `/tasks/export` (emails the
+        # customer) must NOT be — a prefix match would wrongly allow it.
+        self._arm(monkeypatch)
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("blocked path hit network")))
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/tasks/export", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_reads_pass_under_a_target(self, monkeypatch):
+        self._arm(monkeypatch)
+        got = {}
+
+        def fake(req, timeout=None):
+            got["m"] = req.get_method()
+            return _FakeResp({})
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", fake)
+        eesel.http_request("GET", "https://api.example/agents", token="t")
+        assert got["m"] == "GET"  # a GET is never blocked
+
+    def test_no_target_lets_writes_through(self, monkeypatch):
+        # Not impersonating → the backstop is inert; a POST proceeds normally.
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        seen = []
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda req, timeout=None: seen.append(1) or _FakeResp({}))
+        eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert seen == [1]
+
+
+class TestGuardImpersonatedCommand:
+    """`_guard_impersonated_command` runs before dispatch: banner on every
+    command under a live target, refusal for writes, nothing off the staff path."""
+
+    def _creds(self, **extra):
+        c = {"is_impersonator": True, "api_url": "https://api.example",
+             "token": "t", "workspace_id": "own-ws"}
+        c.update(extra)
+        return c
+
+    def _real_target(self, monkeypatch, ws="cust-ws"):
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: ws)
+
+    def test_normal_customer_pays_nothing(self, monkeypatch):
+        # No cached staff flag → no status call, no banner, no target armed.
+        def boom(c):
+            raise AssertionError("must not check impersonation status for a normal login")
+
+        monkeypatch.setattr(eesel, "_get_impersonate_status", boom)
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(agents_cmd="create"), {"api_url": "x", "token": "t"})
+        assert eesel._impersonation_target is None
+
+    def test_idle_staff_not_blocked(self, monkeypatch, capsys):
+        # Allowlisted but no target armed → acts as themselves; no banner, no block.
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": None})
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(agents_cmd="create"), self._creds())
+        assert eesel._impersonation_target is None
+        assert capsys.readouterr().err == ""
+
+    def test_write_refused_with_distinct_code(self, monkeypatch, capsys):
+        self._real_target(monkeypatch)
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(agents_cmd="create"), self._creds())
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        err = capsys.readouterr().err
+        assert "▲ impersonating auth0|cust — cust-ws" in err  # banner
+        assert "Refused" in err                               # refusal
+
+    def test_read_shows_banner_but_is_not_blocked(self, monkeypatch, capsys):
+        self._real_target(monkeypatch)
+        eesel._guard_impersonated_command(_ns(agents_cmd="list"), self._creds())
+        cap = capsys.readouterr()
+        assert "▲ impersonating" in cap.err  # banner on stderr
+        assert "Refused" not in cap.err       # not blocked
+        assert cap.out == ""                  # stdout untouched (byte-for-byte clean)
+        assert eesel._impersonation_target is not None
+
+    def test_control_command_not_blocked_under_target(self, monkeypatch, capsys):
+        # `impersonate clear` must run even while a target is live.
+        self._real_target(monkeypatch)
+        eesel._guard_impersonated_command(_ns(user_id="clear"), self._creds())
+        assert "Refused" not in capsys.readouterr().err
+
+
+class TestImpersonationWriteBlockEndToEnd:
+    """main() refuses an impersonated write before any API call."""
+
+    def _save_staff(self):
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "own-ws",
+            "token": "tok", "refresh_token": "rt", "is_impersonator": True,
+            "expires_at": int(time.time()) + 3600,
+        })
+
+    def test_write_refused_before_any_api_call(self, tmp_config, monkeypatch, capsys):
+        self._save_staff()
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+
+        def no_api(*a, **k):
+            raise AssertionError("a write command must not reach any HTTP call while impersonating")
+
+        monkeypatch.setattr(eesel, "http_request", no_api)
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_api)
+
+        with pytest.raises(SystemExit) as e:
+            eesel.main(["agents", "create", "--name", "x"])
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        cap = capsys.readouterr()
+        assert "Refused" in cap.err
+        assert cap.out == ""  # no partial output on stdout
 
 
 class TestSubcommandSuggestions:
