@@ -5739,6 +5739,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
                                      "the `agents <id> …` path or EESEL_AGENT")
 
     cr = d_sub.add_parser("add", help="Add a file to the workspace (prints its key)")
+    cr.set_defaults(write=True)
     cr.add_argument("--title", required=True, help="File title")
     content = cr.add_mutually_exclusive_group(required=True)
     content.add_argument("--content", help="File content (inline)")
@@ -5747,6 +5748,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
     cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
 
     de = d_sub.add_parser("remove", help="Remove files by key (asks for confirmation)")
+    de.set_defaults(write=True)
     de.add_argument("keys", nargs="+", help="One or more file keys or ids to remove (each must match an existing file)")
     de.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     de.add_argument("--agent", help="Agent whose files to remove; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
@@ -5760,6 +5762,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
         "set",
         help="Replace an agent's knowledge-ACL key prefixes (this REPLACES the existing prefixes, it does not append)",
     )
+    acl_set.set_defaults(write=True)
     acl_set.add_argument("agent", help="Agent id, id-prefix, or name")
     acl_set.add_argument(
         "--prefix",
@@ -5909,15 +5912,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
                       help="Print only the system prompt (raw, pipeable)")
 
     create = a_sub.add_parser("create", help="Create a new agent")
+    create.set_defaults(write=True)
     create.add_argument("--name", help="Agent name (required)")
     create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
 
     set_p = a_sub.add_parser("set", help="Change an agent's name or instructions (only the flags you pass)")
+    set_p.set_defaults(write=True)
     set_p.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     set_p.add_argument("--name", help="New name")
     set_p.add_argument("--instructions", help="New instructions / system prompt")
 
     remove = a_sub.add_parser("remove", help="Remove an agent (asks for confirmation)")
+    remove.set_defaults(write=True)
     remove.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
@@ -6001,6 +6007,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_an.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
     tk_an.add_argument("--json", action="store_true", help="Emit the raw analytics payload instead of a summary")
     tk_ex = tk_sub.add_parser("export", help="Start a CSV export of tasks (download link is emailed when ready)")
+    tk_ex.set_defaults(write=True)
     tk_ex.add_argument("--agent", help="Export only one agent's tasks (full id, id-prefix, or name)")
     tk_ex.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: last 7 days)")
     tk_ex.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
@@ -6074,11 +6081,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         "`eesel login`; the CLI does not wait for the flow to finish.",
     )
     _connect_args(i_connect)
+    i_connect.set_defaults(write=True)
     i_sy = ig_sub.add_parser(
         "sync",
         help="Trigger a data sync for a connected integration (Zendesk only today)",
         description="Trigger a data sync. --type must be one of: help-center, macros, tickets.",
     )
+    i_sy.set_defaults(write=True)
     i_sy.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_sy.add_argument(
         "--type",
@@ -6097,6 +6106,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         p.add_argument("--agent", help="Remove the integration from just this agent (id, id-prefix, or name) — other agents keep their access. Without it, the integration is uninstalled for the whole workspace.")
 
     i_rm = ig_sub.add_parser("remove", help="Remove an integration from one agent (--agent) or uninstall it for the whole workspace")
+    i_rm.set_defaults(write=True)
     _remove_args(i_rm)
 
     ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or set an integration's actions")
@@ -6121,15 +6131,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # enable and edit both POST /agents/{id}/tools/{tool_key}; enable sends an
     # empty config (action at its default settings), edit sends the given config.
     a_en = act_sub.add_parser("enable", help="Enable an action for the agent (POST with empty config)")
+    a_en.set_defaults(write=True)
     a_en.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_en)
 
     a_ed = act_sub.add_parser("set", help="Configure an action's settings, e.g. permission mode (POST with config)")
+    a_ed.set_defaults(write=True)
     a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     a_ed.add_argument("--config", required=True, help="The action's full config as a JSON object (replaces what's stored; permission keys are kept if omitted), e.g. '{\"permission_mode\": \"ask\"}'")
     _agent_arg(a_ed)
 
     a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
+    a_di.set_defaults(write=True)
     a_di.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_di)
     a_di.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
@@ -6147,21 +6160,26 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     m_show.add_argument("--json", action="store_true", help="Emit the raw MCP server payload")
 
     m_add = m_sub.add_parser("add", help="Register (bring in) a new MCP server")
+    m_add.set_defaults(write=True)
     m_add.add_argument("--name", required=True, help="Display name for the MCP server")
     m_add.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
     m_add.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
 
     m_edit = m_sub.add_parser("set", help="Change an MCP server's name or URL (only the flags you pass)")
+    m_edit.set_defaults(write=True)
     m_edit.add_argument("server", help="Full id, id prefix, or exact name")
     m_edit.add_argument("--name", help="New display name")
     m_edit.add_argument("--url", help="New base URL")
 
     m_enable = m_sub.add_parser("enable", help="Activate an MCP server")
+    m_enable.set_defaults(write=True)
     m_enable.add_argument("server", help="Full id, id prefix, or exact name")
     m_disable = m_sub.add_parser("disable", help="Deactivate an MCP server")
+    m_disable.set_defaults(write=True)
     m_disable.add_argument("server", help="Full id, id prefix, or exact name")
 
     m_remove = m_sub.add_parser("remove", help="Remove (take out) an MCP server (asks for confirmation)")
+    m_remove.set_defaults(write=True)
     m_remove.add_argument("server", help="Full id, id prefix, or exact name")
     m_remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
@@ -6199,11 +6217,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     t_reg.add_argument("--json", action="store_true", help="Emit the raw registry payload")
 
     t_add = t_sub.add_parser("add", help="Add a trigger to an agent")
+    t_add.set_defaults(write=True)
     t_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the trigger to")
     t_add.add_argument("--key", required=True, help="Trigger key from `eesel automations triggers registry` (e.g. 'zendesk_ticket_created')")
     t_add.add_argument("--config", help="Trigger config as a JSON object")
 
     t_rm = t_sub.add_parser("remove", help="Remove a trigger by id")
+    t_rm.set_defaults(write=True)
     t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel automations triggers list`)")
     t_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
@@ -6218,6 +6238,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_ls.add_argument("--json", action="store_true", help="Emit the raw scheduled-job payload")
 
     sc_add = sc_sub.add_parser("add", help="Add a scheduled job to an agent")
+    sc_add.set_defaults(write=True)
     sc_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the job to")
     sc_add.add_argument("--cron", required=True, help="Cron expression for the schedule (e.g. '0 9 * * *')")
     sc_add.add_argument("--prompt", required=True, help="The instruction the agent runs each time the job fires")
@@ -6226,10 +6247,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_add.add_argument("--config", help="Extra job config as a JSON object (merged under the flags above)")
 
     sc_rm = sc_sub.add_parser("remove", help="Remove a scheduled job by id")
+    sc_rm.set_defaults(write=True)
     sc_rm.add_argument("job", help="The job's id (first column of `eesel automations schedules list`)")
     sc_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
     sc_fire = sc_sub.add_parser("fire", help="Manually fire a scheduled job once")
+    sc_fire.set_defaults(write=True)
     sc_fire.add_argument("job", help="Full id, id prefix, or substring of the job title (e.g. 'heartbeat')")
 
     sp.set_defaults(func=cmd_schedules)
@@ -6250,14 +6273,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_sh.add_argument("skill_id", help="Skill id to show")
     sk_sh.add_argument("--json", action="store_true", help="Emit the raw skill payload")
     sk_add = sk_sub.add_parser("add", help="Install a skill from the marketplace onto an agent")
+    sk_add.set_defaults(write=True)
     sk_add.add_argument("agent", help=_AGENT_HELP)
     sk_add.add_argument("skill_id", help="Skill id to install")
     sk_rm = sk_sub.add_parser("remove", help="Uninstall a skill from an agent (asks for confirmation)")
+    sk_rm.set_defaults(write=True)
     sk_rm.add_argument("agent", help=_AGENT_HELP)
     sk_rm.add_argument("skill_id", help="Skill id to uninstall")
     sk_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     # `set` merges keys into a skill's per-agent config (PATCH, not replace).
     sk_ed = sk_sub.add_parser("set", help="Set a skill's per-agent config — merges the given keys into the existing config (does not replace it)")
+    sk_ed.set_defaults(write=True)
     sk_ed.add_argument("agent", help=_AGENT_HELP)
     sk_ed.add_argument("skill_id", help="Skill id to configure")
     sk_ed.add_argument("--config", required=True, help="Config keys to set, as a JSON object (merged into the skill's existing config), e.g. '{\"key\": \"value\"}'")
@@ -6270,11 +6296,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     w_show = w_sub.add_parser("show", help="Show the active workspace (name, owner, trial, etc.)")
     w_show.add_argument("--json", action="store_true", help="Emit the raw workspace payload")
     w_set = w_sub.add_parser("set", help="Set a workspace field (name or billing-limit)")
+    w_set.set_defaults(write=True)
     w_set.add_argument("field", choices=["name", "billing-limit"], help="The field to set")
     w_set.add_argument("value", help="The new value (a name string, or a non-negative integer for billing-limit)")
     w_members = w_sub.add_parser("members", help="List the workspace's members (email + role)")
     w_members.add_argument("--json", action="store_true", help="Emit the raw members payload")
-    w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
+    w_extend = w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
+    w_extend.set_defaults(write=True)
     sp.set_defaults(func=cmd_workspace)
 
     sp = sub.add_parser("billing", help="View the workspace's subscription (read-only)")
@@ -6302,10 +6330,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     n_show.add_argument("--json", action="store_true", help="Emit the raw settings payload")
     n_show.add_argument("--plain", action="store_true", help="Tab-separated key/value output for scripts")
     n_enable = n_sub.add_parser("enable", help="Turn an agent's notifications on")
+    n_enable.set_defaults(write=True)
     n_enable.add_argument("agent", help="Agent id, id-prefix, or name")
     n_disable = n_sub.add_parser("disable", help="Turn an agent's notifications off")
+    n_disable.set_defaults(write=True)
     n_disable.add_argument("agent", help="Agent id, id-prefix, or name")
     n_set = n_sub.add_parser("set", help="Set a notification value field (e.g. the delivery channel)")
+    n_set.set_defaults(write=True)
     n_set.add_argument("agent", help="Agent id, id-prefix, or name")
     n_set.add_argument("--channel", default=None, choices=["dashboard", "email", "slack"], help="Where notifications are delivered")
     n_set.add_argument("--json", action="store_true", help="Emit the raw settings readback")
@@ -6651,30 +6682,17 @@ _IMPERSONATION_ALLOWED_WRITE_PATHS = frozenset({
     "/dev/session",                # branch-env plumbing: mint a throwaway dev token
 })
 
-# Verb attribute → the values on it that change the customer's setup. Each
-# command stores its verb under a distinct `<name>_cmd` dest, so an entry can't
-# collide with another command's verbs. The http_request backstop is the real
-# guarantee; this list only drives the earlier, cleaner pre-dispatch refusal (so
-# a missing entry costs a late refusal, never a leaked write).
-_WRITE_VERBS = {
-    "agents_cmd": {"create", "set", "remove"},
-    "integrations_cmd": {"connect", "sync", "remove"},
-    "actions_cmd": {"enable", "set", "disable"},
-    "triggers_cmd": {"add", "remove"},
-    "schedules_cmd": {"add", "remove", "fire"},
-    "file_cmd": {"add", "remove"},
-    "acl_cmd": {"set"},
-    "workspace_cmd": {"set", "extend-trial"},
-    "mcp_cmd": {"add", "set", "enable", "disable", "remove"},
-    "skills_cmd": {"add", "remove", "set"},
-    "notifications_cmd": {"enable", "disable", "set"},
-    "tasks_cmd": {"export"},
-}
-
-
 def _is_write_command(args) -> bool:
-    """True if the parsed command would change the customer's live setup."""
-    return any(getattr(args, attr, None) in verbs for attr, verbs in _WRITE_VERBS.items())
+    """True if the parsed command would change the customer's live setup.
+
+    Each customer-changing subcommand is tagged `write=True` at its parser
+    definition (`set_defaults(write=True)`), so the mark lives next to the
+    command and rides argparse's own resolution — a command with no such tag
+    reads as a non-write. The http_request backstop is the real guarantee; this
+    only drives the earlier, cleaner pre-dispatch refusal, so a command that
+    forgets the tag still gets refused (just later), never leaked.
+    """
+    return bool(getattr(args, "write", False))
 
 
 def _refuse_impersonated_write() -> None:
@@ -6683,7 +6701,9 @@ def _refuse_impersonated_write() -> None:
     identical wherever a write is stopped."""
     t = _impersonation_target or {}
     user, workspace = t.get("user", "a customer"), t.get("workspace", "their workspace")
-    print(_color(f"✗ Refused — you are impersonating {user} ({workspace}).", "31"), file=sys.stderr)
+    # err() already gives the "✗ " prefix + red; the two continuation lines are
+    # plain indented stderr (no helper emits an unprefixed line).
+    err(f"Refused — you are impersonating {user} ({workspace}).")
     print("  The eesel CLI won't change a customer's live setup while impersonating.", file=sys.stderr)
     print("  Run `eesel impersonate clear` to make this change as yourself.", file=sys.stderr)
     sys.exit(EXIT_IMPERSONATION_BLOCKED)

@@ -3060,39 +3060,61 @@ def _ns(**kw):
 
 
 class TestIsWriteCommand:
-    """`_is_write_command` classifies a parsed command as customer-changing or
-    not, by the verb stored under its `<name>_cmd` attribute."""
+    """`_is_write_command` reads the `write=True` tag each customer-changing
+    subcommand sets at its parser. These parse real argv through build_parser so
+    the test breaks if a write verb loses (or a read verb gains) its tag."""
 
-    def test_agent_writes_and_reads(self):
-        assert eesel._is_write_command(_ns(agents_cmd="create"))
-        assert eesel._is_write_command(_ns(agents_cmd="set"))
-        assert eesel._is_write_command(_ns(agents_cmd="remove"))
-        assert not eesel._is_write_command(_ns(agents_cmd="list"))
-        assert not eesel._is_write_command(_ns(agents_cmd="show"))
+    def _writes(self, *argv):
+        args = eesel.build_parser(staff=True).parse_args(list(argv))
+        return eesel._is_write_command(args)
 
-    def test_writes_across_commands(self):
-        assert eesel._is_write_command(_ns(mcp_cmd="add"))
-        assert eesel._is_write_command(_ns(workspace_cmd="set"))
-        assert eesel._is_write_command(_ns(workspace_cmd="extend-trial"))
-        assert eesel._is_write_command(_ns(tasks_cmd="export"))
-        assert eesel._is_write_command(_ns(actions_cmd="enable"))
-        assert eesel._is_write_command(_ns(integrations_cmd="sync"))
-        assert eesel._is_write_command(_ns(notifications_cmd="set"))
-        assert eesel._is_write_command(_ns(file_cmd="add"))
-        assert eesel._is_write_command(_ns(acl_cmd="set"))
+    def test_write_verbs_are_writes(self):
+        for argv in [
+            ("agents", "create", "--name", "x"),
+            ("agents", "set", "a", "--name", "n"),
+            ("agents", "remove", "a"),
+            ("mcp", "add", "--name", "n", "--url", "u"),
+            ("mcp", "set", "s", "--name", "n"),
+            ("mcp", "enable", "s"),
+            ("mcp", "remove", "s"),
+            ("workspace", "set", "billing-limit", "5"),
+            ("workspace", "extend-trial"),
+            ("tasks", "export"),
+            ("integrations", "connect", "z"),
+            ("integrations", "sync", "z"),
+            ("integrations", "remove", "z"),
+            ("automations", "triggers", "add", "a", "--key", "k"),
+            ("automations", "schedules", "fire", "j"),
+            ("files", "add", "--title", "t", "--content", "c"),
+            ("files", "remove", "k"),
+            ("files", "acl", "set", "a", "--prefix", "p"),
+            ("settings", "notifications", "set", "a"),
+        ]:
+            assert self._writes(*argv), f"{argv} should be a write"
 
-    def test_reads_are_not_writes(self):
-        assert not eesel._is_write_command(_ns(mcp_cmd="list"))
-        assert not eesel._is_write_command(_ns(workspace_cmd="show"))
-        assert not eesel._is_write_command(_ns(tasks_cmd="list"))
-        assert not eesel._is_write_command(_ns(billing_cmd="show"))
-        assert not eesel._is_write_command(_ns(integrations_cmd="sync-status"))
+    def test_read_verbs_are_not_writes(self):
+        for argv in [
+            ("agents", "list"),
+            ("agents", "show", "a"),
+            ("mcp", "list"),
+            ("workspace", "show"),
+            ("workspace", "members"),
+            ("tasks", "list"),
+            ("billing", "show"),
+            ("integrations", "list"),
+            ("integrations", "sync-status"),
+            ("files", "list"),
+            ("settings", "notifications", "show", "a"),
+        ]:
+            assert not self._writes(*argv), f"{argv} should NOT be a write"
 
     def test_chat_and_control_commands_are_not_writes(self):
-        # chat/new (positional message, no `_cmd` attr) and impersonate (control)
-        # must never be classified as writes.
-        assert not eesel._is_write_command(_ns(message="hi"))
-        assert not eesel._is_write_command(_ns(user_id="auth0|x"))
+        # chat (its write tools are stubbed server-side) and impersonate (control)
+        # must never be blocked while impersonating.
+        assert not self._writes("chat", "hi")
+        assert not self._writes("impersonate", "auth0|x")
+        assert not self._writes("impersonate", "clear")
+        assert not self._writes("whoami")
 
 
 class TestImpersonationBackstop:
@@ -3180,7 +3202,7 @@ class TestGuardImpersonatedCommand:
 
         monkeypatch.setattr(eesel, "_get_impersonate_status", boom)
         monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
-        eesel._guard_impersonated_command(_ns(agents_cmd="create"), {"api_url": "x", "token": "t"})
+        eesel._guard_impersonated_command(_ns(write=True), {"api_url": "x", "token": "t"})
         assert eesel._impersonation_target is None
 
     def test_idle_staff_not_blocked(self, monkeypatch, capsys):
@@ -3188,14 +3210,14 @@ class TestGuardImpersonatedCommand:
         monkeypatch.setattr(eesel, "_get_impersonate_status",
                             lambda c: {"allowed": True, "target_user_id": None})
         monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
-        eesel._guard_impersonated_command(_ns(agents_cmd="create"), self._creds())
+        eesel._guard_impersonated_command(_ns(write=True), self._creds())
         assert eesel._impersonation_target is None
         assert capsys.readouterr().err == ""
 
     def test_write_refused_with_distinct_code(self, monkeypatch, capsys):
         self._real_target(monkeypatch)
         with pytest.raises(SystemExit) as e:
-            eesel._guard_impersonated_command(_ns(agents_cmd="create"), self._creds())
+            eesel._guard_impersonated_command(_ns(write=True), self._creds())
         assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
         err = capsys.readouterr().err
         assert "▲ impersonating auth0|cust — cust-ws" in err  # banner
@@ -3203,7 +3225,7 @@ class TestGuardImpersonatedCommand:
 
     def test_read_shows_banner_but_is_not_blocked(self, monkeypatch, capsys):
         self._real_target(monkeypatch)
-        eesel._guard_impersonated_command(_ns(agents_cmd="list"), self._creds())
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
         cap = capsys.readouterr()
         assert "▲ impersonating" in cap.err  # banner on stderr
         assert "Refused" not in cap.err       # not blocked
@@ -3211,9 +3233,10 @@ class TestGuardImpersonatedCommand:
         assert eesel._impersonation_target is not None
 
     def test_control_command_not_blocked_under_target(self, monkeypatch, capsys):
-        # `impersonate clear` must run even while a target is live.
+        # `impersonate clear` must run even while a target is live — it carries
+        # no write tag, so the guard shows the banner but does not refuse it.
         self._real_target(monkeypatch)
-        eesel._guard_impersonated_command(_ns(user_id="clear"), self._creds())
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
         assert "Refused" not in capsys.readouterr().err
 
 
