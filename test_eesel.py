@@ -7,6 +7,7 @@ The CLI script has no `.py` extension, so we load it via importlib.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import hmac
@@ -7747,3 +7748,297 @@ class TestPathScopeUnknownHeadErrors:
         # A flag (not a word) after the agent is ambiguous; leave it untouched
         # rather than erroring, so argparse handles it as before.
         assert self.n("agents", "blog", "--json") == ["agents", "blog", "--json"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Input validation — id/key rejection before the network (ENG-5029 part 2)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestValidateId:
+    def test_accepts_plain_id_unchanged(self):
+        assert eesel.validate_id("agent-abc123") == "agent-abc123"
+
+    def test_accepts_uuid(self):
+        assert eesel.validate_id("2b2f5b56-0415-4378-abf7-ef0b5631c856")
+
+    def test_empty_and_none_pass_through(self):
+        # "no id given" is handled downstream, not treated as malformed here.
+        assert eesel.validate_id("") == ""
+        assert eesel.validate_id(None) is None
+
+    @pytest.mark.parametrize("bad", ["../creds", "a/b", "/leading", "files/x"])
+    def test_rejects_any_slash(self, bad):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_id(bad)
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_rejects_double_dot(self):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_id("..")
+        assert exc.value.code == 5
+
+    @pytest.mark.parametrize("bad", ["a\nb", "a\x00b", "a\x1fb", "a\x7fb"])
+    def test_rejects_control_chars(self, bad):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_id(bad)
+        assert exc.value.code == 5
+
+    @pytest.mark.parametrize("bad", ["a?b", "a#b", "a%2e"])
+    def test_rejects_url_metachars(self, bad):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_id(bad)
+        assert exc.value.code == 5
+
+    def test_message_names_the_offending_input(self, capsys):
+        with pytest.raises(SystemExit):
+            eesel.validate_id("../../workspaces/other", "agent")
+        err = capsys.readouterr().err
+        assert "agent" in err
+        assert "../../workspaces/other" in err
+
+
+class TestValidateKey:
+    def test_accepts_interior_slash(self):
+        assert eesel.validate_key("files/report.md") == "files/report.md"
+
+    def test_accepts_bare_filename(self):
+        assert eesel.validate_key("report.md") == "report.md"
+
+    def test_accepts_display_name_with_spaces(self):
+        # Action references may be display names; a space is not a URL hazard.
+        assert eesel.validate_key("Search tickets") == "Search tickets"
+
+    def test_rejects_traversal_segment(self):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_key("files/../secret")
+        assert exc.value.code == 5
+
+    def test_rejects_leading_slash(self):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_key("/files/x")
+        assert exc.value.code == 5
+
+    def test_dotdot_only_when_a_whole_segment(self):
+        # A literal ".." substring inside a segment is not traversal.
+        assert eesel.validate_key("files/a..b.md") == "files/a..b.md"
+
+    @pytest.mark.parametrize("bad", ["a?b", "a#b", "a%b", "x\x01y"])
+    def test_rejects_control_and_metachars(self, bad):
+        with pytest.raises(SystemExit) as exc:
+            eesel.validate_key(bad)
+        assert exc.value.code == 5
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Atomic, locked writes — a crash or race can't corrupt a session (part 1)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestAtomicWrites:
+    def test_roundtrip(self, tmp_path):
+        p = tmp_path / "x.json"
+        eesel._atomic_write(p, json.dumps({"a": 1}))
+        assert json.loads(p.read_text()) == {"a": 1}
+
+    def test_applies_mode(self, tmp_path):
+        import os, stat
+        p = tmp_path / "creds.json"
+        eesel._atomic_write(p, "{}", mode=0o600)
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+    def test_creates_parent_dir(self, tmp_path):
+        p = tmp_path / "nested" / "deep" / "x.json"
+        eesel._atomic_write(p, "{}")
+        assert p.exists()
+
+    def test_leaves_no_temp_file_behind(self, tmp_path):
+        p = tmp_path / "x.json"
+        eesel._atomic_write(p, "{}")
+        leftovers = [q.name for q in tmp_path.iterdir() if q.name.endswith(".tmp")]
+        assert leftovers == []
+
+    def test_credentials_write_is_atomic_and_0600(self, tmp_config):
+        import os, stat
+        eesel.save_creds({"env": "dev", "token": "t", "workspace_id": "w"})
+        assert stat.S_IMODE(os.stat(eesel.CREDS_FILE).st_mode) == 0o600
+        assert json.loads(eesel.CREDS_FILE.read_text())["token"] == "t"
+
+    def test_concurrent_writers_never_leave_unparseable_file(self, tmp_config):
+        """Many threads hammering the same session file, with a reader parsing it
+        on every iteration, must never see empty/truncated/half-written JSON.
+
+        This is the read-back that proves the "crash mid-write drops the whole
+        conversation" bug is closed: the atomic replace means a reader (or a
+        crash) only ever observes a complete file.
+        """
+        import threading
+        eesel.ensure_dirs()
+        errors: list = []
+        stop = threading.Event()
+
+        def writer(n: int):
+            for i in range(60):
+                eesel.save_session({
+                    "id": "hot",
+                    "messages": [{"sender": "user", "message": f"{n}-{i}"}] * (i + 1),
+                })
+
+        def reader():
+            path = eesel._session_path("hot")
+            while not stop.is_set():
+                if path.exists():
+                    try:
+                        json.loads(path.read_text())
+                    except (json.JSONDecodeError, ValueError) as e:
+                        errors.append(str(e))
+
+        eesel.save_session({"id": "hot", "messages": []})
+        writers = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+        r = threading.Thread(target=reader)
+        r.start()
+        for w in writers:
+            w.start()
+        for w in writers:
+            w.join()
+        stop.set()
+        r.join()
+        assert errors == []
+        # Final file is still valid.
+        assert isinstance(json.loads(eesel._session_path("hot").read_text()), dict)
+
+    def test_degrades_without_fcntl(self, tmp_path, monkeypatch):
+        # A host with no fcntl still gets an atomic write (no lock, never a crash).
+        monkeypatch.setattr(eesel, "fcntl", None)
+        p = tmp_path / "x.json"
+        eesel._atomic_write(p, json.dumps({"ok": True}))
+        assert json.loads(p.read_text()) == {"ok": True}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# EESEL_SESSION — parallel-safe sessions pinned per run (part 1)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestPinnedSession:
+    def test_none_when_unset(self, monkeypatch):
+        monkeypatch.delenv("EESEL_SESSION", raising=False)
+        assert eesel._pinned_session_id() is None
+
+    def test_blank_is_none(self, monkeypatch):
+        monkeypatch.setenv("EESEL_SESSION", "   ")
+        assert eesel._pinned_session_id() is None
+
+    def test_returns_the_id(self, monkeypatch):
+        monkeypatch.setenv("EESEL_SESSION", "run-alpha")
+        assert eesel._pinned_session_id() == "run-alpha"
+
+    def test_traversal_value_rejected_exit_5(self, monkeypatch):
+        monkeypatch.setenv("EESEL_SESSION", "../creds")
+        with pytest.raises(SystemExit) as exc:
+            eesel._pinned_session_id()
+        assert exc.value.code == 5
+
+    def test_pin_creates_session_with_that_id_and_no_current_pointer(self, tmp_config, monkeypatch):
+        monkeypatch.setenv("EESEL_SESSION", "alpha")
+        creds = {"workspace_id": "w-1", "agent_id": "a-1"}
+        sess = eesel.ensure_current_session(creds, agent_id="a-1")
+        assert sess["id"] == "alpha"
+        assert eesel.load_session("alpha") is not None
+        # current.json is never written by the pinned path.
+        assert not eesel.CURRENT_FILE.exists()
+        assert eesel.load_current() is None
+
+    def test_pin_leaves_existing_current_json_byte_for_byte(self, tmp_config, monkeypatch):
+        eesel.set_current("human-session")
+        before = eesel.CURRENT_FILE.read_bytes()
+        monkeypatch.setenv("EESEL_SESSION", "alpha")
+        eesel.ensure_current_session({"workspace_id": "w-1", "agent_id": "a-1"}, agent_id="a-1")
+        assert eesel.CURRENT_FILE.read_bytes() == before
+
+    def test_pin_reuses_existing_session(self, tmp_config, monkeypatch):
+        monkeypatch.setenv("EESEL_SESSION", "alpha")
+        creds = {"workspace_id": "w-1", "agent_id": "a-1"}
+        first = eesel.ensure_current_session(creds, agent_id="a-1")
+        first["messages"].append({"sender": "user", "message": "hi"})
+        eesel.save_session(first)
+        second = eesel.ensure_current_session(creds, agent_id="a-1")
+        assert second["id"] == "alpha"
+        assert second["messages"] == [{"sender": "user", "message": "hi"}]
+
+    def test_two_pins_do_not_cross_contaminate(self, tmp_config, monkeypatch):
+        creds = {"workspace_id": "w-1", "agent_id": "a-1"}
+        monkeypatch.setenv("EESEL_SESSION", "alpha")
+        a = eesel.ensure_current_session(creds, agent_id="a-1")
+        a["messages"].append({"sender": "user", "message": "for-alpha"})
+        eesel.save_session(a)
+        monkeypatch.setenv("EESEL_SESSION", "beta")
+        b = eesel.ensure_current_session(creds, agent_id="a-1")
+        b["messages"].append({"sender": "user", "message": "for-beta"})
+        eesel.save_session(b)
+        alpha = eesel.load_session("alpha")
+        beta = eesel.load_session("beta")
+        assert [m["message"] for m in alpha["messages"]] == ["for-alpha"]
+        assert [m["message"] for m in beta["messages"]] == ["for-beta"]
+        assert not eesel.CURRENT_FILE.exists()
+
+    def test_unpinned_still_uses_current_pointer(self, tmp_config, monkeypatch):
+        monkeypatch.delenv("EESEL_SESSION", raising=False)
+        creds = {"workspace_id": "w-1", "agent_id": "a-1"}
+        first = eesel.ensure_current_session(creds, agent_id="a-1")
+        # Sticky: a second call with no env var returns the same session.
+        second = eesel.ensure_current_session(creds, agent_id="a-1")
+        assert first["id"] == second["id"]
+        assert eesel.load_current() == first["id"]
+
+    def test_new_session_honours_explicit_id(self, tmp_config):
+        sess = eesel.new_session({"workspace_id": "w-1", "agent_id": "a-1"},
+                                 agent_id="a-1", name=None, switch_to=False, session_id="pinned-x")
+        assert sess["id"] == "pinned-x"
+        assert not eesel.CURRENT_FILE.exists()  # switch_to=False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Input hardening end-to-end — reject before any network call (part 2)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestInputHardeningNoNetwork:
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        # Any real request is a test failure: validation must fail closed first.
+        def boom(*a, **k):
+            raise AssertionError("network call made before validation")
+        monkeypatch.setattr(eesel, "http_request", boom)
+        monkeypatch.setattr(eesel, "http_request_allow_error", boom)
+        monkeypatch.delenv("EESEL_BASE_URL", raising=False)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_agents_get_traversal_rejected(self, fake_creds, capsys):
+        args = argparse.Namespace(agents_cmd="show", agent_id="../../workspaces/other",
+                                  show_instructions=False, json=False)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_agents(args)
+        assert exc.value.code == 5
+
+    def test_skills_add_traversal_rejected(self, fake_creds):
+        args = argparse.Namespace(skills_cmd="add", agent="a-1", skill_id="../x", force=True)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_skills(args)
+        assert exc.value.code == 5
+
+    def test_files_export_bad_key_rejected(self, fake_creds):
+        args = argparse.Namespace(document_id=None, document_key="files/../secret",
+                                  format="md", output=None, agent=None)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_files_export(args)
+        assert exc.value.code == 5
+
+    def test_tasks_show_control_char_rejected(self, fake_creds):
+        with pytest.raises(SystemExit) as exc:
+            eesel.resolve_task_id(fake_creds, "abc\ndef")
+        assert exc.value.code == 5
+
+    def test_wellformed_key_passes_validation(self):
+        # A legitimate key with interior slashes is not rejected.
+        assert eesel.validate_key("files/report.md") == "files/report.md"
