@@ -8057,3 +8057,47 @@ class TestOutputContractThroughMain:
         assert rc == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["tasks"][0]["task_id"] == "t1"
+
+
+class TestRedactionScope:
+    """Redaction masks only string secret material — verify it spares numeric
+    counts and booleans whose key names collide with a secret-hint substring."""
+
+    def test_preserves_numeric_count_under_token_hinted_key(self):
+        red = eesel._redact_secrets({"input_tokens": 1234, "output_tokens": 5, "access_token": "sk-1"})
+        assert red == {"input_tokens": 1234, "output_tokens": 5, "access_token": "***"}
+
+    def test_preserves_boolean_presence_flag(self):
+        assert eesel._redact_secrets({"has_auth_token": True}) == {"has_auth_token": True}
+
+    def test_still_masks_string_secret(self):
+        assert eesel._redact_secrets({"client_secret": "shh"}) == {"client_secret": "***"}
+
+
+class TestEmitRedactBeforeProject:
+    def test_property_entry_value_masked_even_when_projected(self, capsys):
+        # The {key,value} property shape marks `value` secret via its sibling
+        # `key`. Redaction must run before projection, or `--fields value`
+        # (which drops `key`) would leak the raw value.
+        payload = [{"key": "x_access_token", "value": "SECRET"}]
+        eesel.emit(payload, fields=["value"])
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed == [{"value": "***"}]
+
+
+class TestTasksExportDryRun:
+    def test_export_dry_run_previews_and_makes_no_export_call(self, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def rec(method, url, **k):
+            calls.append((method, url))
+            return {"agents": [], "message": "ok"}
+
+        monkeypatch.setattr(eesel, "http_request", rec)
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "wt")
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["tasks", "export", "--dry-run"])
+        assert exc.value.code == 0
+        # The export POST was previewed, never actually sent.
+        assert not any("/tasks/export" in u for _, u in calls)
+        assert "/tasks/export" in json.loads(capsys.readouterr().out)["url"]

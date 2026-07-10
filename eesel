@@ -257,14 +257,15 @@ def emit(payload, *, fields: list[str] | None = None, reveal: bool | None = None
     """
     if reveal is None:
         reveal = _REVEAL_SECRETS
-    # Project first: dropping keys before the recursive redaction walk means we
-    # never spend it on subtrees --fields is about to discard. Redaction still
-    # recurses into every surviving key, so nothing secret slips through.
+    # Redact before projecting. `_redact_secrets` masks a property entry's
+    # `value` based on its sibling `key`, so projecting first (which can drop
+    # `key`) would strip the signal redaction relies on and leak the value.
+    # Redaction must see the whole object.
+    if not reveal:
+        payload = _redact_secrets(payload)
     projection = fields if fields is not None else _OUTPUT_FIELDS
     if projection is not None:
         payload = _project_fields(payload, projection)
-    if not reveal:
-        payload = _redact_secrets(payload)
     if _OUTPUT_FORMAT == "json" and isinstance(payload, list) and not _is_tty():
         for item in payload:
             print(json.dumps(item))
@@ -1687,10 +1688,13 @@ def _redact_secrets(obj):
         for k, v in obj.items():
             key_is_secret = isinstance(k, str) and any(h in k.lower() for h in _SECRET_KEY_HINTS)
             mask = key_is_secret or (k == "value" and prop_is_secret)
-            # A boolean is a presence/enabled flag, never secret material — e.g.
-            # `has_auth_token: true` says an auth token exists without exposing
-            # it, so masking it to *** would destroy real, non-sensitive info.
-            if mask and not isinstance(v, (dict, list, bool)) and v not in (None, ""):
+            # Only a non-empty *string* is secret material. This deliberately
+            # spares numbers and booleans, whose keys can collide with a hint
+            # substring without being secrets — `has_auth_token: true` (a
+            # presence flag) and `input_tokens: 1234` (a usage count) both match
+            # "token" but carry no secret, and masking them would destroy real
+            # information while protecting nothing.
+            if mask and isinstance(v, str) and v:
                 out[k] = "***"
             else:
                 out[k] = _redact_secrets(v)
@@ -3096,6 +3100,12 @@ def _integrations_connect(args, creds: dict) -> int:
             err(f"Connecting '{key}' via '{opt_type}' needs an interactive browser OAuth step, and --no-input was given.")
             return 1
         url = _browser_connect_url(creds, endpoint, fields.get("subdomain") or fields.get("identifier"))
+        if _DRY_RUN:
+            # This connect path hands off to a browser OAuth flow rather than
+            # sending an API write, so preview the redirect and open nothing —
+            # --dry-run must not trigger a side effect.
+            emit({"action": "open_browser", "url": url})
+            return 0
         info(f"Opening your browser to connect '{key}' — complete the authorization there:\n  {url}")
         try:
             webbrowser.open(url)
@@ -4008,7 +4018,11 @@ def export_tasks(
     if agent_id:
         params["agent_id"] = agent_id
     qs = f"?{urllib.parse.urlencode(params)}" if params else ""
-    return http_request("POST", f"{creds['api_url']}/tasks/export{qs}", token=creds["token"], body={"filters": {}})
+    # A real side effect: it starts a background job and emails a link. So it
+    # routes through write_request — `--dry-run` previews the request instead of
+    # firing the export. (The other /workspace/tasks POSTs are pure reads and
+    # stay on http_request so dry-run leaves them working.)
+    return write_request("POST", f"{creds['api_url']}/tasks/export{qs}", token=creds["token"], body={"filters": {}})
 
 
 def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
@@ -5965,8 +5979,8 @@ _COMMAND_ENDPOINTS = {
     "mcp.show": "GET /workspaces/{ws}/mcp-servers",
     "mcp.add": "POST /workspaces/{ws}/mcp-servers",
     "mcp.set": "PUT /workspaces/{ws}/mcp-servers/{id}",
-    "mcp.enable": "POST /mcp-servers/{id}/toggle",
-    "mcp.disable": "POST /mcp-servers/{id}/toggle",
+    "mcp.enable": "POST /workspaces/{ws}/mcp-servers/{id}/toggle",
+    "mcp.disable": "POST /workspaces/{ws}/mcp-servers/{id}/toggle",
     "mcp.remove": "DELETE /workspaces/{ws}/mcp-servers/{id}",
     "files.list": "GET /documents",
     "files.show": "GET /documents",
@@ -5983,7 +5997,9 @@ _COMMAND_ENDPOINTS = {
     "skills.set": "PATCH /agents/{id}/skills/{id}/config",
     "workspace.show": "GET /workspaces",
     "workspace.members": "GET /workspaces/{ws}/members",
-    "workspace.set": "PUT /workspaces",
+    # `workspace set` dispatches on the field it's given (name → PUT /workspaces,
+    # billing-limit → POST /workspace/billing-limit), so no single endpoint
+    # string is accurate — annotate nothing rather than mislead an agent.
     "workspace.extend-trial": "POST /subscription/extend-trial",
     "settings.notifications.show": "GET /agents/{id}/notification-settings",
     "settings.notifications.enable": "PATCH /agents/{id}/notification-settings",
