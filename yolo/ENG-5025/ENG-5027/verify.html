@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify — ENG-5027: the eesel CLI fails honestly for a headless agent</title>
+<style>
+  :root{--ink:#2C2C2A;--muted:#5F5E5A;--faint:#888780;--line:#E2E0D8;--bg:#FAF9F5;
+        --ok:#0F6E56;--okbg:#E7F4EF;--warn:#8A5B10;--warnbg:#FBF1DE;--bad:#A5341F;--badbg:#F8E7E2;
+        --blue:#185FA5;--bluebg:#E6F1FB;}
+  *{box-sizing:border-box;}
+  body{margin:0;padding:40px 20px;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;line-height:1.5;}
+  .wrap{max-width:860px;margin:0 auto;}
+  h1{font-size:23px;margin:0 0 4px;}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 22px;}
+  .sub a{color:var(--blue);text-decoration:none;} .sub a:hover{text-decoration:underline;}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin-bottom:18px;}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 12px;}
+  h3{font-size:15px;margin:18px 0 6px;}
+  p{margin:0 0 10px;font-size:14.5px;}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.8px;
+       background:#F1EFE8;border-radius:5px;padding:1px 5px;}
+  .verdict{border-radius:14px;padding:18px 22px;margin-bottom:18px;border:1px solid;}
+  .verdict.pass{background:var(--okbg);border-color:#8FCBB6;}
+  .vtitle{font-size:19px;font-weight:700;margin:0 0 6px;color:var(--ok);}
+  .vtitle .flag{color:var(--warn);}
+  .grid{display:grid;grid-template-columns:1fr;gap:10px;margin:14px 0 0;}
+  .box{border-radius:10px;padding:12px 14px;font-size:14px;border:1px solid var(--line);background:#fff;}
+  .box b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--faint);margin-bottom:5px;}
+  .today{background:var(--badbg);border-color:#E7B8AC;}
+  .tmrw{background:var(--okbg);border-color:#8FCBB6;}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;margin:6px 0;}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top;}
+  th{background:#F5F3EC;font-weight:600;}
+  .flow{overflow-x:auto;}
+  .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:6px;padding:2px 7px;margin-right:6px;}
+  .tag.live{background:var(--okbg);color:var(--ok);}
+  .tag.test{background:var(--bluebg);color:var(--blue);}
+  .tag.read{background:#EEE;color:var(--muted);}
+  .tag.pass{background:var(--okbg);color:var(--ok);}
+  .tag.med{background:var(--warnbg);color:var(--warn);}
+  .tag.low{background:#EEE;color:var(--muted);}
+  details{border:1px solid var(--line);border-radius:10px;margin-bottom:12px;background:#fff;}
+  summary{cursor:pointer;padding:13px 16px;font-weight:600;font-size:14.5px;list-style:none;}
+  summary::-webkit-details-marker{display:none;}
+  summary:before{content:"▸ ";color:var(--faint);}
+  details[open] summary:before{content:"▾ ";}
+  .dbody{padding:2px 18px 16px;}
+  .finding{border-left:3px solid var(--line);padding:2px 0 2px 14px;margin:14px 0;}
+  .finding.med{border-color:#D9A441;}
+  .finding.low{border-color:#C9C6BC;}
+  .finding h4{margin:0 0 5px;font-size:14.5px;}
+  .muted{color:var(--muted);font-size:13.5px;}
+  ul{margin:6px 0 10px;padding-left:20px;} li{margin:3px 0;font-size:14px;}
+  .chk{list-style:none;padding-left:0;} .chk li{margin:7px 0;}
+  .watch{background:var(--warnbg);border:1px solid #E7CE9B;border-radius:10px;padding:12px 15px;font-size:14px;margin-top:10px;}
+  pre{background:#F1EFE8;border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:12.5px;
+      font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:8px 0;}
+  .kbd{color:var(--ok);font-weight:600;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Verify — the eesel CLI fails honestly for a headless agent</h1>
+<p class="sub">ENG-5027 · P2 of ENG-5025 · repo <code>eeselapp/eesel-cli</code> · branch <code>claude/hopeful-cohen-ddc91b</code> · commit <code>0ef7f0a</code><br>
+Picks up from the <a href="https://github.com/eeselapp/docs-and-designs/blob/kira/eng-5025-kickoff-plan/yolo/ENG-5025/ENG-5027/plan.html">kickoff plan</a> — this checks what section 4 specified actually holds.</p>
+
+<!-- PROBLEM -->
+<div class="card">
+<h2>The problem this solves</h2>
+<p><code>eesel</code> is the command-line tool for the eesel AI product. An AI agent driving it unattended — in a container or CI, with no human and no terminal attached (a "headless" or "non-TTY" run) — couldn't trust the outcome. A command that did nothing could report success; a real failure gave no machine-readable reason. So the agent had to guess whether to retry, re-authenticate, fix its input, or give up.</p>
+<p class="muted">Terms used below: a <b>typed exit code</b> is the number the process returns (<code>$?</code>), now chosen by failure class so an agent can branch on it without parsing the error text. The <b>shared HTTP helpers</b> are the internal functions every command routes its API calls through — sending failures through them is what gives most commands their typed code. A <b>redirect / browser-OAuth connect</b> is a connector that authorises by sending the user to a web page, which can't happen when there's no browser.</p>
+<div class="grid">
+  <div class="box today"><b>Today (before)</b>
+  <code>chat</code> with no message → drops into a REPL, hits end-of-input, <b>exits 0 having sent nothing</b>.<br>
+  <code>files read</code> with no target → prints <b>"Cancelled."</b> (nothing was cancelled).<br>
+  <code>integrations connect</code> on a browser-OAuth option → prints a URL and <b>exits 0 having connected nothing</b>.<br>
+  Any API error — 401, 404, 429, 500 — <b>all collapse to exit 1</b>.</div>
+  <div class="box tmrw"><b>After this change</b>
+  On a non-interactive terminal those three commands <b>fail with a clear reason and exit 6</b> instead.<br>
+  Failures carry a <b>typed exit code by class</b>: 3 auth · 4 not-found · 5 rate-limit · 6 validation · 7 server. 0/1/2 unchanged.<br>
+  The interactive experience for a human at a real terminal is untouched.</div>
+</div>
+</div>
+
+<!-- VERDICT -->
+<div class="verdict pass">
+<p class="vtitle">Does it work? &nbsp;Yes — <span class="flag">with three cheap fixes worth making first</span></p>
+<p style="margin:0 0 4px;font-size:14.5px;">All six acceptance criteria pass, verified against the running CLI: typed exit codes driven end-to-end through a stub server for every HTTP status class, and all three non-TTY guards observed firing (and correctly <em>not</em> firing on a real terminal). 713/713 unit + contract tests pass.</p>
+<p style="margin:8px 0 0;font-size:14.5px;"><b>The single biggest thing to look at:</b> the <code>files read</code> guard is placed <em>after</em> a network call, so a headless <code>files read</code> with no target against a briefly-down server exits <b>7 ("retry later")</b> instead of <b>6 ("fix your call")</b> — telling the agent to retry a call that can never succeed. Nominal case (server up) exits 6 correctly; this is an edge the AC didn't pin. One-line hoist fixes it.</p>
+
+<div style="margin-top:14px;">
+<p style="margin:0 0 4px;"><b>What changes for users</b></p>
+<ul style="margin-top:2px;">
+<li>A headless agent gets an honest outcome + a typed code it can branch on, with no special knowledge.</li>
+<li>Three deliberate failure-path changes: OAuth connect run headless now exits 6 (was 0); <code>chat</code>/<code>files read</code> with no argument on a non-TTY now error with 6 (was 0 / "Cancelled."); a failing API command's code changes from 1 to its typed class.</li>
+<li><code>--no-input</code> is now a documented, discoverable flag.</li>
+</ul>
+<p style="margin:10px 0 4px;"><b>What must not change (and didn't)</b></p>
+<ul style="margin-top:2px;">
+<li>On a real terminal, <code>chat</code>/<code>files read</code>/<code>connect</code> still open the REPL / picker / browser hand-off — <span class="tag live">ran it live (pty)</span> for connect; <span class="tag test">test-covered</span> for the pickers.</li>
+<li>Successful commands still exit 0; argument-usage errors still exit 2 via argparse — <span class="tag live">ran it live</span>.</li>
+</ul>
+<div class="watch"><b>Watch this:</b> the typed-code contract is applied unevenly. The <code>chat</code> streaming path and a few local-input errors still exit generic 1, so an agent that branches on 3/5/7 gets 1 in those corners. Mostly in-scope per the plan — but two sites contradict their own code comments (see Problems #2). And a confirmed collateral regression: two best-effort background lookups now leak a red <code>✗</code> error banner they used to swallow (Problems #3).</div>
+</div>
+</div>
+
+<!-- NEEDS A HUMAN -->
+<div class="card">
+<h2>🙋 Needs a human (3 decisions — none block correctness of the shipped AC)</h2>
+<ul class="chk">
+<li>☐ <b>Decide on the <code>files read</code> guard ordering (Problem #1).</b> Recommend hoisting the <code>if not sys.stdin.isatty()</code> check above <code>candidates = agent_documents(...)</code> at <code>eesel:4943</code> so a no-target headless call returns 6 regardless of server state. Pass = <code>eesel files read &lt;/dev/null</code> against an unreachable server returns 6, not 7.</li>
+<li>☐ <b>Decide the scope of the typed-code contract on the chat path (Problem #2).</b> Either accept "typed codes are scoped to the shared HTTP helpers" (then soften the README's unqualified "timeout/unreachable → 7") or route the two <code>URLError</code> sites at <code>eesel:1814</code> and <code>eesel:1897</code> through <code>fail(EXIT_SERVER, …)</code> — their comments already claim parity with the helpers. Two-line change.</li>
+<li>☐ <b>Add a breaking-change / migration note to the README (Safety, customer impact).</b> The exit-code table documents the new steady state but never warns an upgrading consumer that a failing command's code moved off 1 — a script whose failure branch is <code>if [ $? -eq 1 ]</code> now routes a 404/500 into its success branch. Pass = README names the three failure-path changes as breaking.</li>
+</ul>
+</div>
+
+<!-- FOOTPRINT -->
+<details>
+<summary>🗺️ Footprint — what changed</summary>
+<div class="dbody">
+<p class="muted">3 files · +260 / −23. No new module, no dependency, no server/DB touch — client-side CLI only.</p>
+<h3>New interface (the decisions to veto)</h3>
+<table>
+<tr><th>Surface</th><th>What</th></tr>
+<tr><td><code>EXIT_*</code> constants</td><td>Named codes 0–7 near the top of <code>eesel</code>. A committed contract; comment says they must not be renumbered.</td></tr>
+<tr><td><code>code_for_status(status)</code></td><td>Maps an HTTP failure status → typed code. Unclassified statuses (402, 409, …) fall through to 1.</td></tr>
+<tr><td><code>fail(code, msg)</code></td><td>Single exit point for a classified failure: prints <code>msg</code> via <code>err()</code>, then <code>sys.exit(code)</code>.</td></tr>
+<tr><td><code>--no-input</code></td><td>Was <code>argparse.SUPPRESS</code> (hidden); now carries real help text on <code>integrations connect</code>.</td></tr>
+</table>
+<h3>Where it routed / guarded</h3>
+<table>
+<tr><th>Site</th><th>Change</th></tr>
+<tr><td><code>http_request</code>, <code>http_request_allow_error</code>, <code>http_fetch</code></td><td>HTTP-error / timeout / unreachable exits now go through <code>fail(code_for_status(…))</code> / <code>fail(EXIT_SERVER, …)</code>.</td></tr>
+<tr><td><code>_integrations_connect</code> (submit branch), <code>_integrations_sync</code></td><td>The <code>≥400 → return 1</code> sites now <code>return code_for_status(status)</code>.</td></tr>
+<tr><td><code>cmd_chat</code></td><td>Guard before any agent lookup: no message + non-TTY → <code>EXIT_VALIDATION</code>. (Correctly pre-network.)</td></tr>
+<tr><td><code>cmd_files_read</code></td><td>Guard in the no-target else-branch: non-TTY → <code>EXIT_VALIDATION</code>. (Placed after the document fetch — see Problem #1.)</td></tr>
+<tr><td><code>_integrations_connect</code> (redirect branch)</td><td>Honest OAuth refusal fires on <code>--no-input</code> <b>or</b> <code>not sys.stdin.isatty()</code> (was <code>--no-input</code> only).</td></tr>
+<tr><td><code>README.md</code></td><td>New "Exit codes" section with the full table + the non-TTY behaviour note.</td></tr>
+</table>
+</div>
+</details>
+
+<!-- ACCEPTANCE CRITERIA -->
+<details open>
+<summary>✅ Acceptance criteria — 6 passed, 0 failed, 0 need a human</summary>
+<div class="dbody">
+
+<p class="muted">Harness (no live stack in this env): a fake creds file pointing at <code>127.0.0.1:8099</code>, and a small stdlib <code>http.server</code> returning a chosen status (or valid payloads), driving the real <code>./eesel</code> process and reading <code>$?</code>. A real TTY was simulated with a Python pty.</p>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> AC1 · chat, no message, non-interactive stdin → exit 6, no chat turn</h4>
+<p><code>./eesel chat &lt;/dev/null</code> → <code>✗ eesel chat needs a message on a non-interactive terminal. Pass one, e.g. eesel chat "your question".</code> · <span class="kbd">exit 6</span>. Confirmed pre-network: it still returned 6 with no server running, so no agent lookup / turn happened. Baseline (HEAD~1) for comparison: the same command entered the REPL (printed <code>you →</code>) and exited as a success.</p></div>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> AC2 · files read, no target, non-interactive stdin → exit 6, no "Cancelled."</h4>
+<p>With a working backend serving one file: <code>./eesel files read &lt;/dev/null</code> → <code>✗ eesel files read needs a file to read on a non-interactive terminal. Name it, e.g. eesel files read &lt;id|key|filename&gt;.</code> · <span class="kbd">exit 6</span> · the word "Cancelled." did not appear. Baseline (HEAD~1) printed <code>&gt; Cancelled.</code> See Problem #1 for the ordering edge.</p></div>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> AC3 · integrations connect, OAuth option, non-TTY, no --no-input → exit 6, connects nothing</h4>
+<p>Backend serving a Zendesk definition with a <code>redirect</code> OAuth option: <code>./eesel integrations connect zendesk --option oauth &lt;/dev/null</code> → <code>✗ Connecting 'zendesk' via 'oauth' needs an interactive browser OAuth step, which can't run on a non-interactive terminal…</code> · <span class="kbd">exit 6</span>. Read-back: <code>./eesel integrations list</code> → <code>(no integrations)</code>. No browser opened.</p></div>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> AC4 · typed exit codes by HTTP status</h4>
+<p>Each status driven through the shared helper against the stub, reading the real process exit code:</p>
+<div class="flow"><table>
+<tr><th>HTTP</th><td>401</td><td>403</td><td>404</td><td>429</td><td>400</td><td>422</td><td>500</td><td>502</td><td>402</td><td>409</td><td>unreachable</td></tr>
+<tr><th>exit</th><td>3</td><td>3</td><td>4</td><td>5</td><td>6</td><td>6</td><td>7</td><td>7</td><td>1</td><td>1</td><td>7</td></tr>
+<tr><th></th><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td><td class="kbd">✓</td></tr>
+</table></div>
+<p class="muted">Every class matched the contract, including unclassified 4xx (402/409) falling through to generic 1. Timeout → 7 is <span class="tag test">test-covered</span> (<code>TestHttpTimeoutHandling</code>). Note the <em>chat</em> path is exempt — Problem #2.</p></div>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> AC5 · --no-input is discoverable</h4>
+<p><code>./eesel integrations connect --help</code> lists <code>--no-input</code> with a real description ("Refuse a browser/OAuth (redirect) connect instead of opening a browser…"), no longer <code>SUPPRESS</code>. Also <span class="tag test">test-covered</span> (<code>test_no_input_flag_is_documented</code>).</p></div>
+
+<div class="finding"><h4><span class="tag pass">PASS</span> <span class="tag read">read the code</span> AC6 · exit codes documented</h4>
+<p>README has an "Exit codes" section with a full 0–7 table whose meanings match the observed behaviour, plus a note on the non-TTY failures. (Completeness caveat in "Needs a human" #3: no migration/breaking note.)</p></div>
+
+<h3>Must-not-change — spot-checked</h3>
+<ul>
+<li><span class="tag pass">PASS</span> <span class="tag live">live (pty)</span> Interactive terminal untouched: connect on a real TTY proceeds to the browser hand-off (printed the dashboard URL), does <em>not</em> hit the guard. Pickers/REPL on TTY are <span class="tag test">test-covered</span> (<code>_FakeStdin(True)</code>).</li>
+<li><span class="tag pass">PASS</span> <span class="tag live">ran it live</span> Success still exits 0 (<code>agents list</code> against a 200 backend). Argument-usage still exits 2 (missing required arg; unknown command).</li>
+<li><span class="tag pass">PASS</span> <span class="tag test">test-covered</span> OAuth submit connect / sync failure code moved 1 → typed class (<code>test_..._maps_to_validation</code>); browser <code>login</code> untouched.</li>
+<li><span class="tag pass">PASS</span> <span class="tag test">tests</span> Full suite 713 passed.</li>
+</ul>
+</div>
+</details>
+
+<!-- PROBLEMS -->
+<details open>
+<summary>🔍 Problems found (survived pressure-testing) — 1 medium behavioural, 1 scoped, 1 confirmed regression, 2 low</summary>
+<div class="dbody">
+
+<div class="finding med"><h4>#1 <span class="tag med">MEDIUM · still open</span> <span class="tag live">observed live</span> <code>files read</code> no-target guard fires after a network fetch</h4>
+<p>In <code>cmd_files_read</code>, <code>candidates = agent_documents(...)</code> (an HTTP call) runs at <code>eesel:4943</code>, <em>before</em> the non-TTY guard at <code>eesel:4965</code>. So for a headless <code>files read</code> with no target:</p>
+<ul>
+<li>Against a briefly-unreachable / 5xx server, the fetch exits <b>7 (server, "retry later")</b> before the guard can return <b>6 (validation, "fix the call")</b>. Observed live: with the backend down, <code>./eesel files read &lt;/dev/null</code> returned 7. The agent's own permanent usage bug is mislabeled as transient, so it retries forever.</li>
+<li>On an empty workspace it returns <b>0</b> at <code>eesel:4946</code> before ever reaching the guard.</li>
+</ul>
+<p class="muted"><b>Why still okay to ship:</b> the AC ("no target, non-TTY → 6") passes in the nominal case (server up), which is what was tested and locked. This is an edge the AC didn't pin. <b>Fix:</b> hoist the guard above the fetch — it doesn't use <code>candidates</code>. The <code>chat</code> guard is already placed correctly (pre-network); this makes <code>files read</code> match. <code>connect</code>'s guard also runs after its definition fetch, but that fetch is genuinely required to know the option is a redirect — acceptable.</p></div>
+
+<div class="finding med"><h4>#2 <span class="tag med">MEDIUM · scoped, 2 sites open</span> chat / streaming path never emits typed codes</h4>
+<p>The one-shot chat path collapses every failure to generic 1: <code>return 0 if reply is not None else 1</code> (<code>eesel:3758</code>), and <code>send_message</code>/<code>stream_reply</code> use bare <code>sys.exit("string")</code> on unreachable/non-JSON (<code>eesel:1793, 1814, 1897</code>) which yields exit 1. So <code>eesel chat "hi"</code> against an unreachable server exits <b>1</b> while <code>eesel agents list</code> exits <b>7</b>; a chat turn rejected 401/429/500 exits <b>1</b>, so an agent never learns to re-auth/back-off/retry from a chat turn.</p>
+<p class="muted"><b>Why largely okay to ship:</b> the plan (section 3, "how wide does the mapping reach") explicitly scoped typed codes to the shared HTTP helpers and says "leave everything else at 1." The chat SSE path is hand-rolled urllib, not those helpers. <b>But:</b> the two <code>URLError</code> sites at <code>eesel:1814</code> and <code>:1897</code> carry comments that say "exit cleanly <em>like the shared http_* helpers</em>" — and those helpers now return 7, so the comments are now false. Cheap, low-risk to route those two through <code>fail(EXIT_SERVER, …)</code>; the deeper "chat turn 401 → 3" is a larger scope call (accept, or file a follow-up).</p></div>
+
+<div class="finding med"><h4>#3 <span class="tag med">MEDIUM · confirmed regression · still open</span> <span class="tag live">reproduced</span> silent best-effort lookups now leak a <code>✗</code> error banner</h4>
+<p><code>_latest_sync_run</code> (<code>eesel:2927</code>) and <code>find_task_row</code> (<code>eesel:3998</code>) wrap an HTTP call in <code>try: … except SystemExit: return None</code> to degrade silently when a secondary lookup fails. Before, <code>http_request</code> failed via <code>sys.exit(string)</code>, whose message was <b>never printed</b> because the <code>SystemExit</code> was caught. Now <code>fail()</code> calls <code>err(msg)</code> <em>before</em> <code>sys.exit(code)</code>, so the red banner is written even though the exit is still swallowed.</p>
+<p class="muted">Reproduced directly: a swallowed 500 in <code>_latest_sync_run</code> now emits <code>✗ GET …/v2/sync-runs → 500: {"error":"boom"}</code> to stderr while still returning <code>None</code>. User-visible on the success paths of <code>eesel integrations status</code>, <code>eesel tasks show</code>, and <code>eesel tasks cost</code> — the command still works but prints a scary line it never used to. Cosmetic (no exit-code or functional change), but it defeats the intended silent degradation and is pure collateral. Consider having those two helpers suppress stderr around the swallowed call.</p></div>
+
+<div class="finding low"><h4>#4 <span class="tag low">LOW · pre-existing</span> <code>http_fetch</code> has no timeout handler despite its "mirrors http_request" docstring</h4>
+<p><code>http_request</code>/<code>http_request_allow_error</code> catch <code>(TimeoutError, socket.timeout)</code> → <code>EXIT_SERVER</code>, but <code>http_fetch</code> (<code>eesel:1112</code>) catches only <code>HTTPError</code>/<code>URLError</code>. <code>socket.timeout</code> is not a <code>URLError</code> subclass, so a slow server on <code>files read</code>/<code>export</code> escapes as a traceback (exit 1), not 7. The diff didn't touch this clause, but it now routes <code>http_fetch</code> through typed codes and its docstring claims parity — so the claim is inaccurate.</p></div>
+
+<div class="finding low"><h4>#5 <span class="tag low">LOW · scope-acknowledged</span> local-input errors are typed inconsistently</h4>
+<p>The three new guards return 6, but sibling local-input errors still <code>return 1</code>: <code>_integrations_sync</code> invalid <code>--type</code> (<code>eesel:3088</code>), <code>_integrations_connect</code> missing required <code>--field</code> (<code>eesel:3051</code>), and <code>_parse_field_args</code> malformed field. The README says "6 = bad/missing local input," so an agent gets 6 for some local-input errors and 1 for others. The plan scoped the mapping to "the clear cases," so this is acknowledged, not a regression.</p></div>
+
+<h3 style="margin-top:20px;">Safety squad (each lens ran — presence is the point)</h3>
+<ul>
+<li><b>Resilience — fine.</b> <code>fail()</code> adds no traceback surface; <code>code_for_status</code> is total over any int (unclassified → generic 1, never an exception); guards only call <code>sys.stdin.isatty()</code> and short-circuit before network. No new crash path.</li>
+<li><b>Operational load — fine, one caveat.</b> The CLI adds no requests and does no retrying (the chat guard removes a round-trip). Caveat: 429 → "back off and retry later" but no <code>Retry-After</code> is surfaced, and all 5xx/timeout lump into 7 "retry later" — a naive agent could retry a permanent 500. Inherent to a status taxonomy; the non-retryable classes (3/4/6) are split out sensibly.</li>
+<li><b>Cost — clean.</b> No metered/paid call added or changed; pure client-side mapping + TTY refusals.</li>
+<li><b>Customer impact — the real watch item.</b> Exit-0-on-success is preserved everywhere (scripts checking <code>-ne 0</code> keep working). The sharp break: a failing command's code moved off 1, so a script whose failure branch is <code>if [ $? -eq 1 ]</code> now misses a 404/500 and routes it into its success branch. Also OAuth-connect and no-arg chat/files-read in CI flip from "green" 0 to red 6. All correct fixes, but under-documented — see "Needs a human" #3.</li>
+</ul>
+</div>
+</details>
+
+<!-- ASK -->
+<details>
+<summary>💬 Ask about this change</summary>
+<div class="dbody">
+<p>Paste into a fresh Claude Code session to dig in:</p>
+<pre>I'm reviewing the verify for ENG-5027 (P2 of ENG-5025), repo eeselapp/eesel-cli —
+a single-file, stdlib-only Python CLI named `eesel`.
+Branch: claude/hopeful-cohen-ddc91b, commit 0ef7f0a. See the change: git diff HEAD~1.
+Plan:   docs-and-designs/yolo/ENG-5025/ENG-5027/plan.html (branch kira/eng-5025-kickoff-plan)
+Verify: eesel-cli/yolo/ENG-5025/ENG-5027/verify.html (this file)
+The change: typed exit codes (3 auth / 4 not-found / 5 rate-limit / 6 validation / 7 server;
+0/1/2 unchanged) routed through the shared HTTP helpers, plus non-TTY guards on
+`eesel chat` (no message), `eesel files read` (no target), and `eesel integrations connect`
+(browser-OAuth), and an unhidden `--no-input`.
+Session transcripts: the eesel-ai-yolo-transcripts S3 bucket, transcripts/eesel-cli/&lt;date&gt;/
+(read creds in yolo-reader.env).
+Ask me anything — start with Problems #1–#3.</pre>
+</div>
+</details>
+
+</div>
+</body>
+</html>
