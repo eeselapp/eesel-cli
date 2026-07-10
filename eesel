@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import contextlib
 import difflib
 import hashlib
 import hmac
@@ -90,15 +89,6 @@ import uuid
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-
-try:
-    # POSIX-only advisory file locking. The CLI installs via `curl | sh` and
-    # already assumes POSIX (0o600 chmod, ~/.config), so fcntl is present on the
-    # Linux/macOS targets. Guarded so a non-POSIX host degrades to atomic writes
-    # without the lock rather than failing to import.
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    fcntl = None
 
 # ──────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -426,35 +416,33 @@ def validate_key(value: str, label: str = "key") -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Atomic, locked file writes
+# Atomic file writes
 #
 # Session, pointer, and credentials writes must survive a crash and concurrent
 # writers. A plain write_text can leave a truncated file if the process dies
 # mid-write; a later read then fails to parse it and the whole session (its
-# accumulated history) is silently lost. These helpers write to a temp file in
-# the same directory and os.replace it into place, so a reader (or a crash)
-# never sees a half-written file, and take a short advisory lock so two
-# concurrent writers can't clobber each other.
-#
-# The lock is held only for the brief read-free write here — never across a
-# network call (see send_message, which saves the session only after the HTTP
-# turn completes). os.replace alone already prevents a torn file; the lock only
-# prevents a lost update between two writers racing the same path.
+# accumulated history) is silently lost. This helper writes to a uniquely-named
+# temp file in the same directory and os.replace()s it into place. os.replace is
+# atomic on POSIX, so a reader — or a crash, or another writer — only ever sees a
+# complete file: the old one or the fully-written new one, never a half-written
+# one. The unique temp name means two writers never collide, so no lock is needed
+# for the file to stay intact. Two writers to the same path still resolve as a
+# benign last-writer-wins on the (recoverable) pointer, which is acceptable — the
+# guarantee that matters is that no conversation is ever dropped to a torn file.
 # ──────────────────────────────────────────────────────────────────────────
 
 
 def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
-    """Write `text` to `path` atomically and under a short advisory lock.
+    """Write `text` to `path` atomically.
 
     The temp file is created in the target's own directory so os.replace is a
     same-filesystem rename (atomic); its name carries a pid + random suffix so
-    two writers never collide on the temp name — which keeps the write torn-free
-    even on a host with no lock (see _write_lock). `mode`, when given, is applied
-    to the temp file before the replace so the final file never briefly exists
-    with looser permissions (used for the 0o600 credentials file)."""
+    two concurrent writers never collide. `mode`, when given, is applied to the
+    temp file before the replace so the final file never briefly exists with
+    looser permissions (used for the 0o600 credentials file)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _write_lock(path):
-        tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
         tmp.write_text(text)
         if mode is not None:
             try:
@@ -462,32 +450,12 @@ def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
             except OSError:
                 pass
         os.replace(tmp, path)
-
-
-@contextlib.contextmanager
-def _write_lock(path: Path):
-    """Hold an exclusive advisory lock guarding writes to `path` for the `with`
-    block. A dedicated `.lock` sidecar is locked rather than the target itself,
-    so the lock outlives the os.replace that swaps the target's inode. Degrades
-    to no lock — the block still runs — where fcntl is absent or locking fails;
-    the atomic replace alone keeps the file from being torn."""
-    handle = None
-    if fcntl is not None:
-        try:
-            handle = open(path.parent / f".{path.name}.lock", "w")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except OSError:
-            if handle is not None:
-                handle.close()
-            handle = None
-    try:
-        yield
-    finally:
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
+    except OSError:
+        # A failed write/replace must leave the existing file untouched and not
+        # strand the temp file. Clean it up and re-raise so the caller sees the
+        # real error rather than a silent partial write.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3822,6 +3790,10 @@ def _current_run_count(creds: dict, sess: dict) -> int:
 
 def cmd_chat(args) -> int:
     creds = require_creds()
+    # Validate EESEL_SESSION up front so a malformed pin (e.g. a traversal) fails
+    # with EXIT_VALIDATION before any network call, not after the agent lookup.
+    # The pin is consumed later in ensure_current_session; this is the early gate.
+    _pinned_session_id()
     # `--agent` scopes this one chat to a specific agent (id, id-prefix, or
     # name), like the EESEL_AGENT env var but per-command. It is resolved in
     # memory and not persisted, so it never changes anything on disk. An

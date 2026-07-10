@@ -321,7 +321,7 @@ file — and two commands writing at once can't corrupt each other.
 
 ## Running under an agent (unattended / parallel)
 
-<!-- TODO: fold this section into CONTEXT.md when that lands (ENG-5030). -->
+<!-- TODO: fold this section into CONTEXT.md once that file exists. -->
 
 The CLI is safe to drive unattended and several at once.
 

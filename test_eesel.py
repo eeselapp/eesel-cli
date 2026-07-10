@@ -7907,12 +7907,15 @@ class TestAtomicWrites:
         # Final file is still valid.
         assert isinstance(json.loads(eesel._session_path("hot").read_text()), dict)
 
-    def test_degrades_without_fcntl(self, tmp_path, monkeypatch):
-        # A host with no fcntl still gets an atomic write (no lock, never a crash).
-        monkeypatch.setattr(eesel, "fcntl", None)
+    def test_failed_replace_leaves_old_file_and_no_temp(self, tmp_path, monkeypatch):
+        # A failed write must not destroy the existing file or strand a temp file.
         p = tmp_path / "x.json"
-        eesel._atomic_write(p, json.dumps({"ok": True}))
-        assert json.loads(p.read_text()) == {"ok": True}
+        eesel._atomic_write(p, json.dumps({"good": 1}))
+        monkeypatch.setattr(eesel.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+        with pytest.raises(OSError):
+            eesel._atomic_write(p, json.dumps({"bad": 2}))
+        assert json.loads(p.read_text()) == {"good": 1}  # old content intact
+        assert [q.name for q in tmp_path.iterdir() if q.name.endswith(".tmp")] == []
 
 
 # ──────────────────────────────────────────────────────────────────────────
