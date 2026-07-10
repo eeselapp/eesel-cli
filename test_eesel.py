@@ -1608,6 +1608,10 @@ class TestFilesRead:
         assert rc == 1
 
     def test_read_no_files_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # An empty workspace on an interactive terminal: nothing to pick, so a
+        # clean "(no files)" exit 0. (On a non-TTY, no target errors 6 before
+        # the fetch — see test_read_no_target_non_tty_errors_with_validation_code.)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "fetch_documents", lambda creds, **kw: [])
         rc = eesel.cmd_files_read(self._args(prefix="integrations/"))
         assert rc == 0
@@ -1619,18 +1623,38 @@ class TestFilesRead:
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
         assert eesel.cmd_files_read(self._args()) == 1
 
-    def test_read_no_target_non_tty_errors_with_validation_code(self, tmp_config, fake_creds, monkeypatch, capsys):
-        # No target on a non-interactive terminal: there's no picker to show, so
-        # fail honestly with the validation code and name the fix — never the
-        # misleading "Cancelled." (nothing was cancelled).
-        self._wire(monkeypatch)
+    def test_read_no_target_non_tty_errors_before_the_fetch(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # No target on a non-interactive terminal: fail with the validation code
+        # and name the fix — never the misleading "Cancelled." (nothing was
+        # cancelled). The guard runs BEFORE the document fetch, so a down server
+        # can't turn this into a server-class exit 7 ("retry later") for a call
+        # that can never succeed as invoked.
         monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "fetch_documents", lambda *a, **k: pytest.fail("must not fetch before the no-target guard"))
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: pytest.fail("must not open a picker on a non-TTY"))
         rc = eesel.cmd_files_read(self._args())
         assert rc == eesel.EXIT_VALIDATION
         err = capsys.readouterr().err
         assert "Cancelled." not in err
         assert "files read" in err
+
+
+class TestBestEffortLookupsStaySilent:
+    """`_latest_sync_run` and `find_task_row` decorate an already-successful
+    command (integrations status / tasks show/cost). When their background fetch
+    fails they must degrade to None *silently* — `fail()` prints via `err()`
+    before exiting, so without suppression the caught SystemExit would still leak
+    a red error banner onto the command's real output."""
+
+    def test_latest_sync_run_swallows_failure_without_printing(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_fetch_sync_runs", lambda creds: eesel.fail(eesel.EXIT_SERVER, "sync-runs endpoint down"))
+        assert eesel._latest_sync_run({"api_url": "x", "token": "t"}, "int-1") is None
+        assert capsys.readouterr().err == ""
+
+    def test_find_task_row_swallows_failure_without_printing(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_tasks", lambda creds, **k: eesel.fail(eesel.EXIT_AUTH, "401 on tasks list"))
+        assert eesel.find_task_row({"api_url": "x", "token": "t"}, "task-1") is None
+        assert capsys.readouterr().err == ""
 
 
 class TestHttpFetch:
@@ -3248,23 +3272,26 @@ class TestChatConnectionFailure:
             "messages": [],
         }
 
-    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch, capsys):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
         with pytest.raises(SystemExit) as excinfo:
             eesel.send_message(fake_creds, self._sess(), "hello")
-        assert "server reachable?" in str(excinfo.value.code)
+        # Unreachable is a server-class failure, same as the shared http_* helpers.
+        assert excinfo.value.code == eesel.EXIT_SERVER
+        assert "server reachable?" in capsys.readouterr().err
 
-    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch, capsys):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
         with pytest.raises(SystemExit) as excinfo:
             eesel.stream_reply(fake_creds, "task1", None)
-        assert "server reachable?" in str(excinfo.value.code)
+        assert excinfo.value.code == eesel.EXIT_SERVER
+        assert "server reachable?" in capsys.readouterr().err
 
     class _StreamResp:
         def __init__(self, exc):

@@ -67,11 +67,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import difflib
 import hashlib
 import hmac
 import http.client
 import http.server
+import io
 import json
 import os
 import re
@@ -1807,11 +1809,11 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
         return None
     except urllib.error.URLError as e:
         # The server isn't reachable at all (connection refused, DNS failure,
-        # timeout) — no HTTP response to surface. Exit cleanly like the shared
-        # http_* helpers rather than letting the connection error traceback
-        # escape. The user message was only appended in memory, so the on-disk
-        # session is left untouched by exiting before save_session.
-        sys.exit(f"POST {url} failed (server reachable?): {e}")
+        # timeout) — no HTTP response to surface. Exit with the server-class
+        # code like the shared http_* helpers rather than letting the connection
+        # error traceback escape. The user message was only appended in memory,
+        # so the on-disk session is left untouched by exiting before save_session.
+        fail(EXIT_SERVER, f"POST {url} failed (server reachable?): {e}")
 
     task_id = start_resp.get("taskId", sess["task_id"])
     sess["task_id"] = task_id
@@ -1892,9 +1894,9 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
         err(f"\nchat stream dropped mid-reply (server/connection?): {e}")
         return None
     except urllib.error.URLError as e:
-        # Server unreachable mid-stream — exit cleanly like the shared http_*
-        # helpers instead of leaking the connection error traceback.
-        sys.exit(f"GET {url} failed (server reachable?): {e}")
+        # Server unreachable mid-stream — exit with the server-class code like
+        # the shared http_* helpers instead of leaking the connection traceback.
+        fail(EXIT_SERVER, f"GET {url} failed (server reachable?): {e}")
 
     return None if saw_error else "".join(text_buffers[tid] for tid in text_order).strip()
 
@@ -2924,8 +2926,13 @@ def _runs_for_integration(runs: list, integration_id: str) -> list:
 def _latest_sync_run(creds: dict, integration_id: str):
     """The most recent sync run for an integration, or None — the one with the
     newest `updated_at` (so the result doesn't depend on the feed's order)."""
+    # Best-effort: a failure here must degrade to None silently, not smear the
+    # command's real output. The fetch can `fail()` (which prints via err()
+    # before exiting), so suppress its stderr — otherwise a caught SystemExit
+    # would still leak the error banner onto an otherwise-successful command.
     try:
-        matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
+        with contextlib.redirect_stderr(io.StringIO()):
+            matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
     except SystemExit:
         return None
     return max(matching, key=lambda r: r.get("updated_at") or r.get("started_at") or "", default=None)
@@ -3995,8 +4002,12 @@ def resolve_task_id(creds: dict, target: str) -> str | None:
 
 def find_task_row(creds: dict, task_id: str) -> dict | None:
     """Best-effort lookup of a task's metadata row for the `show` header."""
+    # Silence the fetch's stderr: it can `fail()` (which prints before exiting),
+    # and this lookup must degrade to None quietly rather than leak an error
+    # banner over the `tasks show` header it's decorating.
     try:
-        rows, _, _ = fetch_tasks(creds, limit=200)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows, _, _ = fetch_tasks(creds, limit=200)
     except SystemExit:
         return None
     return next((r for r in rows if r.get("task_id") == task_id), None)
@@ -4935,18 +4946,30 @@ def cmd_files_read(args) -> int:
     `eesel files read <id> > out.md` captures just the content.
     """
     creds = require_creds_scoped(args)
+    target = getattr(args, "target", None)
+
+    # No target means "open the picker" — which needs an interactive terminal.
+    # On a non-interactive stdin there's nothing to pick on, so fail honestly
+    # and name the fix instead of printing "Cancelled." (nothing was cancelled
+    # — there was no terminal to choose from). Checked before any network call:
+    # otherwise a failure reaching the server would exit 7 ("retry later") for a
+    # call that can never succeed as invoked, however many times it's retried.
+    if not target and not sys.stdin.isatty():
+        err("eesel files read needs a file to read on a non-interactive "
+            "terminal. Name it, e.g. eesel files read <id|key|filename>.")
+        return EXIT_VALIDATION
+
     if not _scope_files_agent(creds, args):
         return 1
     fmt = (getattr(args, "format", None) or "md").lower()
     prefix = getattr(args, "prefix", None)
+    scope = f" under prefix '{prefix}'" if prefix else ""
 
     candidates = agent_documents(creds, prefix=prefix)
-    scope = f" under prefix '{prefix}'" if prefix else ""
     if not candidates:
         info(f"(no files{scope})")
         return 0
 
-    target = getattr(args, "target", None)
     if target:
         match = match_document(candidates, target)
         if match is None:
@@ -4958,14 +4981,6 @@ def cmd_files_read(args) -> int:
             return 1
         doc = match
     else:
-        # No target means "open the picker" — which needs an interactive
-        # terminal. On a non-interactive stdin there's nothing to pick on, so
-        # fail honestly and name the fix instead of printing "Cancelled."
-        # (nothing was cancelled — there was no terminal to choose from).
-        if not sys.stdin.isatty():
-            err("eesel files read needs a file to read on a non-interactive "
-                "terminal. Name it, e.g. eesel files read <id|key|filename>.")
-            return EXIT_VALIDATION
         labels = [f"{(d.get('id') or '?')[:8]}  {_document_key(d) or d.get('name') or '?'}" for d in candidates]
         choice = interactive_select(labels, title=f"Select a file to read{scope}  (↑/↓, Enter, q to cancel):")
         if choice is None:
