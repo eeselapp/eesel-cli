@@ -1651,16 +1651,41 @@ def resolve_scheduled_job_strict(creds: dict, target: str) -> dict | None:
     return None
 
 
-def pick_agent(creds: dict, *, prompt: bool = True) -> str:
-    """Resolve the agent a session (chat / new) runs against.
+def resolve_session_agent(creds: dict) -> tuple[str | None, str | None]:
+    """Resolve the agent a session runs against, without any interaction.
 
-    Scope is explicit: an already-applied `--agent`/`EESEL_AGENT`
-    (`creds["agent_id"]`, set in memory for this invocation) wins. Otherwise a
-    single-agent workspace is used automatically. With several agents and no
-    scope, an interactive terminal shows a picker (asking, not silently
+    Returns ``(agent_id, None)`` when the agent is unambiguous — an already
+    applied `--agent`/`EESEL_AGENT` (`creds["agent_id"]`, set in memory for this
+    invocation) wins, else a single-agent workspace is used automatically. When
+    it can't decide (no agents, or several with no scope) returns
+    ``(None, reason)`` with a human-readable reason, so the caller decides how to
+    surface it (stderr + exit for a human, a JSON error envelope for `--json`).
+    Never prompts, never writes to stdout, never exits.
+    """
+    if creds.get("agent_id"):
+        return creds["agent_id"], None
+    agents = fetch_agents(creds)
+    if not agents:
+        return None, "No agents in workspace. Create one with `eesel agents create` first."
+    if len(agents) == 1:
+        return agents[0]["agent_id"], None
+    listing = "; ".join(f"{a.get('agent_id', '?')} {a.get('name', '?')}" for a in agents)
+    return None, (
+        f"This workspace has {len(agents)} agents — name the one to use with "
+        f"`--agent <id|name>`, EESEL_AGENT=<id|name>, or `eesel agents <id> chat …`. "
+        f"Agents: {listing}"
+    )
+
+
+def pick_agent(creds: dict, *, prompt: bool = True) -> str:
+    """Resolve the agent a session (chat / new) runs against, for a human caller.
+
+    Uses `resolve_session_agent` for the unambiguous cases. With several agents
+    and no scope, an interactive terminal shows a picker (asking, not silently
     guessing); a non-interactive/scripted run errors, so a script never talks to
     an arbitrary agent. The choice is never persisted — the next command must
-    scope itself again.
+    scope itself again. `--json` must not use this (its picker/errors go to
+    stdout/exit); it calls `resolve_session_agent` directly.
     """
     if creds.get("agent_id"):
         return creds["agent_id"]
@@ -1827,6 +1852,13 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
     tool_calls: dict[str, dict] = {}
     tool_order: list[str] = []
     saw_error = False
+    # The AI SDK stream ends with an authoritative terminal event — `finish` on a
+    # normal turn, `abort` if it was cancelled. The server's raw-stream endpoint
+    # consumes the transport's trailing `[DONE]` marker (it never reaches us), so
+    # `finish`/`abort` is the only completion signal the client sees. Without one,
+    # a clean EOF after partial text or an unfinished tool call is a truncated
+    # turn, not a completed one — track it so we don't report success on truncation.
+    saw_terminal = False
     # The failure reason, surfaced into the --json envelope's `error` field so an
     # agent parsing only stdout learns *why* a turn failed (not just that it did).
     error_text: str | None = None
@@ -1897,8 +1929,19 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
                         print(_color(f"[tool] → {preview}", "2;37"), flush=True)
                 elif etype == "error":
                     saw_error = True
+                    saw_terminal = True
                     error_text = evt.get("errorText") or "chat stream reported an error"
                     print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
+                elif etype == "finish":
+                    # Normal end of turn — the reply and every tool call are complete.
+                    saw_terminal = True
+                elif etype == "abort":
+                    # The turn was cancelled server-side; whatever we have is partial.
+                    saw_terminal = True
+                    saw_error = True
+                    reason = evt.get("reason")
+                    error_text = f"chat turn aborted{f': {reason}' if reason else ''}"
+                    print(_color(f"\n[aborted] {reason or 'turn cancelled'}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")
         err(f"raw-stream → {e.code}: {detail}")
@@ -1921,6 +1964,15 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
         saw_error = True
         error_text = f"chat stream dropped mid-reply (server reachable?): {e}"
         return _result()
+
+    # The stream closed without raising. A clean close is only a *completed* turn
+    # if we saw the terminal event; otherwise the connection ended early (LB idle
+    # close, graceful shutdown, empty stream) and the reply is truncated. Report
+    # it as a failure so `--json` doesn't emit status "completed" on partial data.
+    if not saw_terminal:
+        err("\nchat stream ended without a completion signal (truncated reply?)")
+        saw_error = True
+        error_text = "chat stream ended without a completion signal (truncated reply)"
 
     return _result()
 
@@ -3710,7 +3762,20 @@ def cmd_chat(args) -> int:
     # carry their own agent (from the task or the trigger below), so they don't
     # need one named here. Resolved in memory only — never persisted.
     if not task_target and not target and not creds.get("agent_id"):
-        agent_id = pick_agent(creds, prompt=True)
+        if json_mode:
+            # JSON mode is a non-interactive machine call: never show a picker
+            # (it writes to stdout and corrupts the single JSON object) and never
+            # block on input. Resolve without prompting; on an unresolvable agent
+            # emit one error envelope on stdout so the caller still parses a
+            # result, rather than exiting with only a stderr message.
+            agent_id, reason = resolve_session_agent(creds)
+            if agent_id is None:
+                envelope = {"task_id": None, "status": "error", "reply": "",
+                            "tool_calls": [], "error": reason}
+                print(json.dumps(envelope, indent=2))
+                return 1
+        else:
+            agent_id = pick_agent(creds, prompt=True)
         creds = dict(creds)
         creds["agent_id"] = agent_id
     if task_target:

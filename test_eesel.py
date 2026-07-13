@@ -7442,6 +7442,7 @@ class TestChatJson:
             {"type": "text-delta", "id": "m1", "delta": "Refunds "},
             {"type": "tool-output-available", "toolCallId": "c1", "output": "3 docs found"},
             {"type": "text-delta", "id": "m1", "delta": "are covered."},
+            {"type": "finish"},
         )
         monkeypatch.setattr(eesel.urllib.request, "urlopen",
                             self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
@@ -7496,6 +7497,47 @@ class TestChatJson:
         # parsing only stdout learns *why* it failed, not just that it did.
         assert env["error"] == "turn failed"
 
+    def test_clean_eof_without_finish_is_reported_as_error(self, fake_creds, monkeypatch):
+        # A stream that closes cleanly after partial text but WITHOUT the terminal
+        # `finish` event is a truncated turn (LB idle-close, graceful shutdown),
+        # not a completed one. Reporting it "completed" would exit 0 on a partial
+        # reply; the missing terminal signal makes it an error envelope instead.
+        lines = self._sse(
+            {"type": "text-start", "id": "m1"},
+            {"type": "text-delta", "id": "m1", "delta": "partial ans"},
+        )  # no finish
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert "completion signal" in env["error"]
+        # The partial text is still carried, so a caller can inspect what arrived.
+        assert env["reply"] == "partial ans"
+
+    def test_finish_event_marks_the_turn_completed(self, fake_creds, monkeypatch):
+        lines = self._sse(
+            {"type": "text-delta", "id": "m1", "delta": "done"},
+            {"type": "finish"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "completed"
+        assert env["reply"] == "done"
+
+    def test_abort_event_gives_error_envelope(self, fake_creds, monkeypatch):
+        # An aborted turn is a real terminal signal (not a truncation) but the
+        # reply is partial, so it's still an error envelope.
+        lines = self._sse(
+            {"type": "text-delta", "id": "m1", "delta": "half"},
+            {"type": "abort", "reason": "cancelled"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert "aborted" in env["error"]
+
     def test_midstream_unreachable_gives_error_envelope(self, fake_creds, monkeypatch):
         # A server that vanishes mid-stream (URLError on the raw-stream GET) must
         # still yield one parseable error envelope, not a bare exit with empty
@@ -7529,7 +7571,7 @@ class TestChatJson:
     # ---- cmd_chat: stdout purity, exit codes, guards ------------------------
 
     def test_cmd_chat_json_emits_one_clean_object_and_exits_0(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: "agent-test-456")
+        monkeypatch.setattr(eesel, "resolve_session_agent", lambda creds: ("agent-test-456", None))
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
         lines = self._sse(
             {"type": "text-start", "id": "m1"},
@@ -7537,6 +7579,7 @@ class TestChatJson:
              "toolName": "doc_search", "input": {"q": "x"}},
             {"type": "tool-output-available", "toolCallId": "c1", "output": "ok"},
             {"type": "text-delta", "id": "m1", "delta": "hello"},
+            {"type": "finish"},
         )
         monkeypatch.setattr(eesel.urllib.request, "urlopen",
                             self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
@@ -7553,7 +7596,7 @@ class TestChatJson:
         assert "eesel" not in out and "[tool]" not in out and "→" not in out
 
     def test_cmd_chat_json_error_event_exits_nonzero_with_object(self, fake_creds, monkeypatch, capsys):
-        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: "agent-test-456")
+        monkeypatch.setattr(eesel, "resolve_session_agent", lambda creds: ("agent-test-456", None))
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
         lines = self._sse({"type": "error", "errorText": "turn failed"})
         monkeypatch.setattr(eesel.urllib.request, "urlopen",
@@ -7573,6 +7616,7 @@ class TestChatJson:
              "toolName": "doc_search", "input": {"q": "x"}},
             {"type": "tool-output-available", "toolCallId": "c1", "output": "ok"},
             {"type": "text-delta", "id": "m1", "delta": "hi there"},
+            {"type": "finish"},
         )
         monkeypatch.setattr(eesel.urllib.request, "urlopen",
                             self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
@@ -7591,6 +7635,25 @@ class TestChatJson:
         captured = capsys.readouterr()
         assert captured.out == ""  # nothing on stdout
         assert "REPL" in captured.err or "--json requires a message" in captured.err
+
+    def test_cmd_chat_json_ambiguous_agent_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # A multi-agent workspace with no --agent: JSON mode must NOT show a
+        # picker (which would corrupt stdout on a TTY) or exit with only a stderr
+        # message (no envelope non-interactively). It emits one JSON error
+        # envelope on stdout and exits non-zero, and never reaches the interactive
+        # picker.
+        monkeypatch.setattr(eesel, "pick_agent", lambda *a, **k: pytest.fail("JSON mode must not use the interactive picker"))
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "a1", "name": "One"}, {"agent_id": "a2", "name": "Two"}])
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: pytest.fail("must not start a session with no agent"))
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        out = capsys.readouterr().out
+        env = json.loads(out)  # exactly one parseable object on stdout
+        assert env["status"] == "error"
+        assert env["task_id"] is None
+        assert "2 agents" in env["error"]
 
 
 class TestNewAgentScope:
