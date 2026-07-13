@@ -7655,6 +7655,46 @@ class TestChatJson:
         assert env["task_id"] is None
         assert "2 agents" in env["error"]
 
+    def test_cmd_chat_json_invalid_agent_flag_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # An explicit but unresolvable `--agent` must also produce one JSON error
+        # envelope on stdout, not an empty stdout + stderr-only exit.
+        monkeypatch.setattr(eesel, "resolve_agent_or_error", lambda creds, target: None)
+        rc = eesel.cmd_chat(_args(agent="missing", task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert env["task_id"] is None
+        assert "--agent" in env["error"] and "missing" in env["error"]
+
+    def test_cmd_chat_json_invalid_task_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # An unresolvable `--task` returns before a turn starts; JSON mode still
+        # emits one envelope.
+        monkeypatch.setattr(eesel, "resolve_task_id", lambda creds, t: None)
+        rc = eesel.cmd_chat(_args(agent=None, task="bogus", schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "--task" in env["error"] and "bogus" in env["error"]
+
+    def test_cmd_chat_json_unmatched_trigger_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: None)
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule="nope",
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "nope" in env["error"]
+
+    def test_cmd_chat_json_task_and_trigger_conflict_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        rc = eesel.cmd_chat(_args(agent=None, task="t1", schedule="s1",
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "mutually exclusive" in env["error"]
+
 
 class TestNewAgentScope:
     """`eesel new --agent X` / `--schedule J` scope the new session to that agent

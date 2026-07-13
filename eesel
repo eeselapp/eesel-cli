@@ -3728,6 +3728,19 @@ def _current_run_count(creds: dict, sess: dict) -> int:
     return d["total_runs"] if d else 0
 
 
+def _json_chat_error(reason: str) -> int:
+    """Emit the one-object machine contract for a pre-turn `--json` failure.
+
+    Every `--json` path — including an invalid `--agent`/`--task`/`--trigger` or
+    another pre-turn validation error — must still put exactly one parseable
+    object on stdout, not exit with empty stdout and only a stderr message. The
+    turn never started, so there's no task id; the human-readable detail has
+    already gone to stderr via err(). Always returns exit code 1."""
+    print(json.dumps({"task_id": None, "status": "error", "reply": "",
+                      "tool_calls": [], "error": reason}, indent=2))
+    return 1
+
+
 def cmd_chat(args) -> int:
     creds = require_creds()
     json_mode = bool(getattr(args, "json", False))
@@ -3744,6 +3757,8 @@ def cmd_chat(args) -> int:
     if getattr(args, "agent", None):
         match = resolve_agent_or_error(creds, args.agent)
         if not match:
+            if json_mode:
+                return _json_chat_error(f"could not resolve --agent '{args.agent}' (not found or ambiguous)")
             return 1
         creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
@@ -3756,6 +3771,8 @@ def cmd_chat(args) -> int:
     target = getattr(args, "schedule", None)
     if task_target and target:
         err("--task and --trigger are mutually exclusive.")
+        if json_mode:
+            return _json_chat_error("--task and --trigger are mutually exclusive")
         return 1
 
     # A plain chat/REPL must run against a named agent. --task and --trigger
@@ -3770,10 +3787,7 @@ def cmd_chat(args) -> int:
             # result, rather than exiting with only a stderr message.
             agent_id, reason = resolve_session_agent(creds)
             if agent_id is None:
-                envelope = {"task_id": None, "status": "error", "reply": "",
-                            "tool_calls": [], "error": reason}
-                print(json.dumps(envelope, indent=2))
-                return 1
+                return _json_chat_error(reason)
         else:
             agent_id = pick_agent(creds, prompt=True)
         creds = dict(creds)
@@ -3787,6 +3801,8 @@ def cmd_chat(args) -> int:
         # uuid is used as-is, so a task that isn't in the recent list still works.
         task_id = resolve_task_id(creds, task_target)
         if not task_id:
+            if json_mode:
+                return _json_chat_error(f"could not resolve --task '{task_target}'")
             return 1
         # Reuse the local session bound to that task if we have one (keeps local
         # history accumulating), otherwise create a fresh session pinned to it.
@@ -3808,6 +3824,8 @@ def cmd_chat(args) -> int:
         if not match:
             err(f"No scheduled job matches '{target}'.")
             info("Run `eesel automations schedules list` to see available jobs.")
+            if json_mode:
+                return _json_chat_error(f"no scheduled job matches --trigger '{target}'")
             return 1
         # Pin the agent for this preview session only — resolve it in memory,
         # mirroring --agent. The session itself stores agent_id (below), so the
