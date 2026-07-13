@@ -572,6 +572,15 @@ def require_creds_scoped(args) -> dict:
     return apply_agent_flag_override(require_creds(), getattr(args, "agent", None))
 
 
+def _use_creds(creds: dict) -> dict:
+    """Apply the agent-by-env override and record the result as the creds this
+    command runs with, so the `http_request` 401 self-heal can re-resolve and
+    persist the workspace without threading creds through every caller."""
+    global _current_creds
+    _current_creds = creds = apply_agent_env_override(creds)
+    return creds
+
+
 def require_creds() -> dict:
     # A worktree linked to a branch env (or an `EESEL_BASE_URL` override) mints a
     # throwaway token from that env's `/dev/session` per run. This reads nothing
@@ -579,7 +588,7 @@ def require_creds() -> dict:
     # five worktrees each target their own env with nothing global to race over.
     base_url = resolve_dev_base_url()
     if base_url:
-        return apply_agent_env_override(dev_session_creds(base_url))
+        return _use_creds(dev_session_creds(base_url))
 
     creds = load_creds()
     if not creds:
@@ -600,7 +609,10 @@ def require_creds() -> dict:
     if near_expiry and creds.get("refresh_token"):
         refreshed = refresh_prod_token(creds)
         if refreshed:
-            return apply_agent_env_override(refreshed)
+            # Resolve the effective workspace before EESEL_AGENT, so an agent
+            # named by env resolves against the workspace we'll actually query.
+            _apply_effective_workspace(refreshed)
+            return _use_creds(refreshed)
         # Refresh failed. If the access token is already dead we can't proceed;
         # if it's merely near expiry, fall through and use it for this command.
         if time.time() > expires_at:
@@ -611,7 +623,8 @@ def require_creds() -> dict:
         err("Token expired. Run `eesel login` again.")
         sys.exit(1)
 
-    return apply_agent_env_override(creds)
+    _apply_effective_workspace(creds)
+    return _use_creds(creds)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -972,36 +985,138 @@ def format_cost_full(d: dict, sess: dict, label: str = "session") -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
+# The creds the active command runs with, stashed by require_creds so the 401
+# self-heal below can re-resolve and persist the workspace without threading
+# creds through every http_request caller. None until a command authenticates.
+_current_creds: dict | None = None
+
+
+def _http_send(method: str, url: str, *, token: str | None, body: dict | None, timeout: int, headers: dict | None) -> dict:
+    """One HTTP attempt. Returns the parsed JSON dict; lets HTTPError / URLError /
+    timeout propagate so callers can decide whether to retry or exit."""
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json", **(headers or {})}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # A 2xx with a non-JSON body usually means a proxy/gateway or login
+            # page answered instead of the API (e.g. an HTML error page served
+            # with status 200). Surface a clean message rather than letting the
+            # JSONDecodeError traceback escape.
+            snippet = raw[:200].decode(errors="replace").strip()
+            sys.exit(
+                f"{method} {url} → {resp.status} but the response was not JSON "
+                f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+            )
+
+
+def http_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
+    # Belt-and-braces: refuse a customer-changing request while impersonating.
+    # Defined near main() alongside the pre-dispatch guard; a no-op unless a real
+    # impersonation target is active.
+    _impersonation_write_backstop(method, url)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if not raw:
-                return {}
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                # A 2xx with a non-JSON body usually means a proxy/gateway or
-                # login page answered instead of the API (e.g. an HTML error
-                # page served with status 200). Surface a clean message rather
-                # than letting the JSONDecodeError traceback escape.
-                snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
-                    f"{method} {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
-                )
+        return _http_send(method, url, token=token, body=body, timeout=timeout, headers=headers)
     except urllib.error.HTTPError as e:
+        if e.code == 401:
+            healed = _retry_with_current_workspace(method, url, token=token, body=body, timeout=timeout, headers=headers)
+            if healed is not None:
+                return healed
         body_text = e.read().decode(errors="replace")
         sys.exit(f"{method} {url} → {e.code}: {body_text}")
     except (TimeoutError, socket.timeout):
         sys.exit(f"{method} {url} timed out after {timeout}s (server slow or hung?).")
     except urllib.error.URLError as e:
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
+
+
+def _deep_contains(obj, value: str) -> bool:
+    """True if `value` (a workspace id) appears as a string anywhere in `obj`."""
+    if isinstance(obj, str):
+        return obj == value
+    if isinstance(obj, dict):
+        return any(_deep_contains(v, value) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_deep_contains(v, value) for v in obj)
+    return False
+
+
+def _deep_replace(obj, old: str, new: str):
+    """Return `obj` with every string equal to `old` replaced by `new`."""
+    if isinstance(obj, str):
+        return new if obj == old else obj
+    if isinstance(obj, dict):
+        return {k: _deep_replace(v, old, new) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deep_replace(v, old, new) for v in obj]
+    return obj
+
+
+def _retry_with_current_workspace(method: str, url: str, *, token, body, timeout, headers) -> dict | None:
+    """Self-heal a stale workspace pin on a 401, then retry once.
+
+    A 401 on a request that carried the stored `workspace_id` usually means the
+    pin is stale: a lapsed impersonation target, a workspace the login was
+    removed from, or a value left on disk by an older CLI. Re-resolve the
+    workspace the current identity actually acts in (`POST /workspaces/token`),
+    persist the correction, substitute the id into the URL/body, and retry the
+    request once. Gated on the id actually being in the request, so a genuinely
+    unauthorized call fails fast instead of retrying blindly. Prod logins only;
+    returns None (caller then reports the original 401) when it doesn't apply or
+    the retry fails — never loops.
+    """
+    creds = _current_creds
+    if not creds or not creds.get("refresh_token"):
+        return None
+    stale = creds.get("workspace_id")
+    if not stale:
+        return None
+    # Match the workspace id only where it stands as a whole URL segment or query
+    # value (after `/` or `=`, before `/`, `&`, `?`, or end) — never as a loose
+    # substring of some other opaque id — and exact-match it in the body.
+    ws_in_url = re.compile(r"(?<=[/=])" + re.escape(stale) + r"(?=[/&?]|$)")
+    in_url = ws_in_url.search(url) is not None
+    in_body = _deep_contains(body, stale)
+    if not (in_url or in_body):
+        return None
+    fresh = resolve_effective_workspace_id(creds)
+    if not fresh or fresh == stale:
+        return None
+
+    # Correct it in memory too, so a later http_request in this same command
+    # reuses the fixed workspace (best-effort — a `--agent` path holds a dict
+    # copy that won't see this). The retry below substitutes the id directly, so
+    # it doesn't rely on this; the disk write below is what fixes later runs.
+    creds["workspace_id"] = fresh
+    # Persist only the workspace correction, re-reading disk so an in-memory
+    # agent_id (never persisted, per require_creds) can't leak onto disk.
+    disk = load_creds()
+    if disk and not disk.get("ephemeral"):
+        disk["workspace_id"] = fresh
+        save_creds(disk)
+
+    # The retry re-sends via _http_send, skipping the write-backstop. Safe: a
+    # customer-changing request can't reach this point while impersonating — the
+    # pre-dispatch guard and the backstop both exit before any request goes out —
+    # so self-heal only ever retries a read (or an allowlisted POST-shaped read).
+    try:
+        return _http_send(
+            method,
+            ws_in_url.sub(fresh, url) if in_url else url,
+            token=token,
+            body=_deep_replace(body, stale, fresh) if in_body else body,
+            timeout=timeout,
+            headers=headers,
+        )
+    except Exception:
+        return None
 
 
 def http_request_allow_error(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60) -> tuple[int, dict]:
@@ -1014,6 +1129,7 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
     On a non-HTTP failure (server unreachable) it still exits, since there's no
     structured body to surface.
     """
+    _impersonation_write_backstop(method, url)
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -1991,9 +2107,11 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     hiccup.
 
     `allowed` is whether the caller may impersonate. `target_user_id` is the
-    *active* target or None: the endpoint reports the effective user as
-    `target_uid` even when idle, so a target counts as active only when an
-    impersonator origin is present (i.e. a swap actually happened).
+    *active* target or None. When idle the endpoint echoes the caller's own uid
+    as both `impersonator_uid` and `target_uid`, so a target counts as active
+    only when the two differ — i.e. the caller is acting as a *different* user.
+    Testing `target_uid` alone would report a phantom self-impersonation for
+    every sysadmin, since the caller's own uid is always present there.
     """
     try:
         req = urllib.request.Request(
@@ -2006,8 +2124,54 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     except Exception:
         return None
     allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
-    target = data.get("target_uid") if data.get("impersonator_uid") else None
+    impersonator = data.get("impersonator_uid")
+    target_uid = data.get("target_uid")
+    target = target_uid if (impersonator and target_uid and target_uid != impersonator) else None
     return {"allowed": allowed, "target_user_id": target}
+
+
+def resolve_effective_workspace_id(creds: dict) -> str | None:
+    """Return the workspace id the caller currently operates in.
+
+    `POST /workspaces/token` derives the workspace from the *effective* identity
+    — the impersonation target if one is active, otherwise the caller — so it is
+    the authoritative answer to "which workspace am I acting in". Used to point
+    the CLI at an impersonated user's workspace and back again on clear.
+
+    Best-effort: returns None on any failure so callers can leave the stored
+    workspace untouched rather than overwrite it with a wrong value.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{creds['api_url']}/workspaces/token",
+            data=json.dumps({"client": "cli"}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {creds['token']}"},
+            method="POST",
+        )
+        # Short timeout: a slow endpoint must not stall the CLI for long. Called
+        # once per invocation, only while impersonating (from the pre-dispatch
+        # guard), never on a normal customer's commands.
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read() or b"{}")
+    except Exception:
+        return None
+    return data.get("workspaceId") or data.get("workspace_id")
+
+
+def _apply_effective_workspace(creds: dict) -> None:
+    """Point `workspace_id` at the impersonated target's workspace, if active.
+
+    The stored `workspace_id` is the caller's own, fixed at login and never
+    overwritten on disk — so outside impersonation it is already correct and
+    there is nothing to do (a normal customer's commands make no extra call).
+    While impersonating, requests run as the target, usually in a different
+    workspace, so the stored value would 401. The pre-dispatch guard
+    (`_guard_impersonated_command`) has already resolved the target's workspace
+    and stashed it on `_impersonation_target`; reuse that rather than resolving
+    again. Applied in memory only, so nothing is persisted.
+    """
+    if _impersonation_target:
+        creds["workspace_id"] = _impersonation_target["workspace"]
 
 
 def cache_impersonator_flag(creds: dict) -> bool:
@@ -2065,10 +2229,15 @@ def cmd_whoami(args) -> int:
     if not creds:
         info("Not logged in.")
         return 0
+    # Resolve the workspace the CLI actually operates in — the impersonated
+    # user's while a target is active — for display only. Done on a copy so the
+    # is_impersonator save below can't persist it over the stored workspace.
+    shown = dict(creds)
+    _apply_effective_workspace(shown)
     expires_in = int((creds.get("expires_at") or 0) - time.time())
     print(f"env          : {creds.get('env')}")
     print(f"api_url      : {creds.get('api_url')}")
-    print(f"workspace_id : {creds.get('workspace_id')}")
+    print(f"workspace_id : {shown.get('workspace_id')}")
     # No stored "active agent": each agent-scoped command names its own agent
     # (path `agents <id> …`, `--agent`, or EESEL_AGENT), and a single-agent
     # workspace is used automatically.
@@ -3592,52 +3761,18 @@ def _actions_disable(args, creds: dict) -> int:
     return 0
 
 
-def fetch_current_workspace(creds: dict) -> dict:
-    """`GET /workspaces` — the workspace the current login resolves to, as a
-    single row (`workspaceId`, `workspaceName`, `workspaceOwnerUserId`, …).
-
-    Distinct from `fetch_workspace`, which fetches a *named* workspace by id
-    (`/workspaces/{id}`). This unindexed route resolves the workspace from the
-    token's identity, so under an active impersonation it returns the *target*
-    user's workspace — which is how we learn which one to pin after a swap,
-    without knowing its id up front.
-    """
-    return http_request("GET", f"{creds['api_url']}/workspaces", token=creds["token"])
-
-
-def resync_impersonated_workspace(creds: dict) -> str | None:
-    """Drop the stored workspace and re-pin it from `GET /workspaces`.
-
-    The stored `workspace_id` belongs to whoever we were acting as *before* an
-    impersonation change, so it's stale the instant the target flips (this is
-    the bug that made impersonated commands hit the wrong workspace). We clear
-    it first — and persist that — so a mid-flight failure leaves no
-    wrong-but-plausible id behind, then pin the workspace the now re-scoped
-    login resolves to. Returns the new id, or None if the response carried no
-    workspace (workspace left unset, with a warning).
-    """
-    creds.pop("workspace_id", None)
-    save_creds(creds)
-
-    workspace_id = fetch_current_workspace(creds).get("workspaceId")
-    if not workspace_id:
-        warn("No workspace visible for this login — workspace context left unset.")
-        return None
-
-    creds["workspace_id"] = workspace_id
-    save_creds(creds)
-    return workspace_id
-
-
 def cmd_impersonate(args) -> int:
     """`eesel impersonate <user_id>` and `eesel impersonate clear`.
 
     Sets (or clears) a sticky impersonation target on the server. From the
     moment you set a target, every subsequent `eesel` command behaves as if
-    that user were calling — auth, workspace context, agents, integrations.
-    Calls the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target`
-    and `/sysadmin/clear-impersonator-target`), reachable now that the CLI
-    authenticates with an Auth0 token.
+    that user were calling — auth, workspace, agents, integrations. On each of
+    those later commands the pre-dispatch guard resolves the target's workspace
+    and points the CLI at it, so workspace-scoped commands don't 401 against a
+    workspace the impersonated user can't see; once the target is cleared or
+    expires, the guard stops arming and commands run as yourself again. Calls
+    the dashboard sysadmin endpoints (`/sysadmin/set-impersonator-target` and
+    `/sysadmin/clear-impersonator-target`).
 
     Combine with `eesel chat --trigger heartbeat` to preview a target's
     heartbeat, or just `eesel chat` to run a general chat as them. WRITE
@@ -3646,6 +3781,11 @@ def cmd_impersonate(args) -> int:
 
     Sticks for ~1 hour, or until you `eesel impersonate clear`. Always
     visible in `eesel whoami`.
+
+    `set` and `clear` are sysadmin-gated and run through any active swap, so you
+    cannot switch or clear a target while impersonating a *non-sysadmin* user —
+    those calls return 401. Wait for the ~1 hour expiry or clear it from the
+    dashboard.
     """
     creds = require_creds()
     target = args.user_id
@@ -3656,45 +3796,31 @@ def cmd_impersonate(args) -> int:
 
     if target == "clear":
         url = f"{creds['api_url']}/sysadmin/clear-impersonator-target"
-        try:
-            http_request("GET", url, token=creds["token"])
-        except urllib.error.HTTPError as e:
-            try:
-                payload = json.loads(e.read().decode("utf-8") or "{}")
-            except Exception:
-                payload = {}
-            err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
+        status, payload = http_request_allow_error("GET", url, token=creds["token"])
+        if status != 200:
+            err(f"clear-impersonator-target → {status}: {payload.get('error') or 'failed'}")
+            if status in (401, 403):
+                info("Can't clear while impersonating a non-sysadmin user — the clear "
+                     "call itself runs as that user. It auto-expires in ~1 hour, or "
+                     "clear it from the dashboard.")
             return 1
         ok("Impersonation cleared.")
-        # The workspace was pinned to the impersonated target; now that we're
-        # back to our own login, re-pin it (clears the stale one either way).
-        ws = resync_impersonated_workspace(creds)
-        if ws:
-            info(f"Workspace reset to {ws}.")
         return 0
 
     # GET-with-side-effect, matching the /sysadmin/* convention. The target
     # user id goes in the `target` query param.
     url = f"{creds['api_url']}/sysadmin/set-impersonator-target?{urllib.parse.urlencode({'target': target})}"
-    try:
-        resp = http_request("GET", url, token=creds["token"])
-    except urllib.error.HTTPError as e:
-        try:
-            payload = json.loads(e.read().decode("utf-8") or "{}")
-        except Exception:
-            payload = {}
-        err(f"{url} → {e.code}: {payload.get('error') or e.reason}")
-        if e.code in (401, 403):
-            info("This command requires a sysadmin/impersonator account. Your current login isn't on the allowlist.")
+    status, payload = http_request_allow_error("GET", url, token=creds["token"])
+    if status != 200:
+        err(f"set-impersonator-target → {status}: {payload.get('error') or 'failed'}")
+        if status in (401, 403):
+            info("Requires a sysadmin/impersonator account. You also can't set a new "
+                 "target while already impersonating a non-sysadmin user — clear the "
+                 "current one first (or wait for it to expire).")
         return 1
 
-    ok(f"Impersonating: {resp.get('target') or target}")
-    # The stored workspace still points at our own login; with the target now
-    # set server-side, /workspaces returns theirs, so re-pin to the first one.
-    ws = resync_impersonated_workspace(creds)
-    if ws:
-        info(f"Workspace set to {ws}.")
-    info("All subsequent `eesel` commands run as this user.")
+    ok(f"Impersonating: {payload.get('target') or target}")
+    info("All subsequent `eesel` commands run as this user, in their workspace.")
     info("Run `eesel whoami` to confirm. Clear with `eesel impersonate clear`.")
     return 0
 
@@ -5893,6 +6019,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
                                      "the `agents <id> …` path or EESEL_AGENT")
 
     cr = d_sub.add_parser("add", help="Add a file to the workspace (prints its key)")
+    cr.set_defaults(write=True)
     cr.add_argument("--title", required=True, help="File title")
     content = cr.add_mutually_exclusive_group(required=True)
     content.add_argument("--content", help="File content (inline)")
@@ -5901,6 +6028,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
     cr.add_argument("--agent", help="Agent id, id-prefix, or name to grant knowledge access; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
 
     de = d_sub.add_parser("remove", help="Remove files by key (asks for confirmation)")
+    de.set_defaults(write=True)
     de.add_argument("keys", nargs="+", help="One or more file keys or ids to remove (each must match an existing file)")
     de.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     de.add_argument("--agent", help="Agent whose files to remove; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
@@ -5914,6 +6042,7 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
         "set",
         help="Replace an agent's knowledge-ACL key prefixes (this REPLACES the existing prefixes, it does not append)",
     )
+    acl_set.set_defaults(write=True)
     acl_set.add_argument("agent", help="Agent id, id-prefix, or name")
     acl_set.add_argument(
         "--prefix",
@@ -6063,15 +6192,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
                       help="Print only the system prompt (raw, pipeable)")
 
     create = a_sub.add_parser("create", help="Create a new agent")
+    create.set_defaults(write=True)
     create.add_argument("--name", help="Agent name (required)")
     create.add_argument("--instructions", help="The agent's instructions / system prompt (optional)")
 
     set_p = a_sub.add_parser("set", help="Change an agent's name or instructions (only the flags you pass)")
+    set_p.set_defaults(write=True)
     set_p.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     set_p.add_argument("--name", help="New name")
     set_p.add_argument("--instructions", help="New instructions / system prompt")
 
     remove = a_sub.add_parser("remove", help="Remove an agent (asks for confirmation)")
+    remove.set_defaults(write=True)
     remove.add_argument("agent_id", help="Full id, id prefix, or agent name (must match exactly one)")
     remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
@@ -6164,6 +6296,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_an.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
     tk_an.add_argument("--json", action="store_true", help="Emit the raw analytics payload instead of a summary")
     tk_ex = tk_sub.add_parser("export", help="Start a CSV export of tasks (download link is emailed when ready)")
+    tk_ex.set_defaults(write=True)
     tk_ex.add_argument("--agent", help="Export only one agent's tasks (full id, id-prefix, or name)")
     tk_ex.add_argument("--start-date", dest="start_date", help="Range start, YYYY-MM-DD (default: last 7 days)")
     tk_ex.add_argument("--end-date", dest="end_date", help="Range end, YYYY-MM-DD (default: now)")
@@ -6237,11 +6370,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         "`eesel login`; the CLI does not wait for the flow to finish.",
     )
     _connect_args(i_connect)
+    i_connect.set_defaults(write=True)
     i_sy = ig_sub.add_parser(
         "sync",
         help="Trigger a data sync for a connected integration (Zendesk only today)",
         description="Trigger a data sync. --type must be one of: help-center, macros, tickets.",
     )
+    i_sy.set_defaults(write=True)
     i_sy.add_argument("id", help="Full id, id prefix, or integration type of a connected integration")
     i_sy.add_argument(
         "--type",
@@ -6260,6 +6395,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         p.add_argument("--agent", help="Remove the integration from just this agent (id, id-prefix, or name) — other agents keep their access. Without it, the integration is uninstalled for the whole workspace.")
 
     i_rm = ig_sub.add_parser("remove", help="Remove an integration from one agent (--agent) or uninstall it for the whole workspace")
+    i_rm.set_defaults(write=True)
     _remove_args(i_rm)
 
     ig_act = ig_sub.add_parser("actions", help="List, show, enable, disable, or set an integration's actions")
@@ -6284,15 +6420,18 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # enable and edit both POST /agents/{id}/tools/{tool_key}; enable sends an
     # empty config (action at its default settings), edit sends the given config.
     a_en = act_sub.add_parser("enable", help="Enable an action for the agent (POST with empty config)")
+    a_en.set_defaults(write=True)
     a_en.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_en)
 
     a_ed = act_sub.add_parser("set", help="Configure an action's settings, e.g. permission mode (POST with config)")
+    a_ed.set_defaults(write=True)
     a_ed.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     a_ed.add_argument("--config", required=True, help="The action's full config as a JSON object (replaces what's stored; permission keys are kept if omitted), e.g. '{\"permission_mode\": \"ask\"}'")
     _agent_arg(a_ed)
 
     a_di = act_sub.add_parser("disable", help="Disable an action for the agent (DELETE; asks for confirmation)")
+    a_di.set_defaults(write=True)
     a_di.add_argument("action", help="The action's key (e.g. 'zendesk_leave_internal_note')")
     _agent_arg(a_di)
     a_di.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
@@ -6310,21 +6449,26 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     m_show.add_argument("--json", action="store_true", help="Emit the raw MCP server payload")
 
     m_add = m_sub.add_parser("add", help="Register (bring in) a new MCP server")
+    m_add.set_defaults(write=True)
     m_add.add_argument("--name", required=True, help="Display name for the MCP server")
     m_add.add_argument("--url", required=True, help="MCP server base URL (e.g. https://mcp.example.com)")
     m_add.add_argument("--config", help="Extra config as a JSON object (e.g. '{\"auth_type\": \"bearer\", \"auth_token\": \"...\"}')")
 
     m_edit = m_sub.add_parser("set", help="Change an MCP server's name or URL (only the flags you pass)")
+    m_edit.set_defaults(write=True)
     m_edit.add_argument("server", help="Full id, id prefix, or exact name")
     m_edit.add_argument("--name", help="New display name")
     m_edit.add_argument("--url", help="New base URL")
 
     m_enable = m_sub.add_parser("enable", help="Activate an MCP server")
+    m_enable.set_defaults(write=True)
     m_enable.add_argument("server", help="Full id, id prefix, or exact name")
     m_disable = m_sub.add_parser("disable", help="Deactivate an MCP server")
+    m_disable.set_defaults(write=True)
     m_disable.add_argument("server", help="Full id, id prefix, or exact name")
 
     m_remove = m_sub.add_parser("remove", help="Remove (take out) an MCP server (asks for confirmation)")
+    m_remove.set_defaults(write=True)
     m_remove.add_argument("server", help="Full id, id prefix, or exact name")
     m_remove.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
 
@@ -6362,11 +6506,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     t_reg.add_argument("--json", action="store_true", help="Emit the raw registry payload")
 
     t_add = t_sub.add_parser("add", help="Add a trigger to an agent")
+    t_add.set_defaults(write=True)
     t_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the trigger to")
     t_add.add_argument("--key", required=True, help="Trigger key from `eesel automations triggers registry` (e.g. 'zendesk_ticket_created')")
     t_add.add_argument("--config", help="Trigger config as a JSON object")
 
     t_rm = t_sub.add_parser("remove", help="Remove a trigger by id")
+    t_rm.set_defaults(write=True)
     t_rm.add_argument("trigger_id", help="The trigger's id (first column of `eesel automations triggers list`)")
     t_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
@@ -6381,6 +6527,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_ls.add_argument("--json", action="store_true", help="Emit the raw scheduled-job payload")
 
     sc_add = sc_sub.add_parser("add", help="Add a scheduled job to an agent")
+    sc_add.set_defaults(write=True)
     sc_add.add_argument("agent", help="Agent id, id-prefix, or name to attach the job to")
     sc_add.add_argument("--cron", required=True, help="Cron expression for the schedule (e.g. '0 9 * * *')")
     sc_add.add_argument("--prompt", required=True, help="The instruction the agent runs each time the job fires")
@@ -6389,10 +6536,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sc_add.add_argument("--config", help="Extra job config as a JSON object (merged under the flags above)")
 
     sc_rm = sc_sub.add_parser("remove", help="Remove a scheduled job by id")
+    sc_rm.set_defaults(write=True)
     sc_rm.add_argument("job", help="The job's id (first column of `eesel automations schedules list`)")
     sc_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt")
 
     sc_fire = sc_sub.add_parser("fire", help="Manually fire a scheduled job once")
+    sc_fire.set_defaults(write=True)
     sc_fire.add_argument("job", help="Full id, id prefix, or substring of the job title (e.g. 'heartbeat')")
 
     sp.set_defaults(func=cmd_schedules)
@@ -6413,14 +6562,17 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sk_sh.add_argument("skill_id", help="Skill id to show")
     sk_sh.add_argument("--json", action="store_true", help="Emit the raw skill payload")
     sk_add = sk_sub.add_parser("add", help="Install a skill from the marketplace onto an agent")
+    sk_add.set_defaults(write=True)
     sk_add.add_argument("agent", help=_AGENT_HELP)
     sk_add.add_argument("skill_id", help="Skill id to install")
     sk_rm = sk_sub.add_parser("remove", help="Uninstall a skill from an agent (asks for confirmation)")
+    sk_rm.set_defaults(write=True)
     sk_rm.add_argument("agent", help=_AGENT_HELP)
     sk_rm.add_argument("skill_id", help="Skill id to uninstall")
     sk_rm.add_argument("-f", "--force", action="store_true", help="Skip the confirmation prompt (for non-interactive use)")
     # `set` merges keys into a skill's per-agent config (PATCH, not replace).
     sk_ed = sk_sub.add_parser("set", help="Set a skill's per-agent config — merges the given keys into the existing config (does not replace it)")
+    sk_ed.set_defaults(write=True)
     sk_ed.add_argument("agent", help=_AGENT_HELP)
     sk_ed.add_argument("skill_id", help="Skill id to configure")
     sk_ed.add_argument("--config", required=True, help="Config keys to set, as a JSON object (merged into the skill's existing config), e.g. '{\"key\": \"value\"}'")
@@ -6433,11 +6585,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     w_show = w_sub.add_parser("show", help="Show the active workspace (name, owner, trial, etc.)")
     w_show.add_argument("--json", action="store_true", help="Emit the raw workspace payload")
     w_set = w_sub.add_parser("set", help="Set a workspace field (name or billing-limit)")
+    w_set.set_defaults(write=True)
     w_set.add_argument("field", choices=["name", "billing-limit"], help="The field to set")
     w_set.add_argument("value", help="The new value (a name string, or a non-negative integer for billing-limit)")
     w_members = w_sub.add_parser("members", help="List the workspace's members (email + role)")
     w_members.add_argument("--json", action="store_true", help="Emit the raw members payload")
-    w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
+    w_extend = w_sub.add_parser("extend-trial", help="Extend the workspace's free-trial window")
+    w_extend.set_defaults(write=True)
     sp.set_defaults(func=cmd_workspace)
 
     sp = sub.add_parser("billing", help="View the workspace's subscription (read-only)")
@@ -6465,10 +6619,13 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     n_show.add_argument("--json", action="store_true", help="Emit the raw settings payload")
     n_show.add_argument("--plain", action="store_true", help="Tab-separated key/value output for scripts")
     n_enable = n_sub.add_parser("enable", help="Turn an agent's notifications on")
+    n_enable.set_defaults(write=True)
     n_enable.add_argument("agent", help="Agent id, id-prefix, or name")
     n_disable = n_sub.add_parser("disable", help="Turn an agent's notifications off")
+    n_disable.set_defaults(write=True)
     n_disable.add_argument("agent", help="Agent id, id-prefix, or name")
     n_set = n_sub.add_parser("set", help="Set a notification value field (e.g. the delivery channel)")
+    n_set.set_defaults(write=True)
     n_set.add_argument("agent", help="Agent id, id-prefix, or name")
     n_set.add_argument("--channel", default=None, choices=["dashboard", "email", "slack"], help="Where notifications are delivered")
     n_set.add_argument("--json", action="store_true", help="Emit the raw settings readback")
@@ -6779,6 +6936,123 @@ def _normalize_integrations_argv(argv: list[str]) -> list[str]:
     return argv[: i + 1] + ["actions", integration] + tail
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Impersonation write-guard
+#
+# While a staff login is impersonating a customer, every command runs in the
+# customer's live workspace. Reads and chat are fine (chat's write tools are
+# stubbed server-side), but any command that changes the customer's setup would
+# hit their real account. Two layers refuse those, both no-ops unless a *real*
+# target is active:
+#   1. A pre-dispatch check in main() — refuses a known write command before any
+#      API call, and shows a banner on every command.
+#   2. A backstop in http_request — refuses any mutating HTTP method that a verb
+#      tag missed, so a forgotten command can't become a silent hole.
+# This is a CLI-side guard for the operator's own tool; a direct curl under a
+# live target still writes. The complete fix (server-side block-by-default) is a
+# separate, human-gated change.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Distinct from 1 (general error) and 2 (usage) so a caller can tell a refused
+# impersonated write apart from an ordinary failure.
+EXIT_IMPERSONATION_BLOCKED = 3
+
+# Set once by _guard_impersonated_command() when a real target is active; read
+# by the http_request backstop. None means "not impersonating".
+_impersonation_target: dict | None = None
+
+# Mutating-method requests to these paths are reads or plumbing, not customer
+# changes, so they run under a live target. Everything else with a mutating
+# method is refused by the backstop.
+_IMPERSONATION_ALLOWED_WRITE_PATHS = frozenset({
+    "/workspaces/token",           # mint the identity-resolved workspace token (how we find the target's workspace)
+    "/workspace/tasks",            # activity list/count — a POST-shaped read
+    "/workspace/tasks/analytics",  # activity analytics — a POST-shaped read
+    "/dev/session",                # branch-env plumbing: mint a throwaway dev token
+})
+
+def _is_write_command(args) -> bool:
+    """True if the parsed command would change the customer's live setup.
+
+    Each customer-changing subcommand is tagged `write=True` at its parser
+    definition (`set_defaults(write=True)`), so the mark lives next to the
+    command and rides argparse's own resolution — a command with no such tag
+    reads as a non-write. The http_request backstop is the real guarantee; this
+    only drives the earlier, cleaner pre-dispatch refusal, so a command that
+    forgets the tag still gets refused (just later), never leaked.
+    """
+    return bool(getattr(args, "write", False))
+
+
+def _refuse_impersonated_write() -> None:
+    """Print the refusal to stderr and exit with the distinct block code. Used by
+    both the pre-dispatch check and the http_request backstop, so the message is
+    identical wherever a write is stopped."""
+    t = _impersonation_target or {}
+    user, workspace = t.get("user", "a customer"), t.get("workspace", "their workspace")
+    # err() already gives the "✗ " prefix + red; the two continuation lines are
+    # plain indented stderr (no helper emits an unprefixed line).
+    err(f"Refused — you are impersonating {user} ({workspace}).")
+    print("  The eesel CLI won't change a customer's live setup while impersonating.", file=sys.stderr)
+    print("  Run `eesel impersonate clear` to make this change as yourself.", file=sys.stderr)
+    sys.exit(EXIT_IMPERSONATION_BLOCKED)
+
+
+def _impersonation_write_backstop(method: str, url: str) -> None:
+    """Refuse a mutating request under a live target unless its path is a known
+    read/plumbing exception. A mutating GET (there are none today that change a
+    customer's setup) would slip past this and must be caught by _WRITE_VERBS."""
+    if _impersonation_target is None:
+        return
+    if method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    if urllib.parse.urlsplit(url).path in _IMPERSONATION_ALLOWED_WRITE_PATHS:
+        return
+    _refuse_impersonated_write()
+
+
+def _guard_impersonated_command(args, creds: dict | None) -> None:
+    """Before dispatch: if a real impersonation target is active, show a banner on
+    every command and refuse the ones that would change the customer's setup.
+
+    Gated on the cached staff flag, so a normal customer login makes no status
+    call, shows no banner, and is never blocked — zero cost off the staff path.
+    Idle staff (no target armed) act as themselves and are likewise untouched.
+    """
+    global _impersonation_target
+    if not (creds and creds.get("is_impersonator")):
+        return
+    # A cached staff token may be near/expired. `require_creds()` will refresh it
+    # and send the command, so the guard's status probe must run on the same live
+    # token — otherwise the probe 401s, reports "no target", and silently disarms
+    # the write-block while the refreshed command still reaches the customer.
+    # Refresh up front (it saves to disk, so require_creds reuses it) before
+    # probing.
+    expires_at = creds.get("expires_at") or 0
+    near_expiry = bool(expires_at) and time.time() > expires_at - TOKEN_REFRESH_SKEW_SECONDS
+    if near_expiry and creds.get("refresh_token"):
+        refresh_prod_token(creds)
+    status = _get_impersonate_status(creds)
+    if status is None:
+        # Couldn't confirm impersonation state on a staff login (probe failed even
+        # after any refresh). Fail closed for a tagged write rather than let it
+        # through unguarded; reads fall through and act as the caller.
+        if _is_write_command(args):
+            err("Refused — couldn't confirm impersonation state for a staff login.")
+            print("  The eesel CLI won't risk changing a customer's live setup while unsure.", file=sys.stderr)
+            print("  Re-run once the connection is back, or `eesel login` again.", file=sys.stderr)
+            sys.exit(EXIT_IMPERSONATION_BLOCKED)
+        return
+    target_uid = status.get("target_user_id")
+    if not target_uid:
+        return
+    workspace = resolve_effective_workspace_id(creds) or creds.get("workspace_id") or "their workspace"
+    _impersonation_target = {"user": target_uid, "workspace": workspace}
+    print(_color(f"▲ impersonating {target_uid} — {workspace}", "33"), file=sys.stderr)
+    if _is_write_command(args):
+        _refuse_impersonated_write()
+
+
 def main(argv: list[str] | None = None) -> int:
     # Surface staff-only commands only for global impersonators. Read from the
     # cached creds flag (populated at login / refreshed by `whoami`) so this
@@ -6793,6 +7067,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = _normalize_path_scope_argv(argv)
     argv = _normalize_integrations_argv(argv)
     args = parser.parse_args(argv)
+    _guard_impersonated_command(args, creds)
     return args.func(args)
 
 
