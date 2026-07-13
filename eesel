@@ -1651,16 +1651,41 @@ def resolve_scheduled_job_strict(creds: dict, target: str) -> dict | None:
     return None
 
 
-def pick_agent(creds: dict, *, prompt: bool = True) -> str:
-    """Resolve the agent a session (chat / new) runs against.
+def resolve_session_agent(creds: dict) -> tuple[str | None, str | None]:
+    """Resolve the agent a session runs against, without any interaction.
 
-    Scope is explicit: an already-applied `--agent`/`EESEL_AGENT`
-    (`creds["agent_id"]`, set in memory for this invocation) wins. Otherwise a
-    single-agent workspace is used automatically. With several agents and no
-    scope, an interactive terminal shows a picker (asking, not silently
+    Returns ``(agent_id, None)`` when the agent is unambiguous — an already
+    applied `--agent`/`EESEL_AGENT` (`creds["agent_id"]`, set in memory for this
+    invocation) wins, else a single-agent workspace is used automatically. When
+    it can't decide (no agents, or several with no scope) returns
+    ``(None, reason)`` with a human-readable reason, so the caller decides how to
+    surface it (stderr + exit for a human, a JSON error envelope for `--json`).
+    Never prompts, never writes to stdout, never exits.
+    """
+    if creds.get("agent_id"):
+        return creds["agent_id"], None
+    agents = fetch_agents(creds)
+    if not agents:
+        return None, "No agents in workspace. Create one with `eesel agents create` first."
+    if len(agents) == 1:
+        return agents[0]["agent_id"], None
+    listing = "; ".join(f"{a.get('agent_id', '?')} {a.get('name', '?')}" for a in agents)
+    return None, (
+        f"This workspace has {len(agents)} agents — name the one to use with "
+        f"`--agent <id|name>`, EESEL_AGENT=<id|name>, or `eesel agents <id> chat …`. "
+        f"Agents: {listing}"
+    )
+
+
+def pick_agent(creds: dict, *, prompt: bool = True) -> str:
+    """Resolve the agent a session (chat / new) runs against, for a human caller.
+
+    Uses `resolve_session_agent` for the unambiguous cases. With several agents
+    and no scope, an interactive terminal shows a picker (asking, not silently
     guessing); a non-interactive/scripted run errors, so a script never talks to
     an arbitrary agent. The choice is never persisted — the next command must
-    scope itself again.
+    scope itself again. `--json` must not use this (its picker/errors go to
+    stdout/exit); it calls `resolve_session_agent` directly.
     """
     if creds.get("agent_id"):
         return creds["agent_id"]
@@ -1692,7 +1717,18 @@ def pick_agent(creds: dict, *, prompt: bool = True) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def send_message(creds: dict, sess: dict, message: str) -> str | None:
+def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) -> dict:
+    """Send one user turn and return the turn as one envelope dict:
+    ``{"task_id", "status": "completed"|"error", "reply", "tool_calls"[, "error"]}``.
+
+    ``render`` (True by default) streams the reply + tool activity live to stdout
+    for a human behind an ``eesel →`` prefix; the human path ignores the return
+    beyond ``status``. ``render=False`` (the ``--json`` path) leaves stdout
+    untouched so the caller can emit the envelope as the sole JSON object. Every
+    failure — server unreachable, rejected turn, mid-stream drop — returns an
+    error envelope (``status`` "error", the reason in ``error``); it never raises
+    or ``sys.exit``s, so ``--json`` always emits one parseable object.
+    """
     # Empty user messages are how trigger-preview sessions auto-fire (kicked off
     # by `eesel new --trigger X` with no user typing yet). The backend filters
     # empty messages out of the persisted chat history, so the task's history
@@ -1726,6 +1762,19 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
         },
         method="POST",
     )
+
+    def _fail(reason: str) -> dict:
+        # A pre-stream failure (couldn't start the turn): roll back the just-
+        # appended user message (it never reached the model), save, log to
+        # stderr, and return an error envelope. Both paths fail honestly — the
+        # human exits non-zero off `status`, the --json caller gets one parseable
+        # object — instead of a traceback or a silent empty stdout.
+        if message:
+            sess["messages"].pop()
+        save_session(sess)
+        err(reason)
+        return {"task_id": sess.get("task_id"), "status": "error", "reply": "", "tool_calls": [], "error": reason}
+
     try:
         with urllib.request.urlopen(req, timeout=600) as resp:
             raw = resp.read()
@@ -1733,44 +1782,59 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
                 start_resp = json.loads(raw)
             except json.JSONDecodeError:
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
-                    f"POST {url} → {resp.status} but the response was not JSON "
+                return _fail(
+                    f"sandbox/start → {resp.status} but the response was not JSON "
                     f"({len(raw)} bytes; a proxy or login page?): {snippet}"
                 )
     except urllib.error.HTTPError as e:
-        body_text = e.read().decode(errors="replace")
-        err(f"sandbox/start → {e.code}: {body_text}")
-        # Only roll back if we actually appended (i.e. non-empty user message).
-        if message:
-            sess["messages"].pop()
-        save_session(sess)
-        # Return None (not "") to signal failure: a successful turn can legitimately
-        # produce empty text, so callers distinguish failure from empty-success on
-        # `is None`, and `eesel chat "…"` can exit non-zero on a rejected turn.
-        return None
+        return _fail(f"sandbox/start → {e.code}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
-        # The server isn't reachable at all (connection refused, DNS failure,
-        # timeout) — no HTTP response to surface. Exit cleanly like the shared
-        # http_* helpers rather than letting the connection error traceback
-        # escape. The user message was only appended in memory, so the on-disk
-        # session is left untouched by exiting before save_session.
-        sys.exit(f"POST {url} failed (server reachable?): {e}")
+        # Server unreachable (connection refused / DNS / timeout) — no HTTP
+        # response to surface, but still a clean error envelope, not a traceback.
+        return _fail(f"sandbox/start failed (server reachable?): {e}")
 
     task_id = start_resp.get("taskId", sess["task_id"])
     sess["task_id"] = task_id
     stream_url = start_resp.get("streamUrl")
 
-    print(_color("eesel ", "36") + "→ ", end="", flush=True)
-    text = stream_reply(creds, task_id, stream_url)
-    print()  # newline after stream
+    if render:
+        print(_color("eesel ", "36") + "→ ", end="", flush=True)
+    result = stream_reply(creds, task_id, stream_url, render=render)
+    if render:
+        print()  # newline after stream
 
-    if text:
+    text = result["text"]
+    # Don't persist a turn that failed mid-stream (a failed stream leaves no
+    # assistant reply to append).
+    if not result["error"] and text:
         sess["messages"].append({"sender": "assistant", "message": text})
     save_session(sess)
-    return text
+
+    envelope = {
+        "task_id": task_id,
+        "status": "error" if result["error"] else "completed",
+        "reply": text,
+        "tool_calls": result["tool_calls"],
+    }
+    if result["error"]:
+        envelope["error"] = result.get("error_text") or "chat stream failed mid-reply"
+    return envelope
 
 
-def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | None:
+def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: bool = True) -> dict:
+    """Consume the chat SSE stream into a structured result.
+
+    Returns ``{"text": str, "tool_calls": [{"name","input","output"}], "error": bool}``.
+    ``text`` is the concatenated assistant reply; ``tool_calls`` are ordered by
+    when each tool's input first appeared, with outputs paired back to inputs by
+    ``toolCallId`` (tools can run in parallel, so an output need not arrive right
+    after its input). ``error`` is True if the stream signalled an error event or
+    dropped mid-reply.
+
+    When ``render`` is True the reply text and tool activity are also streamed to
+    stdout live for a human; when False (the ``--json`` path) stdout is left
+    untouched so the caller can emit exactly one JSON object.
+    """
     if stream_url:
         url = stream_url
         headers = {}
@@ -1783,7 +1847,29 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
 
     text_buffers: dict[str, str] = {}
     text_order: list[str] = []
+    # Tool calls keyed by toolCallId so a `tool-output-available` attaches to the
+    # matching `tool-input-available`; `tool_order` preserves input arrival order.
+    tool_calls: dict[str, dict] = {}
+    tool_order: list[str] = []
     saw_error = False
+    # The AI SDK stream ends with an authoritative terminal event — `finish` on a
+    # normal turn, `abort` if it was cancelled. The server's raw-stream endpoint
+    # consumes the transport's trailing `[DONE]` marker (it never reaches us), so
+    # `finish`/`abort` is the only completion signal the client sees. Without one,
+    # a clean EOF after partial text or an unfinished tool call is a truncated
+    # turn, not a completed one — track it so we don't report success on truncation.
+    saw_terminal = False
+    # The failure reason, surfaced into the --json envelope's `error` field so an
+    # agent parsing only stdout learns *why* a turn failed (not just that it did).
+    error_text: str | None = None
+
+    def _result() -> dict:
+        return {
+            "text": "".join(text_buffers[tid] for tid in text_order).strip(),
+            "tool_calls": [tool_calls[cid] for cid in tool_order],
+            "error": saw_error,
+            "error_text": error_text,
+        }
 
     try:
         with urllib.request.urlopen(req, timeout=900) as resp:
@@ -1811,35 +1897,84 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None) -> str | Non
                         text_order.append(tid)
                     delta = evt.get("delta", "")
                     text_buffers[tid] += delta
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
+                    if render:
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
                 elif etype == "tool-input-available":
+                    cid = evt.get("toolCallId", "")
                     name = evt.get("toolName")
-                    inp = json.dumps(evt.get("input"))[:200]
-                    print(_color(f"\n[tool] {name} {inp}", "2;37"), flush=True)
+                    call = tool_calls.get(cid)
+                    if call is None:
+                        tool_calls[cid] = {"name": name, "input": evt.get("input"), "output": None}
+                        tool_order.append(cid)
+                    else:
+                        call["name"] = name
+                        call["input"] = evt.get("input")
+                    if render:
+                        inp = json.dumps(evt.get("input"))[:200]
+                        print(_color(f"\n[tool] {name} {inp}", "2;37"), flush=True)
                 elif etype == "tool-output-available":
+                    cid = evt.get("toolCallId", "")
                     out = evt.get("output")
-                    preview = (json.dumps(out) if not isinstance(out, str) else out)[:200]
-                    print(_color(f"[tool] → {preview}", "2;37"), flush=True)
+                    call = tool_calls.get(cid)
+                    if call is None:
+                        # An output with no preceding input event — record it
+                        # rather than drop it, so the envelope still lists the call.
+                        tool_calls[cid] = {"name": None, "input": None, "output": out}
+                        tool_order.append(cid)
+                    else:
+                        call["output"] = out
+                    if render:
+                        preview = (json.dumps(out) if not isinstance(out, str) else out)[:200]
+                        print(_color(f"[tool] → {preview}", "2;37"), flush=True)
                 elif etype == "error":
                     saw_error = True
+                    saw_terminal = True
+                    error_text = evt.get("errorText") or "chat stream reported an error"
                     print(_color(f"\n[error] {evt.get('errorText') or evt}", "31"), file=sys.stderr, flush=True)
+                elif etype == "finish":
+                    # Normal end of turn — the reply and every tool call are complete.
+                    saw_terminal = True
+                elif etype == "abort":
+                    # The turn was cancelled server-side; whatever we have is partial.
+                    saw_terminal = True
+                    saw_error = True
+                    reason = evt.get("reason")
+                    error_text = f"chat turn aborted{f': {reason}' if reason else ''}"
+                    print(_color(f"\n[aborted] {reason or 'turn cancelled'}", "31"), file=sys.stderr, flush=True)
     except urllib.error.HTTPError as e:
-        err(f"raw-stream → {e.code}: {e.read().decode(errors='replace')}")
-        # None signals failure so the caller can exit non-zero (see send_message).
-        return None
+        detail = e.read().decode(errors="replace")
+        err(f"raw-stream → {e.code}: {detail}")
+        # error=True signals failure so the caller can exit non-zero (see send_message).
+        saw_error = True
+        error_text = f"raw-stream → {e.code}: {detail}"
+        return _result()
     except (http.client.IncompleteRead, ConnectionError, TimeoutError, socket.timeout, ssl.SSLError) as e:
         # ssl.SSLError (incl. SSLEOFError) covers an encrypted connection torn
         # down mid-stream — the common abrupt drop on the HTTPS prod transport,
         # which is neither a ConnectionError nor a URLError.
         err(f"\nchat stream dropped mid-reply (server/connection?): {e}")
-        return None
+        saw_error = True
+        error_text = f"chat stream dropped mid-reply: {e}"
+        return _result()
     except urllib.error.URLError as e:
-        # Server unreachable mid-stream — exit cleanly like the shared http_*
-        # helpers instead of leaking the connection error traceback.
-        sys.exit(f"GET {url} failed (server reachable?): {e}")
+        # Server unreachable mid-stream — a failed turn like the branches above,
+        # so the caller can exit non-zero and (in --json) emit an error envelope.
+        err(f"\nchat stream dropped mid-reply (server reachable?): {e}")
+        saw_error = True
+        error_text = f"chat stream dropped mid-reply (server reachable?): {e}"
+        return _result()
 
-    return None if saw_error else "".join(text_buffers[tid] for tid in text_order).strip()
+    # The stream closed without raising. A clean close is only a *completed* turn
+    # if we saw the terminal event; otherwise the connection ended early (LB idle
+    # close, graceful shutdown, empty stream) and the reply is truncated. Report
+    # it as a failure so `--json` doesn't emit status "completed" on partial data.
+    if not saw_terminal:
+        err("\nchat stream ended without a completion signal (truncated reply?)")
+        saw_error = True
+        error_text = "chat stream ended without a completion signal (truncated reply)"
+
+    return _result()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2169,7 +2304,10 @@ def cmd_new(args) -> int:
     # on the preview.
     if trigger_id:
         info("Firing scheduled job...")
-        send_message(creds, sess, "")
+        # Exit non-zero if the preview turn failed, so a script's
+        # `eesel new --trigger X && …` doesn't proceed after a job that never ran.
+        envelope = send_message(creds, sess, "")
+        return 0 if envelope["status"] == "completed" else 1
     return 0
 
 
@@ -3590,8 +3728,28 @@ def _current_run_count(creds: dict, sess: dict) -> int:
     return d["total_runs"] if d else 0
 
 
+def _json_chat_error(reason: str) -> int:
+    """Emit the one-object machine contract for a pre-turn `--json` failure.
+
+    Every `--json` path — including an invalid `--agent`/`--task`/`--trigger` or
+    another pre-turn validation error — must still put exactly one parseable
+    object on stdout, not exit with empty stdout and only a stderr message. The
+    turn never started, so there's no task id; the human-readable detail has
+    already gone to stderr via err(). Always returns exit code 1."""
+    print(json.dumps({"task_id": None, "status": "error", "reply": "",
+                      "tool_calls": [], "error": reason}, indent=2))
+    return 1
+
+
 def cmd_chat(args) -> int:
     creds = require_creds()
+    json_mode = bool(getattr(args, "json", False))
+    # --json is a one-shot machine call: it emits exactly one JSON object for a
+    # single turn. The REPL has no JSON form, so refuse it up front (before any
+    # agent-pick prompt) rather than dropping into an interactive loop.
+    if json_mode and not args.message:
+        err("--json requires a message; the interactive REPL has no JSON form.")
+        return 1
     # `--agent` scopes this one chat to a specific agent (id, id-prefix, or
     # name), like the EESEL_AGENT env var but per-command. It is resolved in
     # memory and not persisted, so it never changes anything on disk. An
@@ -3599,6 +3757,8 @@ def cmd_chat(args) -> int:
     if getattr(args, "agent", None):
         match = resolve_agent_or_error(creds, args.agent)
         if not match:
+            if json_mode:
+                return _json_chat_error(f"could not resolve --agent '{args.agent}' (not found or ambiguous)")
             return 1
         creds = dict(creds)
         creds["agent_id"] = match["agent_id"]
@@ -3611,13 +3771,25 @@ def cmd_chat(args) -> int:
     target = getattr(args, "schedule", None)
     if task_target and target:
         err("--task and --trigger are mutually exclusive.")
+        if json_mode:
+            return _json_chat_error("--task and --trigger are mutually exclusive")
         return 1
 
     # A plain chat/REPL must run against a named agent. --task and --trigger
     # carry their own agent (from the task or the trigger below), so they don't
     # need one named here. Resolved in memory only — never persisted.
     if not task_target and not target and not creds.get("agent_id"):
-        agent_id = pick_agent(creds, prompt=True)
+        if json_mode:
+            # JSON mode is a non-interactive machine call: never show a picker
+            # (it writes to stdout and corrupts the single JSON object) and never
+            # block on input. Resolve without prompting; on an unresolvable agent
+            # emit one error envelope on stdout so the caller still parses a
+            # result, rather than exiting with only a stderr message.
+            agent_id, reason = resolve_session_agent(creds)
+            if agent_id is None:
+                return _json_chat_error(reason)
+        else:
+            agent_id = pick_agent(creds, prompt=True)
         creds = dict(creds)
         creds["agent_id"] = agent_id
     if task_target:
@@ -3629,6 +3801,8 @@ def cmd_chat(args) -> int:
         # uuid is used as-is, so a task that isn't in the recent list still works.
         task_id = resolve_task_id(creds, task_target)
         if not task_id:
+            if json_mode:
+                return _json_chat_error(f"could not resolve --task '{task_target}'")
             return 1
         # Reuse the local session bound to that task if we have one (keeps local
         # history accumulating), otherwise create a fresh session pinned to it.
@@ -3650,6 +3824,8 @@ def cmd_chat(args) -> int:
         if not match:
             err(f"No scheduled job matches '{target}'.")
             info("Run `eesel automations schedules list` to see available jobs.")
+            if json_mode:
+                return _json_chat_error(f"no scheduled job matches --trigger '{target}'")
             return 1
         # Pin the agent for this preview session only — resolve it in memory,
         # mirroring --agent. The session itself stores agent_id (below), so the
@@ -3671,15 +3847,22 @@ def cmd_chat(args) -> int:
     show_cost = bool(getattr(args, "cost", False))
 
     if args.message:
+        if json_mode:
+            # One JSON object on stdout, nothing else (render=False). --cost is a
+            # human-only, dev-only summary that would corrupt the object, so it's
+            # skipped here. Exit non-zero unless the turn completed, so a script
+            # branches on the exit code as well as on `status`.
+            envelope = send_message(creds, sess, args.message, render=False)
+            print(json.dumps(envelope, indent=2))
+            return 0 if envelope["status"] == "completed" else 1
         prev_runs = _current_run_count(creds, sess) if show_cost else 0
-        reply = send_message(creds, sess, args.message)
+        envelope = send_message(creds, sess, args.message)
         if show_cost:
             _print_cost_after_turn(creds, sess, prev_runs)
         # Exit non-zero when the turn was rejected (server 4xx/5xx) so a script's
         # `eesel chat "…" && next` doesn't proceed after a chat that never ran.
-        # send_message returns None only on failure; an empty-but-successful reply
-        # still exits 0.
-        return 0 if reply is not None else 1
+        # An empty-but-successful reply still has status "completed" and exits 0.
+        return 0 if envelope["status"] == "completed" else 1
 
     # REPL mode
     badge = f" [trigger: {sess.get('trigger_title')}]" if sess.get("trigger_id") else ""
@@ -5922,6 +6105,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
 
     sp = sub.add_parser("chat", help="Send a message (no arg = interactive REPL)")
     sp.add_argument("message", nargs="?", help="Message to send (omit for REPL)")
+    sp.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the turn as one JSON object on stdout — reply text, ordered "
+        "tool-calls (name + full untruncated input/output), task_id, and a "
+        "terminal status ('completed'/'error'); progress/prefix noise stays on "
+        "stderr. Requires a message (no REPL); exits non-zero unless status is "
+        "'completed'.",
+    )
     sp.add_argument("--agent", help="Agent id, id-prefix, or name to chat with; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> chat …` path). On a terminal with several agents you'll be prompted; scripts must name one. Stateless — nothing is persisted")
     sp.add_argument("--cost", action="store_true", help="After each reply, print a one-line cost + token summary for the whole session (incl. sub-agents)")
     # `--trigger` is the old name, kept as an alias; the noun is now a scheduled job.
