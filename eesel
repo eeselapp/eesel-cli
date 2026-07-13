@@ -6830,8 +6830,28 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
     global _impersonation_target
     if not (creds and creds.get("is_impersonator")):
         return
+    # A cached staff token may be near/expired. `require_creds()` will refresh it
+    # and send the command, so the guard's status probe must run on the same live
+    # token — otherwise the probe 401s, reports "no target", and silently disarms
+    # the write-block while the refreshed command still reaches the customer.
+    # Refresh up front (it saves to disk, so require_creds reuses it) before
+    # probing.
+    expires_at = creds.get("expires_at") or 0
+    near_expiry = bool(expires_at) and time.time() > expires_at - TOKEN_REFRESH_SKEW_SECONDS
+    if near_expiry and creds.get("refresh_token"):
+        refresh_prod_token(creds)
     status = _get_impersonate_status(creds)
-    target_uid = status.get("target_user_id") if status else None
+    if status is None:
+        # Couldn't confirm impersonation state on a staff login (probe failed even
+        # after any refresh). Fail closed for a tagged write rather than let it
+        # through unguarded; reads fall through and act as the caller.
+        if _is_write_command(args):
+            err("Refused — couldn't confirm impersonation state for a staff login.")
+            print("  The eesel CLI won't risk changing a customer's live setup while unsure.", file=sys.stderr)
+            print("  Re-run once the connection is back, or `eesel login` again.", file=sys.stderr)
+            sys.exit(EXIT_IMPERSONATION_BLOCKED)
+        return
+    target_uid = status.get("target_user_id")
     if not target_uid:
         return
     workspace = resolve_effective_workspace_id(creds) or creds.get("workspace_id") or "their workspace"

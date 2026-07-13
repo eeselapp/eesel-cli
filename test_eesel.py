@@ -3235,6 +3235,49 @@ class TestGuardImpersonatedCommand:
         eesel._guard_impersonated_command(_ns(write=False), self._creds())
         assert "Refused" not in capsys.readouterr().err
 
+    def test_expired_staff_token_is_refreshed_before_probing(self, monkeypatch):
+        # A cached staff token near expiry is refreshed up front, so the status
+        # probe runs on a live token and the write-block still arms. Without the
+        # refresh the probe would 401, report no target, and let the write through
+        # after require_creds refreshed the token.
+        creds = self._creds(refresh_token="rt",
+                            expires_at=int(time.time()) - 1)  # already expired
+        refreshed = {"called": False}
+
+        def fake_refresh(c):
+            refreshed["called"] = True
+            c["token"] = "fresh"
+            c["expires_at"] = int(time.time()) + 3600
+            return c
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", fake_refresh)
+        # Probe only reports the live target once the token is fresh.
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"}
+                            if c["token"] == "fresh" else None)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True), creds)
+        assert refreshed["called"] is True
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_write_fails_closed_when_status_unknown(self, monkeypatch, capsys):
+        # Probe fails even after any refresh (e.g. real network outage). A tagged
+        # write must not slip through unguarded — fail closed with the block code.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True), self._creds())
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert "couldn't confirm impersonation state" in capsys.readouterr().err
+
+    def test_read_falls_through_when_status_unknown(self, monkeypatch):
+        # A read on an unconfirmable staff login acts as the caller — it can't
+        # change a customer, so there's no reason to block it.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
+        assert eesel._impersonation_target is None
+
 
 class TestImpersonationWriteBlockEndToEnd:
     """main() refuses an impersonated write before any API call."""
@@ -3264,6 +3307,40 @@ class TestImpersonationWriteBlockEndToEnd:
         cap = capsys.readouterr()
         assert "Refused" in cap.err
         assert cap.out == ""  # no partial output on stdout
+
+    def test_expired_staff_token_write_still_refused(self, tmp_config, monkeypatch, capsys):
+        # The bypass case: staff creds cached with an expired token and a live
+        # server-side target. main() must refuse the write with exit 3 — the
+        # refresh happens up front so the guard sees the target, rather than the
+        # probe 401ing and the refreshed write reaching the customer.
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "own-ws",
+            "token": "stale", "refresh_token": "rt", "is_impersonator": True,
+            "expires_at": int(time.time()) - 1,  # already expired
+        })
+
+        def fake_refresh(c):
+            c["token"] = "fresh"
+            c["expires_at"] = int(time.time()) + 3600
+            eesel.save_creds(c)
+            return c
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", fake_refresh)
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"}
+                            if c["token"] == "fresh" else None)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+
+        def no_api(*a, **k):
+            raise AssertionError("a write must not reach any HTTP call once the token refreshes")
+
+        monkeypatch.setattr(eesel, "http_request", no_api)
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_api)
+
+        with pytest.raises(SystemExit) as e:
+            eesel.main(["agents", "create", "--name", "should-be-blocked"])
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert capsys.readouterr().out == ""
 
     def test_read_runs_in_the_targets_workspace(self, tmp_config, monkeypatch):
         # End to end: while impersonating, a read command runs in the TARGET's
