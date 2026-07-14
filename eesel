@@ -80,6 +80,7 @@ import re
 import secrets as secrets_mod
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -189,6 +190,30 @@ def confirm(prompt: str) -> bool:
     except EOFError:
         return False
     return answer in ("y", "yes")
+
+
+def _stdin_has_piped_data() -> bool:
+    """True when stdin is redirected from a pipe or a file — a real source the
+    CLI can read input from without a terminal (e.g. `echo 1 | eesel files read`
+    or `eesel chat < message.txt`).
+
+    False for an interactive TTY (handled by the arrow-key menu / REPL) and for
+    a character device such as /dev/null or a closed descriptor — which is what
+    a headless agent that supplied no input looks like. In that case there is
+    genuinely nothing to pick or send, so the caller fails honestly instead of
+    reading EOF and printing a misleading "Cancelled." or silently sending
+    nothing.
+    """
+    if sys.stdin.isatty():
+        return False
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError, AttributeError):
+        # No real descriptor to inspect (e.g. a replaced stdin in tests, or a
+        # platform without fstat) — treat it as "no piped input" so the honest
+        # failure path stays the default.
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1050,9 +1075,10 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
                 # page served with status 200). Surface a clean message rather
                 # than letting the JSONDecodeError traceback escape.
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
+                fail(
+                    EXIT_SERVER,
                     f"{method} {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}",
                 )
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
@@ -1091,9 +1117,10 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
                 # message rather than letting the JSONDecodeError traceback
                 # escape — mirrors http_request's handling of the same case.
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
+                fail(
+                    EXIT_SERVER,
                     f"{method} {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}",
                 )
             return resp.status, (parsed if isinstance(parsed, dict) else {"result": parsed})
     except urllib.error.HTTPError as e:
@@ -1792,9 +1819,10 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
                 start_resp = json.loads(raw)
             except json.JSONDecodeError:
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
+                fail(
+                    EXIT_SERVER,
                     f"POST {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}",
                 )
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
@@ -3666,11 +3694,15 @@ def cmd_chat(args) -> int:
     creds = require_creds()
 
     # With no message, `chat` drops into the interactive REPL. A headless agent
-    # (non-interactive stdin) can't drive it: input() hits end-of-input at once,
-    # the REPL exits, and the agent is told the command succeeded having sent
-    # nothing. Refuse honestly and name the fix instead of that silent no-op.
-    # Checked before any agent lookup so the honest failure costs no network.
-    if not getattr(args, "message", None) and not sys.stdin.isatty():
+    # with no piped input can't drive it: input() hits end-of-input at once, the
+    # REPL exits, and the agent is told the command succeeded having sent
+    # nothing. Refuse that silent no-op honestly and name the fix. But piped
+    # stdin (e.g. `echo "summarize this" | eesel chat`) IS a real message: the
+    # REPL's input() reads the line, sends it, prints the reply, and returns 0 on
+    # EOF — so only the genuinely-empty case (no message, no TTY, no pipe) is
+    # refused here. Checked before any agent lookup so the honest failure costs
+    # no network.
+    if not getattr(args, "message", None) and not sys.stdin.isatty() and not _stdin_has_piped_data():
         err('eesel chat needs a message on a non-interactive terminal. '
             'Pass one, e.g. eesel chat "your question".')
         return EXIT_VALIDATION
@@ -4948,13 +4980,16 @@ def cmd_files_read(args) -> int:
     creds = require_creds_scoped(args)
     target = getattr(args, "target", None)
 
-    # No target means "open the picker" — which needs an interactive terminal.
-    # On a non-interactive stdin there's nothing to pick on, so fail honestly
-    # and name the fix instead of printing "Cancelled." (nothing was cancelled
-    # — there was no terminal to choose from). Checked before any network call:
-    # otherwise a failure reaching the server would exit 7 ("retry later") for a
-    # call that can never succeed as invoked, however many times it's retried.
-    if not target and not sys.stdin.isatty():
+    # No target means "open the picker". On an interactive terminal that's the
+    # arrow-key menu; with piped input (e.g. `echo 1 | eesel files read`) the
+    # numbered-select fallback reads the chosen index off stdin. Only when there
+    # is neither — no TTY and no piped stdin — is there genuinely no way to pick,
+    # so fail honestly and name the fix instead of printing "Cancelled." (nothing
+    # was cancelled — there was no terminal to choose from). Checked before any
+    # network call: otherwise a failure reaching the server would exit 7 ("retry
+    # later") for a call that can never succeed as invoked, however many times
+    # it's retried.
+    if not target and not sys.stdin.isatty() and not _stdin_has_piped_data():
         err("eesel files read needs a file to read on a non-interactive "
             "terminal. Name it, e.g. eesel files read <id|key|filename>.")
         return EXIT_VALIDATION

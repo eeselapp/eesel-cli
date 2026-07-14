@@ -1638,6 +1638,19 @@ class TestFilesRead:
         assert "Cancelled." not in err
         assert "files read" in err
 
+    def test_read_no_target_consumes_piped_index(self, tmp_config, fake_creds, monkeypatch):
+        # `echo 1 | eesel files read`: no TTY, but stdin carries a picked index.
+        # The no-target guard must NOT fire — the numbered-select fallback reads
+        # the index off stdin and the chosen file is read as if picked from the
+        # menu.
+        seen = self._wire(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "_stdin_has_piped_data", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _="": "1")  # pick the second agent-owned doc
+        rc = eesel.cmd_files_read(self._args())
+        assert rc == 0
+        assert seen["doc_id"] == "doc-bbb33344"
+
 
 class TestBestEffortLookupsStaySilent:
     """`_latest_sync_run` and `find_task_row` decorate an already-successful
@@ -2559,16 +2572,20 @@ class TestHttpRequestNonJson:
         def __exit__(self, *a):
             return False
 
-    def test_non_json_200_exits_cleanly(self, monkeypatch):
+    def test_non_json_200_exits_cleanly(self, monkeypatch, capsys):
         # A proxy/login HTML page served with status 200 must not raise a raw
-        # JSONDecodeError traceback.
+        # JSONDecodeError traceback, and it exits with the server-class code (7)
+        # like the timeout/unreachable branches — a headless agent treats a
+        # gateway answering instead of the API as "retry later", not a generic
+        # exit 1.
         html = b"<html><body>Gateway timeout</body></html>"
         monkeypatch.setattr(
             eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
         )
         with pytest.raises(SystemExit) as exc:
             eesel.http_request("GET", "http://proxy/agents")
-        msg = str(exc.value)
+        assert exc.value.code == eesel.EXIT_SERVER
+        msg = capsys.readouterr().err
         assert "not JSON" in msg
         assert "JSONDecodeError" not in msg
 
@@ -2735,16 +2752,20 @@ class TestHttpRequestNonJson:
         def __exit__(self, *a):
             return False
 
-    def test_non_json_200_exits_cleanly(self, monkeypatch):
+    def test_non_json_200_exits_cleanly(self, monkeypatch, capsys):
         # A proxy/login HTML page served with status 200 must not raise a raw
-        # JSONDecodeError traceback.
+        # JSONDecodeError traceback, and it exits with the server-class code (7)
+        # like the timeout/unreachable branches — a headless agent treats a
+        # gateway answering instead of the API as "retry later", not a generic
+        # exit 1.
         html = b"<html><body>Gateway timeout</body></html>"
         monkeypatch.setattr(
             eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
         )
         with pytest.raises(SystemExit) as exc:
             eesel.http_request("GET", "http://proxy/agents")
-        msg = str(exc.value)
+        assert exc.value.code == eesel.EXIT_SERVER
+        msg = capsys.readouterr().err
         assert "not JSON" in msg
         assert "JSONDecodeError" not in msg
 
@@ -7387,6 +7408,31 @@ class TestChatNonTtyGuard:
         rc = eesel.cmd_chat(_args(message="hi", agent=None, task=None, schedule=None, cost=False))
         assert rc == 0
 
+    def test_piped_message_on_non_tty_is_sent(self, fake_creds, monkeypatch):
+        # `echo "summarize this" | eesel chat`: no --message and no TTY, but stdin
+        # carries a real message. The guard must NOT fire — the REPL's input()
+        # reads the piped line, sends it, and returns 0 on end-of-input. Refusing
+        # here would drop a delivered instruction as a silent no-op.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "_stdin_has_piped_data", lambda: True)
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: "a1")
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: {"id": "s1", "agent_id": "a1", "task_id": "t1", "messages": []})
+        sent = []
+        monkeypatch.setattr(eesel, "send_message", lambda creds, sess, msg, **k: (sent.append(msg) or "ok"))
+
+        lines = iter(["summarize this"])
+
+        def fake_input(_=""):
+            try:
+                return next(lines)
+            except StopIteration:
+                raise EOFError  # end of the piped input closes the REPL
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        rc = eesel.cmd_chat(_args(message=None, agent=None, task=None, schedule=None, cost=False))
+        assert rc == 0
+        assert sent == ["summarize this"]
+
 
 class TestChatTaskFlag:
     def test_resolves_prefix_to_full_task_id_before_binding(self, fake_creds, monkeypatch, capsys):
@@ -7467,14 +7513,18 @@ class TestChatHonestExit:
         def __exit__(self, *a):
             return False
 
-    def test_send_message_non_json_200_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_send_message_non_json_200_exits_cleanly(self, fake_creds, monkeypatch, capsys):
         html = b"<html><body>login</body></html>"
         monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._RawResp(html))
 
         with pytest.raises(SystemExit) as exc:
             eesel.send_message(fake_creds, self._sess(), "hi")
 
-        msg = str(exc.value)
+        # Exits with the server-class code (7), matching the timeout/unreachable
+        # branches, so a headless agent sees a gateway answering instead of the
+        # API as "retry later" rather than a generic exit 1.
+        assert exc.value.code == eesel.EXIT_SERVER
+        msg = capsys.readouterr().err
         assert "not JSON" in msg
         assert "JSONDecodeError" not in msg
 
