@@ -7,6 +7,7 @@ The CLI script has no `.py` extension, so we load it via importlib.
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -7384,6 +7386,48 @@ class TestChatHonestExit:
         assert printed.get("cost") is True  # cost summary still printed despite the failure
 
 
+class TestDryRunGuardsBilledAndLoginPaths:
+    """--dry-run must cover the side effects that spend money or write creds, not
+    only config mutations. A chat turn is a billed POST and login mints/stores a
+    token, so both preview and make no call under --dry-run."""
+
+    def _sess(self):
+        return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-test-123",
+                "task_id": "t1", "messages": []}
+
+    def test_send_message_previews_and_makes_no_call(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "_is_tty", lambda: True)
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda *a, **k: pytest.fail("--dry-run must not POST to sandbox/start"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.send_message(fake_creds, self._sess(), "hello")
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["method"] == "POST"
+        assert payload["url"].endswith("/agents/sandbox/start")
+        assert payload["body"]["messages"][-1]["message"] == "hello"
+
+    def test_login_dev_previews_and_writes_no_creds(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_dev", lambda *a, **k: pytest.fail("--dry-run must not log in"))
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--dry-run must not write credentials"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": True, "workspace_id": None})())
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "login" in payload["action"]
+
+    def test_login_prod_previews_and_opens_no_browser(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_prod", lambda *a, **k: pytest.fail("--dry-run must not open the OAuth bridge"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": False, "workspace_id": None})())
+        assert exc.value.code == 0
+        assert "login" in json.loads(capsys.readouterr().out)["action"]
+
+
 class TestNewAgentScope:
     """`eesel new --agent X` / `--schedule J` scope the new session to that agent
     in memory only — they must never rewrite the saved active agent, and --agent
@@ -7864,6 +7908,20 @@ class TestExtractGlobalOutputFlags:
         rest, vals = eesel._extract_global_output_flags(["--fields=a,b", "x"])
         assert rest == ["x"] and vals["fields"] == "a,b"
 
+    def test_fields_does_not_swallow_a_following_flag(self):
+        # `--fields --json` must leave --json intact rather than take it as the
+        # fields value (which would silently disable JSON). With no real value,
+        # fields stays unset and the following flag is still parsed.
+        rest, vals = eesel._extract_global_output_flags(["schema", "--fields", "--json"])
+        assert rest == ["schema"]
+        assert vals["fields"] is None
+        assert vals["json"] is True
+
+    def test_fields_at_end_with_no_value_stays_unset(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--fields"])
+        assert rest == ["agents", "list"]
+        assert vals["fields"] is None
+
     def test_passes_through_unrelated_tokens(self):
         rest, vals = eesel._extract_global_output_flags(["agents", "list", "--plain"])
         assert rest == ["agents", "list", "--plain"]
@@ -7989,6 +8047,153 @@ class TestSchema:
         walk(s, [])
         dead = [k for k in eesel._COMMAND_ENDPOINTS if k not in paths]
         assert dead == []
+
+    def test_endpoint_values_match_a_real_request_call(self):
+        # `test_no_dead_endpoint_keys` proves each KEY names a real command; this
+        # pins each VALUE ("POST /agents") against the method+path the CLI's
+        # request helpers actually issue, so a wrong annotation (wrong verb or
+        # wrong path) is caught rather than silently misleading an agent.
+        #
+        # The check is static: parse the CLI source and collect the (method,
+        # path) of every call to the request helpers (http_request /
+        # http_request_allow_error / write_request, and GET-only http_fetch /
+        # http_download). URL f-strings are rendered to a template with each
+        # `{...}` interpolation collapsed to `{}`; the leading `{api_url}` and any
+        # trailing glued query/suffix placeholder are stripped so a path segment
+        # (`/agents/{}`) is distinguished from an appended query (`/integrations`
+        # + `{qs}`). Then every endpoint value must appear among the collected
+        # calls. This confirms the annotation corresponds to a real call with
+        # that verb and path shape; it does not prove the call is reached by that
+        # exact subcommand (branching handlers make several keys share a handler).
+        request_funcs = {"http_request", "http_request_allow_error", "write_request"}
+        fetch_funcs = {"http_fetch", "http_download"}  # GET-only helpers
+
+        tree = ast.parse((_HERE / "eesel").read_text())
+
+        def render(node, name_values):
+            """Render a str constant or f-string to a template. A FormattedValue
+            that is a bare name present in `name_values` is inlined with that
+            literal; every other interpolation becomes `{}`."""
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                parts = []
+                for v in node.values:
+                    if isinstance(v, ast.Constant):
+                        parts.append(str(v.value))
+                    elif (isinstance(v, ast.FormattedValue)
+                          and isinstance(v.value, ast.Name)
+                          and v.value.id in name_values):
+                        parts.append(name_values[v.value.id])
+                    else:
+                        parts.append("{}")
+                return "".join(parts)
+            return None
+
+        # Module-level one-line `return "<f-string>"` helpers (e.g.
+        # `_mcp_server_url`) so a call passing a literal argument (`"/toggle"`)
+        # inlines it and resolves to the real path.
+        helpers = {}
+        for fn in tree.body:
+            if (isinstance(fn, ast.FunctionDef) and len(fn.body) == 1
+                    and isinstance(fn.body[0], ast.Return)
+                    and isinstance(fn.body[0].value, (ast.JoinedStr, ast.Constant))):
+                helpers[fn.name] = ([a.arg for a in fn.args.args], fn.body[0].value)
+
+        def resolve(node, assigns):
+            """Possible URL templates for a url expression: a literal/f-string, a
+            variable assigned one earlier in the function, or a call to a simple
+            return-only helper."""
+            if isinstance(node, (ast.Constant, ast.JoinedStr)):
+                t = render(node, {})
+                return {t} if t is not None else set()
+            if isinstance(node, ast.Name):
+                return set(assigns.get(node.id, set()))
+            if isinstance(node, ast.Call):
+                fname = (node.func.attr if isinstance(node.func, ast.Attribute)
+                         else getattr(node.func, "id", None))
+                if fname in helpers:
+                    params, ret = helpers[fname]
+                    name_values = {
+                        p: a.value for p, a in zip(params, node.args)
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    }
+                    t = render(ret, name_values)
+                    return {t} if t is not None else set()
+            return set()
+
+        def norm_path(tpl):
+            if tpl is None:
+                return None
+            m = re.search(r"/.*", tpl)
+            if not m:
+                return None
+            path = m.group(0).split("?")[0]
+            path = re.sub(r"\{[^}]*\}", "{}", path)
+            # A trailing `{}` not preceded by `/` is a glued query/suffix, not a
+            # path segment (e.g. `/integrations` + `{qs}`) — drop it.
+            while path.endswith("{}") and not path.endswith("/{}"):
+                path = path[:-2]
+            return path.rstrip("/") or "/"
+
+        actual = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            assigns: dict = {}
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign):
+                    templates = resolve(stmt.value, assigns)
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, ast.Name) and templates:
+                            assigns.setdefault(tgt.id, set()).update(templates)
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = (call.func.attr if isinstance(call.func, ast.Attribute)
+                        else getattr(call.func, "id", None))
+                if name in fetch_funcs and call.args:
+                    for t in resolve(call.args[0], assigns):
+                        p = norm_path(t)
+                        if p:
+                            actual.add(("GET", p))
+                elif name in request_funcs and len(call.args) >= 2:
+                    method = call.args[0].value if isinstance(call.args[0], ast.Constant) else None
+                    if method:
+                        for t in resolve(call.args[1], assigns):
+                            p = norm_path(t)
+                            if p:
+                                actual.add((method, p))
+
+        def norm_ep(path):
+            return re.sub(r"\{[^}]*\}", "{}", path).rstrip("/") or "/"
+
+        # Residual gap: `integrations connect` POSTs to a path the connector
+        # definition supplies at runtime (`option.endpoint`), so no path literal
+        # exists in the source to cross-check — the annotation is a hand-written
+        # approximation of the server's shape. Verified by reading the handler,
+        # not statically here.
+        unverifiable = {"integrations.connect"}
+
+        unmatched = []
+        for key, value in eesel._COMMAND_ENDPOINTS.items():
+            if key in unverifiable:
+                continue
+            method, path = value.split(" ", 1)
+            if path.endswith("/*"):
+                # Wildcard family (e.g. billing → GET /subscription/*): satisfied
+                # by any real call sharing the verb and path prefix.
+                prefix = norm_ep(path[:-1])
+                matched = any(m == method and p.startswith(prefix) for m, p in actual)
+            else:
+                matched = (method, norm_ep(path)) in actual
+            if not matched:
+                unmatched.append(f"{key}: {value}")
+
+        assert unmatched == [], (
+            "endpoint annotations with no matching request call in the source: "
+            + ", ".join(unmatched)
+        )
 
     def test_cmd_schema_emits_valid_json(self, capsys):
         eesel.cmd_schema(type("A", (), {})())

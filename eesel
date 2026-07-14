@@ -1657,6 +1657,16 @@ def _tool_row(t: dict) -> dict:
     }
 
 
+# Field names that mark a value as secret. Masking is a substring match against
+# this fixed list (case-insensitive), so it is a best-effort guard, not an
+# exhaustive classifier. Known gaps to be aware of before trusting it:
+#   - Only these hint words match. A field named `bearer`, `pat`, `signature`,
+#     or a bare `key` is NOT masked because none contain one of these substrings.
+#   - Only non-empty *string* values are masked (see `_redact_secrets`). A secret
+#     stored as a number or other non-string type is left in the clear.
+# Adequate for eesel's real property names, which use these words; extend the
+# list (and reconsider the string-only rule) if a new field carries a secret
+# under a name or type not covered here.
 _SECRET_KEY_HINTS = (
     "token", "secret", "password", "passwd", "credential",
     "api_key", "apikey", "private_key", "authorization", "access_key",
@@ -1832,6 +1842,13 @@ def send_message(creds: dict, sess: dict, message: str) -> str | None:
     if sess.get("trigger_id"):
         body["triggerId"] = sess["trigger_id"]
     url = f"{creds['api_url']}/agents/sandbox/start"
+    # A chat turn is a billed side effect, so honour --dry-run here the same way
+    # write_request does for config mutations: print the request that would be
+    # sent and exit 0 without contacting the server. The reads above (agent
+    # resolution) already ran so the preview shows the real resolved body.
+    if _DRY_RUN:
+        emit({"method": "POST", "url": url, "body": body})
+        sys.exit(0)
     # sandbox/start decodes the bearer with HS256 only (it predates the Auth0
     # migration), so an Auth0 login must send a minted workspace token here.
     req = urllib.request.Request(
@@ -2029,6 +2046,26 @@ def cache_impersonator_flag(creds: dict) -> bool:
 
 
 def cmd_login(args) -> int:
+    # Logging in is a side effect (dev mints a token from the branch env's
+    # /dev/session; prod opens a browser OAuth bridge), so honour --dry-run:
+    # print what the login would do and exit 0 without contacting anything or
+    # writing credentials to disk.
+    if _DRY_RUN:
+        if args.dev:
+            emit({
+                "action": "login (dev)",
+                "reads": "local Postgres for workspace/user ids, then mints a dev JWT",
+                "api_url": ENVS["dev"]["api"],
+                "writes": f"credentials to {CREDS_FILE}",
+            })
+        else:
+            emit({
+                "action": "login (prod)",
+                "flow": f"opens {ENVS['prod']['dashboard']}/cli in a browser and captures the token via a local HTTP server",
+                "api_url": ENVS["prod"]["api"],
+                "writes": f"credentials to {CREDS_FILE}",
+            })
+        sys.exit(0)
     creds = login_dev(args.workspace_id) if args.dev else login_prod()
     # Cache whether this login is a global impersonator so the staff-only
     # commands can be surfaced/hidden without a network call on every run.
@@ -6141,7 +6178,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     # document them, and so the pre-subcommand position (`eesel --json …`) parses.
     p.add_argument("--json", action="store_true", help="Emit machine-readable JSON (also: EESEL_OUTPUT=json). Lists stream as NDJSON when piped.")
     p.add_argument("--fields", metavar="a,b,c", help="With --json: keep only these top-level keys on each object.")
-    p.add_argument("--dry-run", action="store_true", help="Preview a mutation: print the request that would be sent and make no call.")
+    p.add_argument("--dry-run", action="store_true", help="Preview a side effect (config mutation, chat turn, or login): print the request that would be sent and make no call.")
     p.add_argument("--secrets", action="store_true", help="Reveal masked secret values (sysadmin/impersonator accounts only).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -6911,8 +6948,9 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
     optional before the subcommand, so without this an agent could not write the
     natural `eesel agents create --name X --dry-run`. Boolean flags (`--json`,
     `--dry-run`, `--secrets`) are matched exactly; `--fields` consumes the
-    following token, or takes a `--fields=…` inline value. Anything not one of
-    these flags is passed through untouched for argparse to handle.
+    following token as its value only when that token is not itself a flag,
+    or takes a `--fields=…` inline value. Anything not one of these flags is
+    passed through untouched for argparse to handle.
     """
     values = {"json": False, "dry_run": False, "secrets": False, "fields": None}
     rest: list[str] = []
@@ -6926,8 +6964,15 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
         elif tok == "--secrets":
             values["secrets"] = True
         elif tok == "--fields":
-            values["fields"] = argv[i + 1] if i + 1 < len(argv) else None
-            i += 1
+            # Only consume the next token as the value when it is a real value,
+            # not another flag. `eesel schema --fields --json` must leave --json
+            # intact rather than swallow it as fields="--json" (which silently
+            # disables JSON). A missing or flag-shaped value leaves fields unset,
+            # matching argparse's "expected one argument" being a no-op here.
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is not None and not nxt.startswith("--"):
+                values["fields"] = nxt
+                i += 1
         elif tok.startswith("--fields="):
             values["fields"] = tok.split("=", 1)[1]
         else:

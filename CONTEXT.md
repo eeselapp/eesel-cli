@@ -40,12 +40,14 @@ accepts. **Trust it over `--help`.** Combine with `--fields` to trim it.
 
 ## Preview before you write
 
-Add `--dry-run` to any mutation to see the exact request it would send —
-printed as `{"method", "url", "body"}` — with **no call made** and nothing
-changed. Read-only commands still run normally under `--dry-run` (a mutation
-often has to resolve an id or read existing config first, and that read
-executes so the previewed body is faithful). `--dry-run` works in any position,
-before or after the subcommand.
+Add `--dry-run` to any side effect to see what it would do — with **no call
+made** and nothing changed. This covers config mutations (printed as
+`{"method", "url", "body"}`), a billed `chat` turn (the sandbox/start request is
+previewed, not sent), and `login` (prints the flow and endpoint, mints no token,
+writes no credentials). Read-only commands still run normally under `--dry-run`
+(a mutation often has to resolve an id or read existing config first, and that
+read executes so the previewed body is faithful). `--dry-run` works in any
+position, before or after the subcommand.
 
 Example: `eesel agents create --name Probe --dry-run`
 
