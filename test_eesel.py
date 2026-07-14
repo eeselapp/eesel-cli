@@ -8017,12 +8017,17 @@ class TestInputHardeningNoNetwork:
         monkeypatch.delenv("EESEL_BASE_URL", raising=False)
         monkeypatch.delenv("EESEL_AGENT", raising=False)
 
-    def test_agents_get_traversal_rejected(self, fake_creds, capsys):
+    def test_agents_traversal_target_never_becomes_a_path(self, fake_creds, monkeypatch):
+        # A traversal target is no longer pre-rejected as raw input — it is
+        # resolved against the agent list like any id-or-name. Matching nothing,
+        # it is a clean "no such agent" (rc 1) and never becomes a URL path
+        # segment. (The one below would only reach a URL if it were an agent's
+        # real id, which the central choke point would then reject.)
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-abc123", "name": "Support Bot"}])
         args = argparse.Namespace(agents_cmd="show", agent_id="../../workspaces/other",
                                   show_instructions=False, json=False)
-        with pytest.raises(SystemExit) as exc:
-            eesel.cmd_agents(args)
-        assert exc.value.code == 5
+        assert eesel.cmd_agents(args) == 1
 
     def test_skills_add_traversal_rejected(self, fake_creds):
         args = argparse.Namespace(skills_cmd="add", agent="a-1", skill_id="../x", force=True)
@@ -8030,12 +8035,16 @@ class TestInputHardeningNoNetwork:
             eesel.cmd_skills(args)
         assert exc.value.code == 5
 
-    def test_files_export_bad_key_rejected(self, fake_creds):
+    def test_files_export_traversal_key_never_becomes_a_path(self, fake_creds, monkeypatch):
+        # A `--document-key` is matched client-side against the agent's own files,
+        # not pre-validated as raw input (a real filename may carry `% # ?`). A
+        # key that can't belong to this agent is a clean rejection (rc 1) and
+        # never becomes a URL path segment.
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: [{"agent_id": "agent-test-456", "name": "Bot"}])
         args = argparse.Namespace(document_id=None, document_key="files/../secret",
                                   format="md", output=None, agent=None)
-        with pytest.raises(SystemExit) as exc:
-            eesel.cmd_files_export(args)
-        assert exc.value.code == 5
+        assert eesel.cmd_files_export(args) == 1
 
     def test_tasks_show_control_char_rejected(self, fake_creds):
         with pytest.raises(SystemExit) as exc:
@@ -8045,3 +8054,188 @@ class TestInputHardeningNoNetwork:
     def test_wellformed_key_passes_validation(self):
         # A legitimate key with interior slashes is not rejected.
         assert eesel.validate_key("files/report.md") == "files/report.md"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Central URL-path choke point — traversal fails closed inside the HTTP helper
+# even if a caller forgot to validate its id (part 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestUrlPathChokePoint:
+    @pytest.mark.parametrize("url", [
+        "https://api.example.com/agents/../secret",
+        "https://api.example.com/agents/../../workspaces/other/mcp-servers",
+        "https://api.example.com/documents/%2e%2e/export-link",   # encoded ..
+        "https://api.example.com/agents/..%2Fsecret/tools",       # encoded / hides ..
+        "https://api.example.com/agents/./triggers",              # single-dot segment
+    ])
+    def test_rejects_traversal_path(self, url):
+        with pytest.raises(SystemExit) as exc:
+            eesel.assert_url_path_safe(url)
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_rejects_control_char_in_path(self):
+        with pytest.raises(SystemExit) as exc:
+            eesel.assert_url_path_safe("https://api.example.com/agents/a%00b/tools")
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    @pytest.mark.parametrize("url", [
+        "https://api.example.com/agents/agent-abc123/triggers",
+        "https://api.example.com/documents/2b2f5b56-0415-4378-abf7-ef0b5631c856/export-link",
+        # An interior '..' that is not a whole segment is a legitimate key part.
+        "https://api.example.com/documents/files/a..b.md/export-link",
+    ])
+    def test_allows_ordinary_paths(self, url):
+        assert eesel.assert_url_path_safe(url) is None
+
+    def test_allows_metachars_in_query_string(self):
+        # A title/filename passed as a query value legitimately carries % # ? —
+        # only the path is guarded, so these must not trip the check.
+        url = "https://api.example.com/documents?prefix=files/Report%20100%25.md&q=a#b?c"
+        assert eesel.assert_url_path_safe(url) is None
+
+    def test_allows_encoded_display_name_in_path(self):
+        # A display name resolved to a key and run through urllib.parse.quote
+        # decodes to an ordinary string, so the encoded % does not read as a
+        # traversal or control char.
+        seg = eesel.urllib.parse.quote("Search % discounts", safe="")
+        url = f"https://api.example.com/agents/a1/tools/{seg}"
+        assert eesel.assert_url_path_safe(url) is None
+
+    def test_http_request_aborts_before_sending_on_traversal(self, monkeypatch):
+        # The guard runs inside http_request, so a traversal URL never reaches
+        # urlopen — proving the choke point is fail-closed regardless of caller.
+        def boom(*a, **k):
+            raise AssertionError("request sent despite traversal path")
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "https://api.example.com/agents/../secret", token="t")
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# id-or-name lookups: a human name/title/filename with URL metacharacters
+# resolves to a slash-free id instead of being rejected as raw input (part 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestNameLookupsAllowMetachars:
+    def test_agent_name_with_slash_resolves(self, monkeypatch):
+        # An agent literally named "Support/Billing" must resolve by exact name;
+        # the raw name is never validated, only the resolved (slash-free) id.
+        agents = [{"agent_id": "agent-xyz789", "name": "Support/Billing"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        agent = eesel.resolve_agent_or_error({"token": "t"}, "Support/Billing")
+        assert agent["agent_id"] == "agent-xyz789"
+
+    def test_agent_env_override_name_with_slash_resolves(self, fake_creds, monkeypatch):
+        agents = [{"agent_id": "agent-xyz789", "name": "Support/Billing"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        monkeypatch.setenv("EESEL_AGENT", "Support/Billing")
+        out = eesel.apply_agent_env_override({"agent_id": None, "token": "t"})
+        assert out["agent_id"] == "agent-xyz789"
+
+    def test_agent_filter_name_with_slash_resolves(self, monkeypatch):
+        agents = [{"agent_id": "agent-xyz789", "name": "Support/Billing"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        assert eesel.resolve_agent_filter({"token": "t"}, "Support/Billing") == "agent-xyz789"
+
+    def test_scheduled_job_title_with_percent_resolves(self, monkeypatch):
+        # Job titled "Q3 report (50% sample)" — a '50%' title substring must
+        # resolve, not be rejected on the '%'.
+        jobs = [{"id": "sch-1", "config": {"title": "Q3 report (50% sample)"}}]
+        monkeypatch.setattr(eesel, "fetch_all_scheduled_jobs", lambda creds: jobs)
+        assert eesel.resolve_scheduled_job({"token": "t"}, "50%")["id"] == "sch-1"
+        assert eesel.resolve_scheduled_job_strict({"token": "t"}, "50%")["id"] == "sch-1"
+
+    def test_mcp_server_name_with_slash_and_hash_resolves(self, monkeypatch):
+        # A server whose name is a URL ("https://mcp.example.com/sse") or carries
+        # a '#' must resolve by exact name, not be rejected on '/' or '#'.
+        servers = [
+            {"id": "srv-1", "name": "https://mcp.example.com/sse"},
+            {"id": "srv-2", "name": "staging #2"},
+        ]
+        monkeypatch.setattr(eesel, "fetch_mcp_servers", lambda creds, **k: servers)
+        assert eesel._resolve_one_mcp_server({"token": "t"}, "https://mcp.example.com/sse")["id"] == "srv-1"
+        assert eesel._resolve_one_mcp_server({"token": "t"}, "staging #2")["id"] == "srv-2"
+
+    def test_resolved_id_still_validated(self, monkeypatch):
+        # Defense in depth: if resolution somehow yields an id that would traverse
+        # a URL path, it is still rejected (exit 5) rather than passed through.
+        agents = [{"agent_id": "../../workspaces/other", "name": "Evil"}]
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: agents)
+        with pytest.raises(SystemExit) as exc:
+            eesel.resolve_agent_or_error({"token": "t"}, "Evil")
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# EESEL_SESSION vs an explicit agent — never silently route to the wrong agent
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestPinnedSessionAgentConflict:
+    def test_explicit_agent_conflict_fails_loud(self, tmp_config, monkeypatch, capsys):
+        # A session pinned via EESEL_SESSION belongs to agent A; an explicit
+        # --agent/EESEL_AGENT names agent B. Routing the turn to A would swap the
+        # target invisibly, so the run must abort with EXIT_VALIDATION.
+        monkeypatch.setenv("EESEL_SESSION", "pinned-run")
+        creds = {"workspace_id": "w-1", "agent_id": "agent-A"}
+        eesel.ensure_current_session(creds, agent_id="agent-A")  # create for A
+        with pytest.raises(SystemExit) as exc:
+            eesel.ensure_current_session(creds, agent_id="agent-B", agent_explicit=True)
+        assert exc.value.code == eesel.EXIT_VALIDATION
+        assert "agent" in capsys.readouterr().err.lower()
+
+    def test_auto_selected_agent_conflict_uses_pinned_with_note(self, tmp_config, monkeypatch, capsys):
+        # When the agent was auto-picked (not explicitly requested), the pin still
+        # wins with an informational note — no abort.
+        monkeypatch.setenv("EESEL_SESSION", "pinned-run")
+        creds = {"workspace_id": "w-1", "agent_id": "agent-A"}
+        eesel.ensure_current_session(creds, agent_id="agent-A")
+        sess = eesel.ensure_current_session(creds, agent_id="agent-B", agent_explicit=False)
+        assert sess["agent_id"] == "agent-A"
+        assert "pinned session" in capsys.readouterr().err.lower()
+
+    def test_matching_explicit_agent_reuses_pinned(self, tmp_config, monkeypatch):
+        # No conflict: the explicit agent equals the pinned session's agent.
+        monkeypatch.setenv("EESEL_SESSION", "pinned-run")
+        creds = {"workspace_id": "w-1", "agent_id": "agent-A"}
+        first = eesel.ensure_current_session(creds, agent_id="agent-A", agent_explicit=True)
+        again = eesel.ensure_current_session(creds, agent_id="agent-A", agent_explicit=True)
+        assert first["id"] == again["id"] == "pinned-run"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Credentials temp file is never world-readable, even briefly (part 3)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCredentialsTempPermissions:
+    def test_temp_created_with_0600_not_default_umask(self, tmp_path, monkeypatch):
+        # The bytes must never touch a file other local users can read. Capture
+        # the mode the temp file is *created* with (os.open), not just its final
+        # mode, so a create-at-0644-then-chmod window would be caught here.
+        real_open = os.open
+        seen: list[int] = []
+
+        def spy_open(path, flags, mode=0o777, *a, **k):
+            seen.append(mode)
+            return real_open(path, flags, mode, *a, **k)
+
+        monkeypatch.setattr(eesel.os, "open", spy_open)
+        p = tmp_path / "credentials.json"
+        eesel._atomic_write(p, '{"token": "secret"}', mode=0o600)
+        assert seen and all(m == 0o600 for m in seen)
+
+    def test_temp_write_never_group_or_world_readable(self, tmp_path):
+        # A permissive process umask must not widen the credentials temp file.
+        import stat
+        old = os.umask(0)
+        try:
+            p = tmp_path / "credentials.json"
+            eesel._atomic_write(p, '{"token": "secret"}', mode=0o600)
+            assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+        finally:
+            os.umask(old)
