@@ -193,16 +193,26 @@ def confirm(prompt: str) -> bool:
 
 
 def _stdin_has_piped_data() -> bool:
-    """True when stdin is redirected from a pipe or a file — a real source the
-    CLI can read input from without a terminal (e.g. `echo 1 | eesel files read`
-    or `eesel chat < message.txt`).
+    """True when stdin is redirected from a pipe or file AND carries at least one
+    byte to read — a real, non-empty source the CLI can read input from without a
+    terminal (e.g. `echo 1 | eesel files read` or `eesel chat < message.txt`).
 
-    False for an interactive TTY (handled by the arrow-key menu / REPL) and for
-    a character device such as /dev/null or a closed descriptor — which is what
-    a headless agent that supplied no input looks like. In that case there is
-    genuinely nothing to pick or send, so the caller fails honestly instead of
-    reading EOF and printing a misleading "Cancelled." or silently sending
-    nothing.
+    False for an interactive TTY (handled by the arrow-key menu / REPL) and for a
+    character device such as /dev/null or a closed descriptor.
+
+    Critically also False for an *empty* pipe or file. A headless agent that
+    supplies no input — `produces_nothing | eesel chat`, or `eesel chat <
+    empty.txt` — leaves an empty FIFO/regular file. The descriptor type alone
+    cannot tell that apart from a pipe carrying a real message, and treating it
+    as "has input" would fall back into the REPL, hit EOF on the first read, and
+    report exit 0 having sent nothing — the exact silent no-op this guard exists
+    to refuse. So emptiness is settled by actually peeking a byte.
+
+    The peek reads through the buffered binary layer (`sys.stdin.buffer.peek`),
+    which fills the read buffer without advancing it: a following input() /
+    readline() in the REPL or numbered picker still sees the whole stream. On a
+    pipe the peek blocks until the first byte or EOF arrives — the same wait
+    input() would incur.
     """
     if sys.stdin.isatty():
         return False
@@ -213,7 +223,21 @@ def _stdin_has_piped_data() -> bool:
         # platform without fstat) — treat it as "no piped input" so the honest
         # failure path stays the default.
         return False
-    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+    if not (stat.S_ISFIFO(mode) or stat.S_ISREG(mode)):
+        return False
+    # A FIFO or regular file with a real descriptor: peek one byte to tell an
+    # empty source from one carrying input.
+    buffer = getattr(sys.stdin, "buffer", None)
+    peek = getattr(buffer, "peek", None)
+    if peek is None:
+        # No buffered binary layer to peek without consuming (an unusual stdin
+        # replacement). Fall back to the descriptor type and assume the
+        # redirected source has input.
+        return True
+    try:
+        return len(peek(1)) > 0
+    except (OSError, ValueError):
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────

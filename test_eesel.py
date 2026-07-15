@@ -2868,6 +2868,55 @@ class _FakeStdin:
         return self._tty
 
 
+class TestStdinHasPipedData:
+    """`_stdin_has_piped_data` must return True only for a non-TTY stdin that
+    actually carries a byte to read. An empty pipe or file (a headless caller
+    that produced no input) must read as "no piped data" so the no-target /
+    no-message guards fire instead of dropping into a REPL that reads EOF and
+    reports success having done nothing."""
+
+    def test_tty_has_no_piped_data(self, monkeypatch):
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
+        assert eesel._stdin_has_piped_data() is False
+
+    def test_non_empty_file_has_piped_data(self, tmp_path, monkeypatch):
+        p = tmp_path / "msg.txt"
+        p.write_text("summarize this\n")
+        with open(p, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is True
+
+    def test_empty_file_has_no_piped_data(self, tmp_path, monkeypatch):
+        # `eesel chat < empty.txt`: a real regular file, but zero bytes. The old
+        # descriptor-type-only check returned True here and re-opened the exit-0
+        # silent no-op; peeking a byte settles it as empty.
+        p = tmp_path / "empty.txt"
+        p.write_text("")
+        with open(p, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is False
+
+    def test_non_empty_pipe_has_piped_data_without_consuming(self, monkeypatch):
+        # A pipe carrying a message reads as "has data", and the peek must not
+        # consume it — a following read still sees the whole line.
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, b"line one\n")
+        os.close(w_fd)
+        with os.fdopen(r_fd, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is True
+            assert f.readline() == "line one\n"
+
+    def test_empty_closed_pipe_has_no_piped_data(self, monkeypatch):
+        # `produces_nothing | eesel chat`: the writer closes without emitting a
+        # byte, so the peek sees EOF immediately and the guard can fire.
+        r_fd, w_fd = os.pipe()
+        os.close(w_fd)
+        with os.fdopen(r_fd, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is False
+
+
 class TestPickAgent:
     """chat / new resolve their agent via pick_agent: an explicit scope wins, a
     single-agent workspace is used automatically, an interactive terminal
