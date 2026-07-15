@@ -8,6 +8,7 @@ The CLI script has no `.py` extension, so we load it via importlib.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import hashlib
 import hmac
@@ -16,6 +17,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -76,6 +78,18 @@ def fake_creds(tmp_config):
     }
     eesel.save_creds(creds)
     return creds
+
+
+@pytest.fixture(autouse=True)
+def _reset_impersonation_target():
+    # The guard sets _impersonation_target and require_creds sets _current_creds
+    # as module globals (not via monkeypatch), so force both clear around every
+    # test to stop the backstop / 401 self-heal leaking state between tests.
+    eesel._impersonation_target = None
+    eesel._current_creds = None
+    yield
+    eesel._impersonation_target = None
+    eesel._current_creds = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2977,83 +2991,30 @@ class TestImpersonatorFlagCaching:
         assert eesel.load_creds()["is_impersonator"] is True
         assert "impersonator : yes" in capsys.readouterr().out
 
-
-class TestImpersonationWorkspaceResync:
-    """Impersonating (or clearing) must re-pin `workspace_id` from `/workspaces`,
-    since the stored one belongs to whoever we were acting as before the swap.
-    `GET /workspaces` returns a single workspace object."""
-
-    def _creds(self, **extra):
-        c = {
+    def test_whoami_shows_effective_workspace_without_persisting_it(self, tmp_config, monkeypatch, capsys):
+        # whoami resolves the effective (impersonated) workspace for DISPLAY
+        # only. It also saves creds to refresh the is_impersonator flag — that
+        # save must not carry the resolved workspace onto disk over the stored
+        # one, or a read-only whoami would silently corrupt the login.
+        eesel.save_creds({
             "env": "prod",
             "api_url": "https://oracle.eesel.app",
-            "workspace_id": "stale-ws",
-            "token": "tok",
+            "workspace_id": "ws-A-own",
+            "token": "auth0",
+            "refresh_token": "rt",
             "expires_at": int(time.time()) + 3600,
-        }
-        c.update(extra)
-        eesel.save_creds(c)
-        return c
-
-    def _workspace(self, workspace_id="ws-A"):
-        return {
-            "createdAt": "Tue, 30 Jun 2026 22:44:57 GMT",
-            "workspaceId": workspace_id,
-            "workspaceName": "Default Workspace",
-            "workspaceOwnerUserId": "auth0|abc",
-        }
-
-    def test_resync_pins_workspace_and_persists(self, tmp_config, monkeypatch):
-        creds = self._creds()
+        })
+        # The guard has already resolved the target's workspace onto the module
+        # global; whoami reuses it for display.
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "victim-9", "workspace": "ws-B-target"}, raising=False)
         monkeypatch.setattr(
-            eesel, "http_request", lambda method, url, **k: self._workspace("ws-A")
+            eesel, "_get_impersonate_status",
+            lambda c: {"allowed": True, "target_user_id": "victim-9"},
         )
-        assert eesel.resync_impersonated_workspace(creds) == "ws-A"
-        assert eesel.load_creds()["workspace_id"] == "ws-A"
-
-    def test_resync_hits_workspaces_endpoint(self, tmp_config, monkeypatch):
-        creds = self._creds()
-        seen = {}
-        monkeypatch.setattr(
-            eesel, "http_request",
-            lambda method, url, **k: seen.update(method=method, url=url) or self._workspace(),
-        )
-        eesel.resync_impersonated_workspace(creds)
-        assert seen == {"method": "GET", "url": "https://oracle.eesel.app/workspaces"}
-
-    def test_resync_clears_and_warns_on_empty_response(self, tmp_config, monkeypatch, capsys):
-        creds = self._creds()
-        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {})
-        assert eesel.resync_impersonated_workspace(creds) is None
-        # Stale id must not survive even when the response carries no workspace.
-        assert "workspace_id" not in eesel.load_creds()
-        assert "No workspace" in capsys.readouterr().err
-
-    def test_impersonate_target_repins_workspace(self, tmp_config, monkeypatch):
-        self._creds()
-
-        def fake_http(method, url, **k):
-            if "/sysadmin/" in url:
-                return {"target": "auth0|xyz"}
-            return self._workspace("target-ws")
-
-        monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "auth0|xyz"})())
-        assert rc == 0
-        assert eesel.load_creds()["workspace_id"] == "target-ws"
-
-    def test_impersonate_clear_repins_workspace(self, tmp_config, monkeypatch):
-        self._creds()
-
-        def fake_http(method, url, **k):
-            if "/sysadmin/" in url:
-                return {}
-            return self._workspace("own-ws")
-
-        monkeypatch.setattr(eesel, "http_request", fake_http)
-        rc = eesel.cmd_impersonate(type("Args", (), {"user_id": "clear"})())
-        assert rc == 0
-        assert eesel.load_creds()["workspace_id"] == "own-ws"
+        eesel.cmd_whoami(type("Args", (), {})())
+        assert "ws-B-target" in capsys.readouterr().out          # display is the effective ws
+        assert eesel.load_creds()["workspace_id"] == "ws-A-own"  # disk is untouched
 
 
 class TestMainStaffGating:
@@ -3090,6 +3051,530 @@ class TestMainStaffGating:
 
     def test_main_staff_false_when_not_logged_in(self, tmp_config, monkeypatch):
         assert self._run_capturing_staff(monkeypatch) is False
+
+
+def _ns(**kw):
+    """A throwaway argparse-Namespace stand-in carrying only the given attrs."""
+    return type("Args", (), kw)()
+
+
+class TestIsWriteCommand:
+    """`_is_write_command` reads the `write=True` tag each customer-changing
+    subcommand sets at its parser. These parse real argv through build_parser so
+    the test breaks if a write verb loses (or a read verb gains) its tag."""
+
+    def _writes(self, *argv):
+        args = eesel.build_parser(staff=True).parse_args(list(argv))
+        return eesel._is_write_command(args)
+
+    def test_write_verbs_are_writes(self):
+        for argv in [
+            ("agents", "create", "--name", "x"),
+            ("agents", "set", "a", "--name", "n"),
+            ("agents", "remove", "a"),
+            ("mcp", "add", "--name", "n", "--url", "u"),
+            ("mcp", "set", "s", "--name", "n"),
+            ("mcp", "enable", "s"),
+            ("mcp", "remove", "s"),
+            ("workspace", "set", "billing-limit", "5"),
+            ("workspace", "extend-trial"),
+            ("tasks", "export"),
+            ("integrations", "connect", "z"),
+            ("integrations", "sync", "z"),
+            ("integrations", "remove", "z"),
+            ("automations", "triggers", "add", "a", "--key", "k"),
+            ("automations", "schedules", "fire", "j"),
+            ("files", "add", "--title", "t", "--content", "c"),
+            ("files", "remove", "k"),
+            ("files", "acl", "set", "a", "--prefix", "p"),
+            ("settings", "notifications", "set", "a"),
+        ]:
+            assert self._writes(*argv), f"{argv} should be a write"
+
+    def test_read_verbs_are_not_writes(self):
+        for argv in [
+            ("agents", "list"),
+            ("agents", "show", "a"),
+            ("mcp", "list"),
+            ("workspace", "show"),
+            ("workspace", "members"),
+            ("tasks", "list"),
+            ("billing", "show"),
+            ("integrations", "list"),
+            ("integrations", "sync-status"),
+            ("files", "list"),
+            ("settings", "notifications", "show", "a"),
+        ]:
+            assert not self._writes(*argv), f"{argv} should NOT be a write"
+
+    def test_chat_and_control_commands_are_not_writes(self):
+        # chat (its write tools are stubbed server-side) and impersonate (control)
+        # must never be blocked while impersonating.
+        assert not self._writes("chat", "hi")
+        assert not self._writes("impersonate", "auth0|x")
+        assert not self._writes("impersonate", "clear")
+        assert not self._writes("whoami")
+
+
+class TestImpersonationBackstop:
+    """The http_request backstop refuses a mutating request under a live target,
+    unless its path is a known read/plumbing exception."""
+
+    def _arm(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "auth0|cust", "workspace": "cust-ws"}, raising=False)
+
+    def test_mutating_call_blocked_before_network(self, monkeypatch, capsys):
+        self._arm(monkeypatch)
+
+        def boom(*a, **k):
+            raise AssertionError("request must not reach the network")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED  # distinct code 3
+        assert "Refused" in capsys.readouterr().err
+
+    def test_allowed_paths_pass_the_backstop(self, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda req, timeout=None: seen.append(req.full_url) or _FakeResp({}),
+        )
+        for path in ("/workspaces/token", "/workspace/tasks", "/workspace/tasks/analytics", "/dev/session"):
+            eesel.http_request("POST", f"https://api.example{path}", token="t")
+        assert len(seen) == 4  # every allowed path reached the network, none blocked
+
+    def test_export_is_not_confused_with_tasks_list(self, monkeypatch, capsys):
+        # `/workspace/tasks` (list) is allowed; `/tasks/export` (emails the
+        # customer) must NOT be — a prefix match would wrongly allow it.
+        self._arm(monkeypatch)
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("blocked path hit network")))
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/tasks/export", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_reads_pass_under_a_target(self, monkeypatch):
+        self._arm(monkeypatch)
+        got = {}
+
+        def fake(req, timeout=None):
+            got["m"] = req.get_method()
+            return _FakeResp({})
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", fake)
+        eesel.http_request("GET", "https://api.example/agents", token="t")
+        assert got["m"] == "GET"  # a GET is never blocked
+
+    def test_no_target_lets_writes_through(self, monkeypatch):
+        # Not impersonating → the backstop is inert; a POST proceeds normally.
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        seen = []
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda req, timeout=None: seen.append(1) or _FakeResp({}))
+        eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert seen == [1]
+
+
+class TestGuardImpersonatedCommand:
+    """`_guard_impersonated_command` runs before dispatch: banner on every
+    command under a live target, refusal for writes, nothing off the staff path."""
+
+    def _creds(self, **extra):
+        c = {"is_impersonator": True, "api_url": "https://api.example",
+             "token": "t", "workspace_id": "own-ws"}
+        c.update(extra)
+        return c
+
+    def _real_target(self, monkeypatch, ws="cust-ws"):
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: ws)
+
+    def test_normal_customer_pays_nothing(self, monkeypatch):
+        # No cached staff flag → no status call, no banner, no target armed.
+        def boom(c):
+            raise AssertionError("must not check impersonation status for a normal login")
+
+        monkeypatch.setattr(eesel, "_get_impersonate_status", boom)
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(write=True), {"api_url": "x", "token": "t"})
+        assert eesel._impersonation_target is None
+
+    def test_idle_staff_not_blocked(self, monkeypatch, capsys):
+        # Allowlisted but no target armed → acts as themselves; no banner, no block.
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": None})
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(write=True), self._creds())
+        assert eesel._impersonation_target is None
+        assert capsys.readouterr().err == ""
+
+    def test_write_refused_with_distinct_code(self, monkeypatch, capsys):
+        self._real_target(monkeypatch)
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True), self._creds())
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        err = capsys.readouterr().err
+        assert "▲ impersonating auth0|cust — cust-ws" in err  # banner
+        assert "Refused" in err                               # refusal
+
+    def test_read_shows_banner_but_is_not_blocked(self, monkeypatch, capsys):
+        self._real_target(monkeypatch)
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
+        cap = capsys.readouterr()
+        assert "▲ impersonating" in cap.err  # banner on stderr
+        assert "Refused" not in cap.err       # not blocked
+        assert cap.out == ""                  # stdout untouched (byte-for-byte clean)
+        assert eesel._impersonation_target is not None
+
+    def test_control_command_not_blocked_under_target(self, monkeypatch, capsys):
+        # `impersonate clear` must run even while a target is live — it carries
+        # no write tag, so the guard shows the banner but does not refuse it.
+        self._real_target(monkeypatch)
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
+        assert "Refused" not in capsys.readouterr().err
+
+    def test_expired_staff_token_is_refreshed_before_probing(self, monkeypatch):
+        # A cached staff token near expiry is refreshed up front, so the status
+        # probe runs on a live token and the write-block still arms. Without the
+        # refresh the probe would 401, report no target, and let the write through
+        # after require_creds refreshed the token.
+        creds = self._creds(refresh_token="rt",
+                            expires_at=int(time.time()) - 1)  # already expired
+        refreshed = {"called": False}
+
+        def fake_refresh(c):
+            refreshed["called"] = True
+            c["token"] = "fresh"
+            c["expires_at"] = int(time.time()) + 3600
+            return c
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", fake_refresh)
+        # Probe only reports the live target once the token is fresh.
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"}
+                            if c["token"] == "fresh" else None)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True), creds)
+        assert refreshed["called"] is True
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_write_fails_closed_when_status_unknown(self, monkeypatch, capsys):
+        # Probe fails even after any refresh (e.g. real network outage). A tagged
+        # write must not slip through unguarded — fail closed with the block code.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True), self._creds())
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert "couldn't confirm impersonation state" in capsys.readouterr().err
+
+    def test_read_falls_through_when_status_unknown(self, monkeypatch):
+        # A read on an unconfirmable staff login acts as the caller — it can't
+        # change a customer, so there's no reason to block it.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda c: None)
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+        eesel._guard_impersonated_command(_ns(write=False), self._creds())
+        assert eesel._impersonation_target is None
+
+
+class TestImpersonationWriteBlockEndToEnd:
+    """main() refuses an impersonated write before any API call."""
+
+    def _save_staff(self):
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "own-ws",
+            "token": "tok", "refresh_token": "rt", "is_impersonator": True,
+            "expires_at": int(time.time()) + 3600,
+        })
+
+    def test_write_refused_before_any_api_call(self, tmp_config, monkeypatch, capsys):
+        self._save_staff()
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+
+        def no_api(*a, **k):
+            raise AssertionError("a write command must not reach any HTTP call while impersonating")
+
+        monkeypatch.setattr(eesel, "http_request", no_api)
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_api)
+
+        with pytest.raises(SystemExit) as e:
+            eesel.main(["agents", "create", "--name", "x"])
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        cap = capsys.readouterr()
+        assert "Refused" in cap.err
+        assert cap.out == ""  # no partial output on stdout
+
+    def test_expired_staff_token_write_still_refused(self, tmp_config, monkeypatch, capsys):
+        # The bypass case: staff creds cached with an expired token and a live
+        # server-side target. main() must refuse the write with exit 3 — the
+        # refresh happens up front so the guard sees the target, rather than the
+        # probe 401ing and the refreshed write reaching the customer.
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "own-ws",
+            "token": "stale", "refresh_token": "rt", "is_impersonator": True,
+            "expires_at": int(time.time()) - 1,  # already expired
+        })
+
+        def fake_refresh(c):
+            c["token"] = "fresh"
+            c["expires_at"] = int(time.time()) + 3600
+            eesel.save_creds(c)
+            return c
+
+        monkeypatch.setattr(eesel, "refresh_prod_token", fake_refresh)
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"}
+                            if c["token"] == "fresh" else None)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+
+        def no_api(*a, **k):
+            raise AssertionError("a write must not reach any HTTP call once the token refreshes")
+
+        monkeypatch.setattr(eesel, "http_request", no_api)
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_api)
+
+        with pytest.raises(SystemExit) as e:
+            eesel.main(["agents", "create", "--name", "should-be-blocked"])
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert capsys.readouterr().out == ""
+
+    def test_read_runs_in_the_targets_workspace(self, tmp_config, monkeypatch):
+        # End to end: while impersonating, a read command runs in the TARGET's
+        # workspace — the guard resolves it once and require_creds reuses it.
+        self._save_staff()
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|cust"})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "cust-ws")
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: seen.setdefault("ws", creds["workspace_id"]) and [] or [])
+        eesel.main(["agents", "list"])
+        assert seen["ws"] == "cust-ws"  # ran against the target, not "own-ws"
+
+
+class TestEffectiveWorkspaceZeroCost:
+    """A non-impersonating login makes no workspace-resolution call and keeps
+    its stored (login) workspace — the "zero cost for normal customers" contract."""
+
+    def test_normal_login_makes_no_resolution_call(self, tmp_config, monkeypatch):
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "login-ws",
+            "token": "tok", "refresh_token": "rt",  # a normal prod login (not staff)
+            "expires_at": int(time.time()) + 3600,
+        })
+
+        def boom(*a, **k):
+            raise AssertionError("a normal login must not resolve the workspace")
+
+        # Neither the impersonation-status probe nor the workspace mint may fire.
+        monkeypatch.setattr(eesel, "_get_impersonate_status", boom)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_agents",
+                            lambda creds: seen.setdefault("ws", creds["workspace_id"]) and [] or [])
+        eesel.main(["agents", "list"])
+        assert seen["ws"] == "login-ws"  # stored login workspace, unchanged
+
+
+def _http_error(code=401, body=b'{"message":"no editor access"}'):
+    import io
+    return eesel.urllib.error.HTTPError("https://api.example/x", code, "Unauthorized", {}, io.BytesIO(body))
+
+
+class TestSelfHealWorkspace401:
+    """A 401 on a request carrying the stored workspace_id re-resolves the
+    effective workspace, persists it, and retries once — for prod logins only,
+    without looping."""
+
+    def _creds(self, **extra):
+        c = {"api_url": "https://api.example", "token": "tok", "refresh_token": "rt", "workspace_id": "STALE-WS"}
+        c.update(extra)
+        return c
+
+    def _arm(self, monkeypatch, fresh="FRESH-WS", creds=None):
+        eesel.save_creds(creds or self._creds())
+        monkeypatch.setattr(eesel, "_current_creds", creds or eesel.load_creds())
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: fresh)
+
+    def test_read_heals_url_and_retries(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            seen.append(url)
+            if len(seen) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        out = eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert out == {"ok": True}
+        assert len(seen) == 2
+        assert "FRESH-WS" in seen[1] and "STALE-WS" not in seen[1]
+        assert eesel.load_creds()["workspace_id"] == "FRESH-WS"  # correction persisted
+
+    def test_write_heals_workspace_in_body(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        bodies = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            bodies.append(body)
+            if len(bodies) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("POST", "https://api.example/agents", token="tok",
+                           body={"workspace_id": "STALE-WS", "name": "x"})
+        assert bodies[1] == {"workspace_id": "FRESH-WS", "name": "x"}  # id swapped, rest intact
+
+    def test_401_without_workspace_in_request_fails_fast(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+
+        def boom(c):
+            raise AssertionError("must not re-resolve when the workspace wasn't in the request")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents", token="tok")  # no workspace id
+        assert n[0] == 1  # one attempt, no retry
+
+    def test_non_prod_login_does_not_self_heal(self, tmp_config, monkeypatch):
+        # No refresh token → not a prod login → self-heal never runs.
+        monkeypatch.setattr(eesel, "_current_creds",
+                            {"api_url": "https://api.example", "token": "t", "workspace_id": "STALE-WS"})
+
+        def boom(c):
+            raise AssertionError("must not re-resolve for a non-prod login")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="t")
+        assert n[0] == 1
+
+    def test_resolve_returns_same_workspace_no_retry(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch, fresh="STALE-WS")  # re-resolve gives the same id → nothing to heal
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert n[0] == 1
+
+    def test_retry_that_also_401s_does_not_loop(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)  # even the retry fails
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        assert n[0] == 2  # original + exactly one retry, then stop
+
+    def test_in_memory_agent_id_is_not_persisted_by_the_heal(self, tmp_config, monkeypatch):
+        eesel.save_creds(self._creds())          # disk has no agent_id
+        cur = eesel.load_creds()
+        cur["agent_id"] = "in-memory-agent"      # set only in memory, like --agent/EESEL_AGENT
+        monkeypatch.setattr(eesel, "_current_creds", cur)
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "FRESH-WS")
+        seq = [_http_error(401)]
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            if seq:
+                raise seq.pop()
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("GET", "https://api.example/agents?workspace_id=STALE-WS", token="tok")
+        disk = eesel.load_creds()
+        assert disk["workspace_id"] == "FRESH-WS"
+        assert "agent_id" not in disk  # the heal must not leak the in-memory agent onto disk
+
+    def test_workspace_id_as_substring_is_not_matched(self, tmp_config, monkeypatch):
+        # The stale id appears only as a prefix of a larger opaque id, not as a
+        # whole URL segment — self-heal must not fire (no spurious resolve/retry).
+        self._arm(monkeypatch)
+
+        def boom(c):
+            raise AssertionError("must not re-resolve on a substring-only match")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        n = [0]
+
+        def fake_send(*a, **k):
+            n[0] += 1
+            raise _http_error(401)
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        with pytest.raises(SystemExit):
+            eesel.http_request("GET", "https://api.example/agents/STALE-WS-EXTRA/tools", token="tok")
+        assert n[0] == 1  # substring didn't count as the workspace → no retry
+
+    def test_workspace_id_as_path_segment_is_matched(self, tmp_config, monkeypatch):
+        self._arm(monkeypatch)
+        seen = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            seen.append(url)
+            if len(seen) == 1:
+                raise _http_error(401)
+            return {"ok": True}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        eesel.http_request("GET", "https://api.example/workspaces/STALE-WS/mcp-servers", token="tok")
+        assert seen[1] == "https://api.example/workspaces/FRESH-WS/mcp-servers"  # segment healed
+
+    def test_end_to_end_create_after_clear_self_heals(self, tmp_config, monkeypatch):
+        # The reported case: not impersonating, a stale stored workspace, so the
+        # operator's own `agents create` 401s — then self-heals and succeeds.
+        # _current_creds is set by the real require_creds (not stubbed).
+        eesel.save_creds({
+            "env": "prod", "api_url": "https://api.example", "workspace_id": "STALE-WS",
+            "token": "tok", "refresh_token": "rt", "expires_at": int(time.time()) + 3600,
+        })
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: "OWN-WS")
+        sends = []
+
+        def fake_send(method, url, *, token, body, timeout, headers):
+            sends.append((url, body))
+            if len(sends) == 1:
+                raise _http_error(401)  # server rejects the stale workspace
+            return {"agent_id": "a1"}
+
+        monkeypatch.setattr(eesel, "_http_send", fake_send)
+        rc = eesel.main(["agents", "create", "--name", "x"])
+        assert rc == 0
+        assert len(sends) == 2
+        assert sends[1][1]["workspace_id"] == "OWN-WS"       # retried with the real workspace
+        assert eesel.load_creds()["workspace_id"] == "OWN-WS"  # and it's persisted
 
 
 class TestSubcommandSuggestions:
@@ -3170,8 +3655,9 @@ class TestTriggersAllRemoved:
 
 class TestChatConnectionFailure:
     """A server that isn't reachable at all (connection refused / DNS / timeout)
-    must give the same clean one-line "server reachable?" exit the shared http_*
-    helpers give — not a raw connection-error traceback."""
+    must fail honestly — a clean "server reachable?" error envelope (status
+    "error", the reason in `error`) and no raw connection-error traceback — so
+    `eesel chat --json` always emits one parseable object on any failure."""
 
     def _sess(self):
         return {
@@ -3182,23 +3668,23 @@ class TestChatConnectionFailure:
             "messages": [],
         }
 
-    def test_sandbox_start_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_sandbox_start_unreachable_gives_error_envelope(self, fake_creds, monkeypatch):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        with pytest.raises(SystemExit) as excinfo:
-            eesel.send_message(fake_creds, self._sess(), "hello")
-        assert "server reachable?" in str(excinfo.value.code)
+        env = eesel.send_message(fake_creds, self._sess(), "hello")
+        assert env["status"] == "error"
+        assert "server reachable?" in env["error"]
 
-    def test_stream_unreachable_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_stream_unreachable_flags_error(self, fake_creds, monkeypatch):
         def boom(req, timeout=None):
             raise eesel.urllib.error.URLError("connection refused")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        with pytest.raises(SystemExit) as excinfo:
-            eesel.stream_reply(fake_creds, "task1", None)
-        assert "server reachable?" in str(excinfo.value.code)
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
+        assert "server reachable?" in result["error_text"]
 
     class _StreamResp:
         def __init__(self, exc):
@@ -3213,25 +3699,28 @@ class TestChatConnectionFailure:
         def __iter__(self):
             raise self.exc
 
-    def test_stream_connection_reset_returns_none(self, fake_creds, monkeypatch, capsys):
+    def test_stream_connection_reset_flags_error(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(
             eesel.urllib.request,
             "urlopen",
             lambda *a, **k: self._StreamResp(ConnectionResetError("reset")),
         )
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
+        assert result["text"] == "" and result["tool_calls"] == []
         assert "chat stream dropped mid-reply" in capsys.readouterr().err
 
-    def test_stream_incomplete_read_returns_none(self, fake_creds, monkeypatch, capsys):
+    def test_stream_incomplete_read_flags_error(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(
             eesel.urllib.request,
             "urlopen",
             lambda *a, **k: self._StreamResp(http.client.IncompleteRead(b"partial")),
         )
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
         assert "chat stream dropped mid-reply" in capsys.readouterr().err
 
-    def test_stream_tls_teardown_returns_none(self, fake_creds, monkeypatch, capsys):
+    def test_stream_tls_teardown_flags_error(self, fake_creds, monkeypatch, capsys):
         # An encrypted connection torn down mid-reply raises ssl.SSLEOFError,
         # which is an OSError but neither a ConnectionError nor a URLError. It is
         # the common abrupt drop on the HTTPS prod transport and must fail the
@@ -3241,16 +3730,18 @@ class TestChatConnectionFailure:
             "urlopen",
             lambda *a, **k: self._StreamResp(ssl.SSLEOFError("EOF in violation of protocol")),
         )
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
         assert "chat stream dropped mid-reply" in capsys.readouterr().err
 
-    def test_stream_generic_ssl_error_returns_none(self, fake_creds, monkeypatch, capsys):
+    def test_stream_generic_ssl_error_flags_error(self, fake_creds, monkeypatch, capsys):
         monkeypatch.setattr(
             eesel.urllib.request,
             "urlopen",
             lambda *a, **k: self._StreamResp(ssl.SSLError("decryption failed")),
         )
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        result = eesel.stream_reply(fake_creds, "task1", None)
+        assert result["error"] is True
         assert "chat stream dropped mid-reply" in capsys.readouterr().err
 
 
@@ -4582,9 +5073,19 @@ class TestImpersonateStatus:
         )
         assert out == {"allowed": True, "target_user_id": "victim-9"}
 
-    def test_idle_allowlisted_reports_no_target(self, tmp_config, monkeypatch):
-        # Allowlisted but not impersonating: the endpoint echoes the caller as
-        # target_uid with no origin — must NOT be read as an active target.
+    def test_idle_echoes_caller_as_both_reports_no_target(self, tmp_config, monkeypatch):
+        # Not impersonating: the endpoint echoes the caller's own uid into BOTH
+        # impersonator_uid and target_uid. That must NOT be read as an active
+        # target, or every sysadmin sees a phantom self-impersonation.
+        out = self._status(
+            monkeypatch,
+            {"is_impersonator": True, "is_sysadmin": False,
+             "impersonator_uid": "self-1", "target_uid": "self-1"},
+        )
+        assert out == {"allowed": True, "target_user_id": None}
+
+    def test_idle_allowlisted_with_null_origin_reports_no_target(self, tmp_config, monkeypatch):
+        # A null impersonator_uid also means no active swap.
         out = self._status(
             monkeypatch,
             {"is_impersonator": True, "is_sysadmin": False,
@@ -4624,13 +5125,10 @@ class TestImpersonateCommand:
         seen = {}
 
         def fake_http(method, url, *, token=None, body=None, **kw):
-            if "/sysadmin/" in url:
-                seen.update(method=method, url=url)
-                return {"message": "Impersonation target set", "target": "victim-9"}
-            # The resync's `GET /workspaces` call.
-            return {"workspaceId": "victim-ws"}
+            seen.update(method=method, url=url)
+            return 200, {"message": "Impersonation target set", "target": "victim-9"}
 
-        monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_http)
         args = eesel.build_parser(staff=True).parse_args(["impersonate", "victim-9"])
         rc = args.func(args)
         assert rc == 0
@@ -4645,19 +5143,78 @@ class TestImpersonateCommand:
         seen = {}
 
         def fake_http(method, url, *, token=None, body=None, **kw):
-            if "/sysadmin/" in url:
-                seen.update(method=method, url=url)
-                return {"message": "Impersonation target cleared"}
-            # The resync's `GET /workspaces` call.
-            return {"workspaceId": "own-ws"}
+            seen.update(method=method, url=url)
+            return 200, {"message": "Impersonation target cleared"}
 
-        monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(eesel, "http_request_allow_error", fake_http)
         args = eesel.build_parser(staff=True).parse_args(["impersonate", "clear"])
         rc = args.func(args)
         assert rc == 0
         assert seen["method"] == "GET"
         assert seen["url"].endswith("/sysadmin/clear-impersonator-target")
         assert "cleared" in capsys.readouterr().err.lower()
+
+    def test_clear_while_impersonating_nonsysadmin_explains_the_trap(self, tmp_config, monkeypatch, capsys):
+        # Clearing runs through the swap as the impersonated non-sysadmin, so the
+        # server returns 401. The user must be told it auto-expires / to use the
+        # dashboard, not left with a bare "Unauthorized".
+        eesel.save_creds(self._creds())
+        monkeypatch.setattr(
+            eesel, "http_request_allow_error",
+            lambda method, url, **kw: (401, {"error": "Unauthorized"}),
+        )
+        args = eesel.build_parser(staff=True).parse_args(["impersonate", "clear"])
+        rc = args.func(args)
+        assert rc == 1
+        err = capsys.readouterr().err.lower()
+        assert "auto-expires" in err or "dashboard" in err
+
+
+class TestResolveEffectiveWorkspaceId:
+    """`resolve_effective_workspace_id` reads the effective workspace from the
+    /workspaces/token mint, best-effort."""
+
+    def test_returns_workspace_id_from_token_mint(self, monkeypatch):
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda req, timeout=None: _FakeResp({"workspaceId": "ws-x", "token": "t"}),
+        )
+        creds = {"api_url": "https://oracle.eesel.app", "token": "t"}
+        assert eesel.resolve_effective_workspace_id(creds) == "ws-x"
+
+    def test_returns_none_on_error(self, monkeypatch):
+        def boom(req, timeout=None):
+            raise OSError("down")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        creds = {"api_url": "https://oracle.eesel.app", "token": "t"}
+        assert eesel.resolve_effective_workspace_id(creds) is None
+
+
+class TestEffectiveWorkspace:
+    """`_apply_effective_workspace` re-points workspace_id at the impersonated
+    target's workspace when one is active, reusing the workspace the guard
+    already resolved (no network call of its own), and is a no-op otherwise."""
+
+    def test_adopts_the_active_targets_workspace(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "victim-9", "workspace": "ws-target"}, raising=False)
+        creds = {"api_url": "x", "token": "auth0", "workspace_id": "ws-stored"}
+        eesel._apply_effective_workspace(creds)
+        assert creds["workspace_id"] == "ws-target"
+
+    def test_no_target_leaves_workspace_untouched_without_a_network_call(self, monkeypatch):
+        # The key "zero cost for normal customers" guarantee: with no active
+        # target, this neither resolves nor changes the stored workspace.
+        monkeypatch.setattr(eesel, "_impersonation_target", None, raising=False)
+
+        def boom(*a, **k):
+            raise AssertionError("must not resolve the workspace when not impersonating")
+
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", boom)
+        creds = {"api_url": "x", "token": "auth0", "workspace_id": "ws-stored"}
+        eesel._apply_effective_workspace(creds)
+        assert creds["workspace_id"] == "ws-stored"
 
 
 class TestIntegrationsCommand:
@@ -7234,8 +7791,8 @@ class TestChatAgentFlag:
         )
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "trigger_id": "trig-1", "trigger_title": "heartbeat", "agent_id": creds.get("agent_id")})
-        # A successful turn returns its (possibly empty) reply text, not None.
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
+        # A successful turn returns a "completed" envelope.
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "ok", "task_id": "t1", "tool_calls": []})
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
         rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
         assert rc == 0
@@ -7257,8 +7814,8 @@ class TestChatTaskFlag:
             return {"id": "sess-1", **k}
 
         monkeypatch.setattr(eesel, "new_session", fake_new_session)
-        # A successful turn returns its (possibly empty) reply text, not None.
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
+        # A successful turn returns a "completed" envelope.
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "ok", "task_id": "t1", "tool_calls": []})
         rc = eesel.cmd_chat(_args(task="330c8f22", schedule=None, agent=None, message="hi", cost=False))
         assert rc == 0
         # The full resolved id is pinned, not the truncated prefix.
@@ -7279,14 +7836,15 @@ class TestChatTaskFlag:
 
 class TestChatHonestExit:
     """`eesel chat "…"` (one-shot) must exit non-zero when the server rejects the
-    turn. send_message returns None only on failure; a successful turn returns its
-    reply text (possibly empty), which still exits 0."""
+    turn. send_message returns an envelope dict whose `status` is "error" on
+    failure; a successful turn (even an empty reply) has status "completed" and
+    exits 0."""
 
     def _sess(self):
         return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-test-123",
                 "task_id": "t1", "messages": []}
 
-    def test_send_message_returns_none_on_sandbox_http_error(self, fake_creds, monkeypatch):
+    def test_send_message_gives_error_envelope_on_sandbox_http_error(self, fake_creds, monkeypatch):
         import io
 
         def boom(req, timeout=None):
@@ -7295,16 +7853,18 @@ class TestChatHonestExit:
                 io.BytesIO(b'{"code":"BILLING_LIMIT_EXCEEDED"}'))
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        assert eesel.send_message(fake_creds, self._sess(), "hi") is None
+        env = eesel.send_message(fake_creds, self._sess(), "hi")
+        assert env["status"] == "error"
+        assert "402" in env["error"]
 
-    def test_stream_reply_returns_none_on_http_error(self, fake_creds, monkeypatch):
+    def test_stream_reply_flags_error_on_http_error(self, fake_creds, monkeypatch):
         import io
 
         def boom(req, timeout=None):
             raise eesel.urllib.error.HTTPError(req.full_url, 500, "Server Error", {}, io.BytesIO(b"boom"))
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert eesel.stream_reply(fake_creds, "task1", None)["error"] is True
 
     class _RawResp:
         def __init__(self, body: bytes, status: int = 200):
@@ -7320,16 +7880,14 @@ class TestChatHonestExit:
         def __exit__(self, *a):
             return False
 
-    def test_send_message_non_json_200_exits_cleanly(self, fake_creds, monkeypatch):
+    def test_send_message_non_json_200_gives_error_envelope(self, fake_creds, monkeypatch):
         html = b"<html><body>login</body></html>"
         monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._RawResp(html))
 
-        with pytest.raises(SystemExit) as exc:
-            eesel.send_message(fake_creds, self._sess(), "hi")
-
-        msg = str(exc.value)
-        assert "not JSON" in msg
-        assert "JSONDecodeError" not in msg
+        env = eesel.send_message(fake_creds, self._sess(), "hi")
+        assert env["status"] == "error"
+        assert "not JSON" in env["error"]
+        assert "JSONDecodeError" not in env["error"]  # no raw traceback leaked
 
     class _SseResp:
         def __init__(self, lines):
@@ -7344,32 +7902,33 @@ class TestChatHonestExit:
         def __iter__(self):
             return iter(self.lines)
 
-    def test_stream_reply_returns_none_on_error_event(self, fake_creds, monkeypatch, capsys):
+    def test_stream_reply_flags_error_on_error_event(self, fake_creds, monkeypatch, capsys):
         lines = [b'data: {"type":"error","errorText":"turn failed"}\n']
         monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda *a, **k: self._SseResp(lines))
 
-        assert eesel.stream_reply(fake_creds, "task1", None) is None
+        assert eesel.stream_reply(fake_creds, "task1", None)["error"] is True
         assert "turn failed" in capsys.readouterr().err
 
     def test_oneshot_exits_1_when_turn_rejected(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)  # rejected turn
+        # rejected turn → error envelope
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "error", "reply": "", "task_id": "t1", "tool_calls": [], "error": "boom"})
         rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
         assert rc == 1
 
     def test_oneshot_exits_0_on_success(self, fake_creds, monkeypatch):
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "the reply")
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "the reply", "task_id": "t1", "tool_calls": []})
         rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
         assert rc == 0
 
     def test_oneshot_exits_0_on_empty_but_successful_reply(self, fake_creds, monkeypatch):
-        # An empty string is a successful (if quiet) turn — must NOT be read as failure.
+        # An empty reply is a successful (if quiet) turn — status "completed", not failure.
         monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "")
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "", "task_id": "t1", "tool_calls": []})
         rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=False))
         assert rc == 0
 
@@ -7379,10 +7938,356 @@ class TestChatHonestExit:
         monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
         monkeypatch.setattr(eesel, "_current_run_count", lambda creds, sess: 0)
         monkeypatch.setattr(eesel, "_print_cost_after_turn", lambda *a, **k: printed.setdefault("cost", True))
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: None)
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "error", "reply": "", "task_id": "t1", "tool_calls": [], "error": "boom"})
         rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None, message="hi", cost=True))
         assert rc == 1
         assert printed.get("cost") is True  # cost summary still printed despite the failure
+
+
+class TestDryRunGuardsBilledAndLoginPaths:
+    """--dry-run must cover the side effects that spend money or write creds, not
+    only config mutations. A chat turn is a billed POST and login mints/stores a
+    token, so both preview and make no call under --dry-run."""
+
+    def _sess(self):
+        return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-test-123",
+                "task_id": "t1", "messages": []}
+
+    def test_send_message_previews_and_makes_no_call(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "_is_tty", lambda: True)
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda *a, **k: pytest.fail("--dry-run must not POST to sandbox/start"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.send_message(fake_creds, self._sess(), "hello")
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["method"] == "POST"
+        assert payload["url"].endswith("/agents/sandbox/start")
+        assert payload["body"]["messages"][-1]["message"] == "hello"
+
+    def test_login_dev_previews_and_writes_no_creds(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_dev", lambda *a, **k: pytest.fail("--dry-run must not log in"))
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--dry-run must not write credentials"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": True, "workspace_id": None})())
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "login" in payload["action"]
+
+    def test_login_prod_previews_and_opens_no_browser(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_prod", lambda *a, **k: pytest.fail("--dry-run must not open the OAuth bridge"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": False, "workspace_id": None})())
+        assert exc.value.code == 0
+        assert "login" in json.loads(capsys.readouterr().out)["action"]
+
+
+class TestChatJson:
+    """`eesel chat --json "…"` is the keystone agent call: one JSON object on
+    stdout carrying the reply, the ordered tool-calls (with full untruncated
+    input/output), the task_id and a terminal status — and nothing else on
+    stdout. Plain `eesel chat "…"` must stream to a human exactly as before."""
+
+    def _sess(self):
+        return {"id": "s1", "agent_id": "agent-test-456", "workspace_id": "ws-test-123",
+                "task_id": "t1", "messages": []}
+
+    class _SseResp:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    def _urlopen(self, start_resp, sse_lines):
+        """Dispatch the two calls a turn makes: the sandbox/start POST (JSON) and
+        the raw-stream GET (SSE). streamUrl is left None so the stream goes to
+        the raw-stream URL, which the dispatcher recognises."""
+        outer = self
+
+        def _open(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if url.endswith("/agents/sandbox/start"):
+                return _FakeResp(start_resp)
+            return outer._SseResp(sse_lines)
+
+        return _open
+
+    def _sse(self, *events):
+        return [("data: " + json.dumps(e) + "\n").encode() for e in events]
+
+    # ---- envelope shape (direct send_message) -------------------------------
+
+    def test_envelope_shape_happy(self, fake_creds, monkeypatch):
+        lines = self._sse(
+            {"type": "text-start", "id": "m1"},
+            {"type": "tool-input-available", "toolCallId": "c1",
+             "toolName": "doc_search", "input": {"query": "refunds"}},
+            {"type": "text-delta", "id": "m1", "delta": "Refunds "},
+            {"type": "tool-output-available", "toolCallId": "c1", "output": "3 docs found"},
+            {"type": "text-delta", "id": "m1", "delta": "are covered."},
+            {"type": "finish"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "do refunds work?", render=False)
+        assert env["task_id"] == "task-xyz"
+        assert env["status"] == "completed"
+        assert env["reply"] == "Refunds are covered."
+        assert env["tool_calls"] == [
+            {"name": "doc_search", "input": {"query": "refunds"}, "output": "3 docs found"}
+        ]
+        assert "error" not in env
+
+    def test_tool_calls_paired_by_id_when_outputs_arrive_out_of_order(self, fake_creds, monkeypatch):
+        # Tools can run in parallel, so outputs need not arrive in input order.
+        # Pairing is by toolCallId; ordering is by when each input first appeared.
+        lines = self._sse(
+            {"type": "tool-input-available", "toolCallId": "a", "toolName": "first", "input": {"n": 1}},
+            {"type": "tool-input-available", "toolCallId": "b", "toolName": "second", "input": {"n": 2}},
+            {"type": "tool-output-available", "toolCallId": "b", "output": "out-b"},
+            {"type": "tool-output-available", "toolCallId": "a", "output": "out-a"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "run both", render=False)
+        assert [c["name"] for c in env["tool_calls"]] == ["first", "second"]
+        assert env["tool_calls"][0]["output"] == "out-a"
+        assert env["tool_calls"][1]["output"] == "out-b"
+
+    def test_tool_io_is_not_truncated(self, fake_creds, monkeypatch):
+        # The human view truncates tool input/output to 200 chars; the JSON
+        # envelope must carry them in full so an agent reads back what really ran.
+        big_input = {"blob": "x" * 500}
+        big_output = "y" * 500
+        lines = self._sse(
+            {"type": "tool-input-available", "toolCallId": "c1", "toolName": "big", "input": big_input},
+            {"type": "tool-output-available", "toolCallId": "c1", "output": big_output},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "big", render=False)
+        assert env["tool_calls"][0]["input"] == big_input
+        assert env["tool_calls"][0]["output"] == big_output
+
+    def test_error_event_gives_error_envelope(self, fake_creds, monkeypatch):
+        lines = self._sse({"type": "error", "errorText": "turn failed"})
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert env["task_id"] == "task-xyz"
+        # The specific server reason is threaded into the envelope so an agent
+        # parsing only stdout learns *why* it failed, not just that it did.
+        assert env["error"] == "turn failed"
+
+    def test_clean_eof_without_finish_is_reported_as_error(self, fake_creds, monkeypatch):
+        # A stream that closes cleanly after partial text but WITHOUT the terminal
+        # `finish` event is a truncated turn (LB idle-close, graceful shutdown),
+        # not a completed one. Reporting it "completed" would exit 0 on a partial
+        # reply; the missing terminal signal makes it an error envelope instead.
+        lines = self._sse(
+            {"type": "text-start", "id": "m1"},
+            {"type": "text-delta", "id": "m1", "delta": "partial ans"},
+        )  # no finish
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert "completion signal" in env["error"]
+        # The partial text is still carried, so a caller can inspect what arrived.
+        assert env["reply"] == "partial ans"
+
+    def test_finish_event_marks_the_turn_completed(self, fake_creds, monkeypatch):
+        lines = self._sse(
+            {"type": "text-delta", "id": "m1", "delta": "done"},
+            {"type": "finish"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "completed"
+        assert env["reply"] == "done"
+
+    def test_abort_event_gives_error_envelope(self, fake_creds, monkeypatch):
+        # An aborted turn is a real terminal signal (not a truncation) but the
+        # reply is partial, so it's still an error envelope.
+        lines = self._sse(
+            {"type": "text-delta", "id": "m1", "delta": "half"},
+            {"type": "abort", "reason": "cancelled"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "tk", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert "aborted" in env["error"]
+
+    def test_midstream_unreachable_gives_error_envelope(self, fake_creds, monkeypatch):
+        # A server that vanishes mid-stream (URLError on the raw-stream GET) must
+        # still yield one parseable error envelope, not a bare exit with empty
+        # stdout — the sandbox/start POST succeeds, then the stream dies.
+        def _open(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if url.endswith("/agents/sandbox/start"):
+                return _FakeResp({"taskId": "task-xyz", "streamUrl": None})
+            raise eesel.urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", _open)
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert env["task_id"] == "task-xyz"
+        assert "server reachable?" in env["error"]
+
+    def test_prestream_http_error_gives_error_envelope(self, fake_creds, monkeypatch):
+        import io
+
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.HTTPError(
+                req.full_url, 402, "Payment Required", {},
+                io.BytesIO(b'{"code":"BILLING_LIMIT_EXCEEDED"}'))
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        env = eesel.send_message(fake_creds, self._sess(), "hi", render=False)
+        assert env["status"] == "error"
+        assert "402" in env["error"]
+        assert env["tool_calls"] == []
+
+    # ---- cmd_chat: stdout purity, exit codes, guards ------------------------
+
+    def test_cmd_chat_json_emits_one_clean_object_and_exits_0(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_session_agent", lambda creds: ("agent-test-456", None))
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        lines = self._sse(
+            {"type": "text-start", "id": "m1"},
+            {"type": "tool-input-available", "toolCallId": "c1",
+             "toolName": "doc_search", "input": {"q": "x"}},
+            {"type": "tool-output-available", "toolCallId": "c1", "output": "ok"},
+            {"type": "text-delta", "id": "m1", "delta": "hello"},
+            {"type": "finish"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Exactly one JSON object, and none of the human streaming noise.
+        env = json.loads(out)
+        assert env["status"] == "completed"
+        assert env["reply"] == "hello"
+        assert env["task_id"] == "task-xyz"
+        assert env["tool_calls"][0]["name"] == "doc_search"
+        assert "eesel" not in out and "[tool]" not in out and "→" not in out
+
+    def test_cmd_chat_json_error_event_exits_nonzero_with_object(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_session_agent", lambda creds: ("agent-test-456", None))
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: self._sess())
+        lines = self._sse({"type": "error", "errorText": "turn failed"})
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)  # still one parseable object
+        assert env["status"] == "error"
+
+    def test_human_mode_still_streams_to_stdout(self, fake_creds, monkeypatch, capsys):
+        # Regression: plain `eesel chat "…"` (no --json) streams the reply and
+        # tool activity to stdout behind the `eesel →` prefix, exactly as before.
+        lines = self._sse(
+            {"type": "text-start", "id": "m1"},
+            {"type": "tool-input-available", "toolCallId": "c1",
+             "toolName": "doc_search", "input": {"q": "x"}},
+            {"type": "tool-output-available", "toolCallId": "c1", "output": "ok"},
+            {"type": "text-delta", "id": "m1", "delta": "hi there"},
+            {"type": "finish"},
+        )
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            self._urlopen({"taskId": "task-xyz", "streamUrl": None}, lines))
+        env = eesel.send_message(fake_creds, self._sess(), "hi")  # render defaults True
+        assert env["status"] == "completed" and env["reply"] == "hi there"
+        out = capsys.readouterr().out
+        assert "eesel" in out and "hi there" in out and "[tool] doc_search" in out
+
+    def test_cmd_chat_json_no_message_refuses_repl(self, fake_creds, monkeypatch, capsys):
+        # --json with no message must not drop into the REPL; it errors and the
+        # picker is never reached.
+        monkeypatch.setattr(eesel, "pick_agent", lambda *a, **k: pytest.fail("must not prompt for an agent"))
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None,
+                                  message=None, cost=False, json=True))
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""  # nothing on stdout
+        assert "REPL" in captured.err or "--json requires a message" in captured.err
+
+    def test_cmd_chat_json_ambiguous_agent_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # A multi-agent workspace with no --agent: JSON mode must NOT show a
+        # picker (which would corrupt stdout on a TTY) or exit with only a stderr
+        # message (no envelope non-interactively). It emits one JSON error
+        # envelope on stdout and exits non-zero, and never reaches the interactive
+        # picker.
+        monkeypatch.setattr(eesel, "pick_agent", lambda *a, **k: pytest.fail("JSON mode must not use the interactive picker"))
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [
+            {"agent_id": "a1", "name": "One"}, {"agent_id": "a2", "name": "Two"}])
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: pytest.fail("must not start a session with no agent"))
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        out = capsys.readouterr().out
+        env = json.loads(out)  # exactly one parseable object on stdout
+        assert env["status"] == "error"
+        assert env["task_id"] is None
+        assert "2 agents" in env["error"]
+
+    def test_cmd_chat_json_invalid_agent_flag_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # An explicit but unresolvable `--agent` must also produce one JSON error
+        # envelope on stdout, not an empty stdout + stderr-only exit.
+        monkeypatch.setattr(eesel, "resolve_agent_or_error", lambda creds, target: None)
+        rc = eesel.cmd_chat(_args(agent="missing", task=None, schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert env["task_id"] is None
+        assert "--agent" in env["error"] and "missing" in env["error"]
+
+    def test_cmd_chat_json_invalid_task_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        # An unresolvable `--task` returns before a turn starts; JSON mode still
+        # emits one envelope.
+        monkeypatch.setattr(eesel, "resolve_task_id", lambda creds, t: None)
+        rc = eesel.cmd_chat(_args(agent=None, task="bogus", schedule=None,
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "--task" in env["error"] and "bogus" in env["error"]
+
+    def test_cmd_chat_json_unmatched_trigger_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, t: None)
+        rc = eesel.cmd_chat(_args(agent=None, task=None, schedule="nope",
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "nope" in env["error"]
+
+    def test_cmd_chat_json_task_and_trigger_conflict_emits_error_envelope(self, fake_creds, monkeypatch, capsys):
+        rc = eesel.cmd_chat(_args(agent=None, task="t1", schedule="s1",
+                                  message="hi", cost=False, json=True))
+        assert rc == 1
+        env = json.loads(capsys.readouterr().out)
+        assert env["status"] == "error"
+        assert "mutually exclusive" in env["error"]
 
 
 class TestNewAgentScope:
@@ -7417,10 +8322,20 @@ class TestNewAgentScope:
         monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "trig-1", "agent_id": "sched-agent", "config": {"title": "hb"}})
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("new --schedule must not persist the active agent"))
         monkeypatch.setattr(eesel, "new_session", lambda creds, **k: (created.update(k) or {"id": "sess-1", "name": "sess-1", "trigger_id": k.get("trigger_id"), "trigger_title": k.get("trigger_title")}))
-        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: "ok")
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "completed", "reply": "ok", "task_id": "t1", "tool_calls": []})
         rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
         assert rc == 0
         assert created["agent_id"] == "sched-agent"  # session pinned to the trigger's agent, in memory only
+
+    def test_new_schedule_exits_nonzero_when_preview_fire_fails(self, fake_creds, monkeypatch):
+        # The auto-fire preview turn failing must surface as a non-zero exit, not
+        # a silent 0 — a script chaining on `eesel new --trigger X` should stop.
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: None)
+        monkeypatch.setattr(eesel, "resolve_scheduled_job", lambda creds, target: {"id": "trig-1", "agent_id": "sched-agent", "config": {"title": "hb"}})
+        monkeypatch.setattr(eesel, "new_session", lambda creds, **k: {"id": "sess-1", "name": "sess-1", "trigger_id": k.get("trigger_id"), "trigger_title": k.get("trigger_title")})
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"status": "error", "reply": "", "task_id": "t1", "tool_calls": [], "error": "boom"})
+        rc = eesel.cmd_new(_args(agent=None, schedule="hb", name=None))
+        assert rc == 1
 
 
 class TestPathScopeResolver:
@@ -7751,7 +8666,7 @@ class TestPathScopeUnknownHeadErrors:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Input validation — id/key rejection before the network (ENG-5029 part 2)
+# Input validation — id/key rejection before the network
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -8239,3 +9154,518 @@ class TestCredentialsTempPermissions:
             assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
         finally:
             os.umask(old)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Machine-output contract: emit(), --fields, NDJSON, --dry-run, schema
+# (self-describing & previewable CLI)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_output_globals():
+    """Restore the output-contract module globals before and after each test.
+
+    Handlers read these globals; a test that flips one (e.g. to JSON) must not
+    leak that into the next test, which may call a handler directly and rely on
+    the human/no-op defaults.
+    """
+    saved = (eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS)
+    eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS = "human", None, False, False
+    # The impersonator-status lookup is memoized per token for a process's life;
+    # clear it between tests so a cached verdict from one test can't leak into
+    # another that reuses the same token with a different mocked response.
+    eesel._IMPERSONATE_STATUS_CACHE.clear()
+    yield
+    eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS = saved
+    eesel._IMPERSONATE_STATUS_CACHE.clear()
+
+
+class TestProjectFields:
+    def test_keeps_only_requested_top_level_keys(self):
+        row = {"agent_id": "a1", "name": "Bot", "prompt": "long", "is_active": True}
+        assert eesel._project_fields(row, ["agent_id", "name"]) == {"agent_id": "a1", "name": "Bot"}
+
+    def test_applies_elementwise_to_a_list(self):
+        rows = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+        assert eesel._project_fields(rows, ["a"]) == [{"a": 1}, {"a": 3}]
+
+    def test_unknown_field_is_omitted_not_an_error(self):
+        assert eesel._project_fields({"a": 1}, ["a", "nope"]) == {"a": 1}
+
+    def test_scalar_payload_passes_through(self):
+        assert eesel._project_fields("hello", ["a"]) == "hello"
+        assert eesel._project_fields(["x", "y"], ["a"]) == ["x", "y"]
+
+
+class TestWantJson:
+    def test_true_from_per_command_flag(self):
+        assert eesel._want_json(type("A", (), {"json": True})()) is True
+
+    def test_true_from_global_format(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        assert eesel._want_json(type("A", (), {})()) is True
+
+    def test_false_by_default(self):
+        assert eesel._want_json(type("A", (), {})()) is False
+
+
+class TestEmit:
+    def test_masks_secrets_by_default(self, capsys):
+        eesel.emit({"name": "x", "access_token": "sk-123"})
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"name": "x", "access_token": "***"}
+
+    def test_reveal_true_leaves_secrets_raw(self, capsys):
+        eesel.emit({"access_token": "sk-123"}, reveal=True)
+        assert json.loads(capsys.readouterr().out)["access_token"] == "sk-123"
+
+    def test_reveal_none_defers_to_global(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", True)
+        eesel.emit({"access_token": "sk-123"})
+        assert json.loads(capsys.readouterr().out)["access_token"] == "sk-123"
+
+    def test_fields_argument_projects(self, capsys):
+        eesel.emit({"a": 1, "b": 2}, fields=["a"])
+        assert json.loads(capsys.readouterr().out) == {"a": 1}
+
+    def test_global_fields_projects_when_no_arg(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_OUTPUT_FIELDS", ["b"])
+        eesel.emit({"a": 1, "b": 2})
+        assert json.loads(capsys.readouterr().out) == {"b": 2}
+
+    def test_list_streams_ndjson_when_json_and_piped(self, monkeypatch, capsys):
+        # JSON active + not a TTY (capsys) → one object per line.
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert [json.loads(l) for l in lines] == [{"a": 1}, {"a": 2}]
+
+    def test_list_is_one_pretty_array_on_a_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        monkeypatch.setattr(eesel, "_is_tty", lambda: True)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        assert json.loads(capsys.readouterr().out) == [{"a": 1}, {"a": 2}]
+
+    def test_list_is_one_array_when_format_human_even_if_piped(self, monkeypatch, capsys):
+        # A handler invoked directly (no main()) leaves _OUTPUT_FORMAT="human";
+        # its list --json output must stay a parseable whole array, not NDJSON —
+        # this is what keeps the pre-existing direct-handler json.loads tests green.
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        assert json.loads(capsys.readouterr().out) == [{"a": 1}, {"a": 2}]
+
+
+class TestExtractGlobalOutputFlags:
+    def test_extracts_booleans_anywhere(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "create", "--dry-run", "--json"])
+        assert rest == ["agents", "create"]
+        assert vals["dry_run"] is True and vals["json"] is True
+
+    def test_fields_consumes_following_token(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--fields", "a,b"])
+        assert rest == ["agents", "list"] and vals["fields"] == "a,b"
+
+    def test_fields_inline_equals(self):
+        rest, vals = eesel._extract_global_output_flags(["--fields=a,b", "x"])
+        assert rest == ["x"] and vals["fields"] == "a,b"
+
+    def test_fields_does_not_swallow_a_following_flag(self):
+        # `--fields --json` must leave --json intact rather than take it as the
+        # fields value (which would silently disable JSON). With no real value,
+        # fields stays unset and the following flag is still parsed.
+        rest, vals = eesel._extract_global_output_flags(["schema", "--fields", "--json"])
+        assert rest == ["schema"]
+        assert vals["fields"] is None
+        assert vals["json"] is True
+
+    def test_fields_at_end_with_no_value_stays_unset(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--fields"])
+        assert rest == ["agents", "list"]
+        assert vals["fields"] is None
+
+    def test_passes_through_unrelated_tokens(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--plain"])
+        assert rest == ["agents", "list", "--plain"]
+        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None}
+
+
+class TestConfigureOutput:
+    def test_env_output_json_sets_json_format(self, monkeypatch):
+        monkeypatch.setenv("EESEL_OUTPUT", "json")
+        args = type("A", (), {"json": False})()
+        eesel._configure_output(args, {"json": False, "dry_run": False, "fields": None}, None)
+        assert eesel._OUTPUT_FORMAT == "json"
+
+    def test_fields_parsed_into_list(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        eesel._configure_output(type("A", (), {"json": True})(), {"json": True, "dry_run": False, "fields": "a, b ,c"}, None)
+        assert eesel._OUTPUT_FIELDS == ["a", "b", "c"]
+
+    def test_dry_run_flag_sets_global(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        eesel._configure_output(type("A", (), {"json": False})(), {"json": False, "dry_run": True, "fields": None}, None)
+        assert eesel._DRY_RUN is True
+
+    def test_secrets_needs_sysadmin(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
+        eesel._configure_output(type("A", (), {"json": False, "secrets": True})(), {"json": False, "dry_run": False, "fields": None}, {"token": "t"})
+        assert eesel._REVEAL_SECRETS is False
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
+        eesel._configure_output(type("A", (), {"json": False, "secrets": True})(), {"json": False, "dry_run": False, "fields": None}, {"token": "t"})
+        assert eesel._REVEAL_SECRETS is True
+
+
+class TestWriteRequestDryRun:
+    def test_dry_run_prints_resolved_request_and_exits_zero(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        called = []
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: called.append(a) or {})
+        with pytest.raises(SystemExit) as exc:
+            eesel.write_request("POST", "https://api/agents", token="t", body={"name": "X"})
+        assert exc.value.code == 0
+        assert called == []  # no real call was made
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"method": "POST", "url": "https://api/agents", "body": {"name": "X"}}
+
+    def test_dry_run_masks_secret_in_previewed_body(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        with pytest.raises(SystemExit):
+            eesel.write_request("POST", "https://api/x", body={"api_key": "sk-9"})
+        assert json.loads(capsys.readouterr().out)["body"]["api_key"] == "***"
+
+    def test_passthrough_when_not_dry_run(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_DRY_RUN", False)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"ok": method})
+        assert eesel.write_request("DELETE", "https://api/x", token="t") == {"ok": "DELETE"}
+
+    def test_allow_error_passthrough_returns_tuple(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_DRY_RUN", False)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (400, {"error": "bad"}))
+        assert eesel.write_request("POST", "https://api/x", body={}, allow_error=True) == (400, {"error": "bad"})
+
+
+class TestSchema:
+    def _schema(self):
+        parser = eesel.build_parser(staff=True)
+        return eesel._serialize_parser(parser)
+
+    def test_lists_every_top_level_command(self):
+        s = self._schema()
+        names = set(s["subcommands"])
+        for expected in ("agents", "integrations", "automations", "mcp", "files", "skills", "workspace", "schema"):
+            assert expected in names
+
+    def test_flag_reports_names_required_and_enum_choices(self):
+        s = self._schema()
+        show = s["subcommands"]["files"]["subcommands"]["show"]
+        fmt = next(f for f in show["flags"] if "--format" in f["names"])
+        assert fmt["choices"] == ["md", "html"]  # matches the parser's enum
+        assert fmt["takes_value"] is True
+
+    def test_every_command_resolves_to_a_real_handler(self):
+        s = self._schema()
+        missing = []
+
+        def walk(node, path):
+            subs = node.get("subcommands", {})
+            if not subs and "handler" not in node:
+                missing.append(".".join(path))
+            for name, sub in subs.items():
+                walk(sub, path + [name])
+
+        walk(s, [])
+        assert missing == []
+
+    def test_handler_names_exist_on_the_module(self):
+        s = self._schema()
+
+        def walk(node):
+            if "handler" in node:
+                assert hasattr(eesel, node["handler"]), node["handler"]
+            for sub in node.get("subcommands", {}).values():
+                walk(sub)
+
+        walk(s)
+
+    def test_endpoint_annotation_attached_to_writes(self):
+        s = self._schema()
+        create = s["subcommands"]["agents"]["subcommands"]["create"]
+        assert create["endpoint"] == "POST /agents"
+
+    def test_no_dead_endpoint_keys(self):
+        # Every key in the hand-kept endpoint map points at a command that
+        # actually exists in the parser tree.
+        s = self._schema()
+        paths = set()
+
+        def walk(node, path):
+            if path:
+                paths.add(".".join(path))
+            for name, sub in node.get("subcommands", {}).items():
+                walk(sub, path + [name])
+
+        walk(s, [])
+        dead = [k for k in eesel._COMMAND_ENDPOINTS if k not in paths]
+        assert dead == []
+
+    def test_endpoint_values_match_a_real_request_call(self):
+        # `test_no_dead_endpoint_keys` proves each KEY names a real command; this
+        # pins each VALUE ("POST /agents") against the method+path the CLI's
+        # request helpers actually issue, so a wrong annotation (wrong verb or
+        # wrong path) is caught rather than silently misleading an agent.
+        #
+        # The check is static: parse the CLI source and collect the (method,
+        # path) of every call to the request helpers (http_request /
+        # http_request_allow_error / write_request, and GET-only http_fetch /
+        # http_download). URL f-strings are rendered to a template with each
+        # `{...}` interpolation collapsed to `{}`; the leading `{api_url}` and any
+        # trailing glued query/suffix placeholder are stripped so a path segment
+        # (`/agents/{}`) is distinguished from an appended query (`/integrations`
+        # + `{qs}`). Then every endpoint value must appear among the collected
+        # calls. This confirms the annotation corresponds to a real call with
+        # that verb and path shape; it does not prove the call is reached by that
+        # exact subcommand (branching handlers make several keys share a handler).
+        request_funcs = {"http_request", "http_request_allow_error", "write_request"}
+        fetch_funcs = {"http_fetch", "http_download"}  # GET-only helpers
+
+        tree = ast.parse((_HERE / "eesel").read_text())
+
+        def render(node, name_values):
+            """Render a str constant or f-string to a template. A FormattedValue
+            that is a bare name present in `name_values` is inlined with that
+            literal; every other interpolation becomes `{}`."""
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                parts = []
+                for v in node.values:
+                    if isinstance(v, ast.Constant):
+                        parts.append(str(v.value))
+                    elif (isinstance(v, ast.FormattedValue)
+                          and isinstance(v.value, ast.Name)
+                          and v.value.id in name_values):
+                        parts.append(name_values[v.value.id])
+                    else:
+                        parts.append("{}")
+                return "".join(parts)
+            return None
+
+        # Module-level one-line `return "<f-string>"` helpers (e.g.
+        # `_mcp_server_url`) so a call passing a literal argument (`"/toggle"`)
+        # inlines it and resolves to the real path.
+        helpers = {}
+        for fn in tree.body:
+            if (isinstance(fn, ast.FunctionDef) and len(fn.body) == 1
+                    and isinstance(fn.body[0], ast.Return)
+                    and isinstance(fn.body[0].value, (ast.JoinedStr, ast.Constant))):
+                helpers[fn.name] = ([a.arg for a in fn.args.args], fn.body[0].value)
+
+        def resolve(node, assigns):
+            """Possible URL templates for a url expression: a literal/f-string, a
+            variable assigned one earlier in the function, or a call to a simple
+            return-only helper."""
+            if isinstance(node, (ast.Constant, ast.JoinedStr)):
+                t = render(node, {})
+                return {t} if t is not None else set()
+            if isinstance(node, ast.Name):
+                return set(assigns.get(node.id, set()))
+            if isinstance(node, ast.Call):
+                fname = (node.func.attr if isinstance(node.func, ast.Attribute)
+                         else getattr(node.func, "id", None))
+                if fname in helpers:
+                    params, ret = helpers[fname]
+                    name_values = {
+                        p: a.value for p, a in zip(params, node.args)
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    }
+                    t = render(ret, name_values)
+                    return {t} if t is not None else set()
+            return set()
+
+        def norm_path(tpl):
+            if tpl is None:
+                return None
+            m = re.search(r"/.*", tpl)
+            if not m:
+                return None
+            path = m.group(0).split("?")[0]
+            path = re.sub(r"\{[^}]*\}", "{}", path)
+            # A trailing `{}` not preceded by `/` is a glued query/suffix, not a
+            # path segment (e.g. `/integrations` + `{qs}`) — drop it.
+            while path.endswith("{}") and not path.endswith("/{}"):
+                path = path[:-2]
+            return path.rstrip("/") or "/"
+
+        actual = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            assigns: dict = {}
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign):
+                    templates = resolve(stmt.value, assigns)
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, ast.Name) and templates:
+                            assigns.setdefault(tgt.id, set()).update(templates)
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = (call.func.attr if isinstance(call.func, ast.Attribute)
+                        else getattr(call.func, "id", None))
+                if name in fetch_funcs and call.args:
+                    for t in resolve(call.args[0], assigns):
+                        p = norm_path(t)
+                        if p:
+                            actual.add(("GET", p))
+                elif name in request_funcs and len(call.args) >= 2:
+                    method = call.args[0].value if isinstance(call.args[0], ast.Constant) else None
+                    if method:
+                        for t in resolve(call.args[1], assigns):
+                            p = norm_path(t)
+                            if p:
+                                actual.add((method, p))
+
+        def norm_ep(path):
+            return re.sub(r"\{[^}]*\}", "{}", path).rstrip("/") or "/"
+
+        # Residual gap: `integrations connect` POSTs to a path the connector
+        # definition supplies at runtime (`option.endpoint`), so no path literal
+        # exists in the source to cross-check — the annotation is a hand-written
+        # approximation of the server's shape. Verified by reading the handler,
+        # not statically here.
+        unverifiable = {"integrations.connect"}
+
+        unmatched = []
+        for key, value in eesel._COMMAND_ENDPOINTS.items():
+            if key in unverifiable:
+                continue
+            method, path = value.split(" ", 1)
+            if path.endswith("/*"):
+                # Wildcard family (e.g. billing → GET /subscription/*): satisfied
+                # by any real call sharing the verb and path prefix.
+                prefix = norm_ep(path[:-1])
+                matched = any(m == method and p.startswith(prefix) for m, p in actual)
+            else:
+                matched = (method, norm_ep(path)) in actual
+            if not matched:
+                unmatched.append(f"{key}: {value}")
+
+        assert unmatched == [], (
+            "endpoint annotations with no matching request call in the source: "
+            + ", ".join(unmatched)
+        )
+
+    def test_cmd_schema_emits_valid_json(self, capsys):
+        eesel.cmd_schema(type("A", (), {})())
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["prog"] == "eesel"
+        assert "agents" in parsed["subcommands"]
+
+
+class TestOutputContractThroughMain:
+    """End-to-end through main() — the path real usage and agents take."""
+
+    def test_json_list_is_ndjson_when_piped(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One"}, {"agent_id": "a2", "name": "Two"}])
+        assert eesel.main(["agents", "list", "--json"]) == 0
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert [json.loads(l)["agent_id"] for l in lines] == ["a1", "a2"]
+
+    def test_env_output_json_matches_json_flag(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One"}])
+        monkeypatch.setenv("EESEL_OUTPUT", "json")
+        assert eesel.main(["agents", "list"]) == 0
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert json.loads(lines[0])["agent_id"] == "a1"
+
+    def test_fields_projection_through_main(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One", "prompt": "big"}])
+        assert eesel.main(["agents", "list", "--json", "--fields", "agent_id,name"]) == 0
+        assert json.loads(capsys.readouterr().out.splitlines()[0]) == {"agent_id": "a1", "name": "One"}
+
+    def test_no_flag_output_unchanged_and_not_json(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1b2c3d4e5f6", "name": "One", "is_active": True}])
+        assert eesel.main(["agents", "list"]) == 0
+        out = capsys.readouterr().out
+        assert "[on]" in out and "One" in out  # human table, not JSON
+
+    def test_dry_run_create_makes_no_call(self, fake_creds, monkeypatch, capsys):
+        def boom(*a, **k):
+            raise AssertionError("dry-run must not hit the network")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["agents", "create", "--name", "Probe", "--dry-run"])
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["method"] == "POST"
+        assert payload["url"].endswith("/agents")
+        assert payload["body"]["name"] == "Probe"
+
+    def test_dry_run_flag_before_subcommand(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")))
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["--dry-run", "agents", "create", "--name", "Probe"])
+        assert exc.value.code == 0
+        assert json.loads(capsys.readouterr().out)["body"]["name"] == "Probe"
+
+    def test_post_read_is_not_intercepted_by_dry_run(self, fake_creds, monkeypatch, capsys):
+        # tasks list is POST /workspace/tasks — a read. --dry-run must NOT
+        # short-circuit it; it still returns data.
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "wt")
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [{"task_id": "t1"}], "has_next": False, "next_page": None})
+        rc = eesel.main(["--dry-run", "tasks", "list", "--json"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["tasks"][0]["task_id"] == "t1"
+
+
+class TestRedactionScope:
+    """Redaction masks only string secret material — verify it spares numeric
+    counts and booleans whose key names collide with a secret-hint substring."""
+
+    def test_preserves_numeric_count_under_token_hinted_key(self):
+        red = eesel._redact_secrets({"input_tokens": 1234, "output_tokens": 5, "access_token": "sk-1"})
+        assert red == {"input_tokens": 1234, "output_tokens": 5, "access_token": "***"}
+
+    def test_preserves_boolean_presence_flag(self):
+        assert eesel._redact_secrets({"has_auth_token": True}) == {"has_auth_token": True}
+
+    def test_still_masks_string_secret(self):
+        assert eesel._redact_secrets({"client_secret": "shh"}) == {"client_secret": "***"}
+
+
+class TestEmitRedactBeforeProject:
+    def test_property_entry_value_masked_even_when_projected(self, capsys):
+        # The {key,value} property shape marks `value` secret via its sibling
+        # `key`. Redaction must run before projection, or `--fields value`
+        # (which drops `key`) would leak the raw value.
+        payload = [{"key": "x_access_token", "value": "SECRET"}]
+        eesel.emit(payload, fields=["value"])
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed == [{"value": "***"}]
+
+
+class TestTasksExportDryRun:
+    def test_export_dry_run_previews_and_makes_no_export_call(self, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def rec(method, url, **k):
+            calls.append((method, url))
+            return {"agents": [], "message": "ok"}
+
+        monkeypatch.setattr(eesel, "http_request", rec)
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "wt")
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["tasks", "export", "--dry-run"])
+        assert exc.value.code == 0
+        # The export POST was previewed, never actually sent.
+        assert not any("/tasks/export" in u for _, u in calls)
+        assert "/tasks/export" in json.loads(capsys.readouterr().out)["url"]

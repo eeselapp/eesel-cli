@@ -53,6 +53,16 @@ eesel new                           # start a chat session
 eesel chat "hey, talk to me"        # one-shot send to active session
 eesel chat                          # interactive REPL
 
+eesel chat --json "do refunds work?"   # one JSON object on stdout: the reply,
+                                    # ordered tool-calls (name + full,
+                                    # untruncated input/output), task_id, and a
+                                    # terminal status ("completed"/"error").
+                                    # Progress/prefix noise stays on stderr, so
+                                    # stdout parses cleanly. Requires a message
+                                    # (no REPL); exits non-zero unless status is
+                                    # "completed". Read the turn back with
+                                    # `eesel tasks show <task_id> --json`.
+
 eesel chat --task <task-id> "..."   # continue an existing conversation by
                                     # its backend task id — e.g. post an
                                     # async job result back into the chat
