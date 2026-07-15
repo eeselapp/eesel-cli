@@ -142,6 +142,26 @@ PROD_TOKEN_TTL_FALLBACK_SECONDS = 3600
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Exit codes
+#
+# A stable, machine-branchable contract for agents driving the CLI: an exit code
+# tells the caller *why* a command failed, not just that it did. Today only
+# validation failures use a dedicated code; every other failure still exits
+# EXIT_GENERIC (1). The auth / not-found / rate-limit / server codes are reserved
+# here so a later change can wire them without renumbering — once agents branch
+# on these numbers they are a public contract and must not shift.
+# ──────────────────────────────────────────────────────────────────────────
+EXIT_OK = 0
+EXIT_GENERIC = 1
+EXIT_USAGE = 2          # argparse's own code for a malformed command line
+EXIT_AUTH = 3           # reserved: not logged in / token rejected
+EXIT_NOT_FOUND = 4      # reserved: named resource does not exist
+EXIT_VALIDATION = 5     # input rejected client-side before any network call
+EXIT_RATE_LIMIT = 6     # reserved: server asked us to back off
+EXIT_SERVER = 7         # reserved: server-side failure (5xx)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Output helpers
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -399,6 +419,186 @@ def interactive_select(options: list[str], *, title: str | None = None, initial:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Input validation
+#
+# An id/key that becomes an API URL path segment must never carry a traversal
+# like `../`, an ASCII control character, or a URL metacharacter (`?` `#` `%`)
+# that could smuggle a query string onto an unrelated endpoint. Two layers
+# enforce this:
+#
+#   1. `assert_url_path_safe` (the choke point) runs inside the HTTP helpers on
+#      the fully-assembled URL, so any id reaching a path segment is checked
+#      centrally — even if a command forgets to validate it. This is what makes
+#      traversal protection fail CLOSED. It inspects only the path, never the
+#      query string (which legitimately carries metacharacters).
+#   2. `validate_id` / `validate_key` reject a malformed *resolved* id/key close
+#      to the call site, as defense in depth and for a clearer message.
+#
+#   validate_id   Opaque ids (agent_id, task_id, integration_id, session id, …).
+#                 No `/` at all, and none of the shared rejects below.
+#   validate_key  Path-like keys (e.g. `files/report.md`). Interior `/` is
+#                 allowed, but a leading `/`, any `..` path segment, and the
+#                 shared rejects are not.
+#
+# These validators run on the value that actually becomes a URL segment — the
+# *resolved* id, not a raw human name. A target can legitimately be an agent
+# name, job title, or filename containing `/ ? # % ..`; those are resolved to a
+# slash-free id client-side, and only that resolved id is validated. Validating
+# the raw name would break the documented id-or-name lookups for such targets.
+# ──────────────────────────────────────────────────────────────────────────
+
+# `?` `#` `%` delimit a URL's query and fragment and introduce percent-encoding;
+# an id carrying one could smuggle a query string onto an unrelated endpoint.
+_URL_METACHARS = "?#%"
+
+
+def _control_or_meta_reason(value: str) -> str | None:
+    """The reason `value` is unfit for a URL path segment (a control char or a
+    URL metacharacter), or None if it carries neither. Shared by both validators."""
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F:
+            return "contains an ASCII control character"
+        if ch in _URL_METACHARS:
+            return f"contains a URL metacharacter '{ch}'"
+    return None
+
+
+def _reject_input(value: str, label: str, reason: str) -> None:
+    err(f"Invalid {label} {value!r}: {reason}.")
+    sys.exit(EXIT_VALIDATION)
+
+
+def validate_id(value: str, label: str = "id") -> str:
+    """Validate an opaque identifier bound for a URL path segment and return it
+    unchanged, or exit EXIT_VALIDATION naming what was wrong.
+
+    Rejects `/` (which would traverse into other path segments), `..`, ASCII
+    control characters, and the URL metacharacters `? # %`. An empty or None
+    value passes through untouched — "no id given" is handled downstream, not
+    here."""
+    if not isinstance(value, str) or not value:
+        return value
+    reason = _control_or_meta_reason(value)
+    if reason is None and "/" in value:
+        reason = "contains '/'"
+    if reason is None and ".." in value:
+        reason = "contains '..'"
+    if reason is not None:
+        _reject_input(value, label, reason)
+    return value
+
+
+def validate_key(value: str, label: str = "key") -> str:
+    """Validate a path-like key bound for a URL path (e.g. `files/report.md`) and
+    return it unchanged, or exit EXIT_VALIDATION naming what was wrong.
+
+    Interior `/` is allowed — document keys legitimately contain it — but a
+    leading `/`, any `..` path segment, ASCII control characters, and the URL
+    metacharacters `? # %` are rejected. An empty or None value passes through."""
+    if not isinstance(value, str) or not value:
+        return value
+    reason = _control_or_meta_reason(value)
+    if reason is None and value.startswith("/"):
+        reason = "has a leading '/'"
+    if reason is None and ".." in value.split("/"):
+        reason = "contains a '..' path segment"
+    if reason is not None:
+        _reject_input(value, label, reason)
+    return value
+
+
+def assert_url_path_safe(url: str) -> None:
+    """Fail-closed guard against path traversal in a fully-assembled request URL.
+
+    This runs inside the HTTP helpers, on the URL right before it is sent, so any
+    id that reaches a URL path segment is checked here regardless of whether the
+    caller remembered a per-argument `validate_id`/`validate_key`. It is the
+    single choke point that makes traversal protection fail closed: a new command
+    that forgets to validate its id still can't send a request whose path escapes
+    the intended endpoint.
+
+    Only the PATH is inspected. Query-string and fragment values legitimately
+    carry URL metacharacters (`%`, `#`, an inner `?`) — e.g. a title or filename
+    passed as a query parameter — so they are left untouched. A path segment that
+    decodes to `.` or `..` (a traversal, including a percent-encoded `%2e%2e` or
+    a `%2f`-smuggled separator) or that contains an ASCII control character aborts
+    with EXIT_VALIDATION. Segments are unquoted before the check so an encoded
+    traversal can't slip past the raw comparison; a legitimately percent-encoded
+    id (e.g. a display name run through `urllib.parse.quote`) decodes to an
+    ordinary string and passes."""
+    path = urllib.parse.urlsplit(url).path
+    for raw_segment in path.split("/"):
+        decoded = urllib.parse.unquote(raw_segment)
+        # An encoded separator (%2f) can hide a `..` inside a single raw segment,
+        # so split the decoded segment again before comparing.
+        for part in decoded.split("/"):
+            if part in (".", ".."):
+                _reject_input(url, "URL path", f"contains a '{part}' traversal segment")
+        for ch in decoded:
+            code = ord(ch)
+            if code < 0x20 or code == 0x7F:
+                _reject_input(url, "URL path", "contains an ASCII control character")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Atomic file writes
+#
+# Session, pointer, and credentials writes must survive a crash and concurrent
+# writers. A plain write_text can leave a truncated file if the process dies
+# mid-write; a later read then fails to parse it and the whole session (its
+# accumulated history) is silently lost. This helper writes to a uniquely-named
+# temp file in the same directory and os.replace()s it into place. os.replace is
+# atomic on POSIX, so a reader — or a crash, or another writer — only ever sees a
+# complete file: the old one or the fully-written new one, never a half-written
+# one. The unique temp name means two writers never collide, so no lock is needed
+# for the file to stay intact. Two writers to the same path still resolve as a
+# benign last-writer-wins on the (recoverable) pointer, which is acceptable — the
+# guarantee that matters is that no conversation is ever dropped to a torn file.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Write `text` to `path` atomically.
+
+    The temp file is created in the target's own directory so os.replace is a
+    same-filesystem rename (atomic); its name carries a pid + random suffix so
+    two concurrent writers never collide. When `mode` is given, the temp file is
+    *created* with those permissions via os.open(O_CREAT|O_EXCL, mode) — the
+    bytes are never written to a file other local users could read, even for the
+    instant between create and chmod. This matters for the 0o600 credentials
+    file, whose token would otherwise exist group/world-readable at the default
+    umask (~0o644) until a later chmod tightened it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        if mode is not None:
+            # O_EXCL guarantees we create (never open an existing) file, and the
+            # mode argument sets the permission bits at creation time (subject to
+            # umask), so the file is 0o600 before any bytes land in it.
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, mode)
+            try:
+                os.write(fd, text.encode())
+            finally:
+                os.close(fd)
+            # The create mode is masked by the process umask; chmod pins the
+            # exact bits in case a permissive umask (e.g. 0) left them looser.
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+        else:
+            tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError:
+        # A failed write/replace must leave the existing file untouched and not
+        # strand the temp file. Clean it up and re-raise so the caller sees the
+        # real error rather than a silent partial write.
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Config / credentials
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -425,11 +625,9 @@ def save_creds(creds: dict) -> None:
     if creds.get("ephemeral"):
         return
     ensure_dirs()
-    CREDS_FILE.write_text(json.dumps(creds, indent=2))
-    try:
-        os.chmod(CREDS_FILE, 0o600)
-    except OSError:
-        pass
+    # Written 0o600 on the temp file before the atomic replace, so the real
+    # credentials file never briefly exists world-readable.
+    _atomic_write(CREDS_FILE, json.dumps(creds, indent=2), mode=0o600)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -605,6 +803,9 @@ def apply_agent_env_override(creds: dict) -> dict:
     target = (os.environ.get("EESEL_AGENT") or "").strip()
     if not target:
         return creds
+    # The target may legitimately be an agent *name* containing `/`, `%`, etc.
+    # (e.g. "Support/Billing"), so it is resolved first; only the resolved
+    # agent_id — the value that becomes a URL path segment — is validated.
     match, candidates = resolve_agent_strict(fetch_agents(creds), target)
     if not match:
         if candidates:
@@ -617,7 +818,7 @@ def apply_agent_env_override(creds: dict) -> dict:
         sys.exit(1)
     # Copy so the override stays in memory for this process and is never saved.
     creds = dict(creds)
-    creds["agent_id"] = match["agent_id"]
+    creds["agent_id"] = validate_id(match["agent_id"], "agent id")
     return creds
 
 
@@ -643,7 +844,9 @@ def apply_agent_flag_override(creds: dict, agent: str | None) -> dict:
             info("Run `eesel agents list` to see available agents.")
         sys.exit(1)
     creds = dict(creds)
-    creds["agent_id"] = match["agent_id"]
+    # The `--agent` value may be a human name (e.g. "Support/Billing"); validate
+    # the resolved id — the value that becomes a URL path segment — not the name.
+    creds["agent_id"] = validate_id(match["agent_id"], "agent id")
     return creds
 
 
@@ -746,7 +949,7 @@ def load_session(sid: str) -> dict | None:
 def save_session(sess: dict) -> None:
     ensure_dirs()
     sess["updated_at"] = time.time()
-    _session_path(sess["id"]).write_text(json.dumps(sess, indent=2))
+    _atomic_write(_session_path(sess["id"]), json.dumps(sess, indent=2))
 
 
 def delete_session(sid: str) -> bool:
@@ -774,15 +977,66 @@ def set_current(sid: str | None) -> None:
     if sid is None:
         CURRENT_FILE.unlink(missing_ok=True)
         return
-    CURRENT_FILE.write_text(json.dumps({"session_id": sid}, indent=2))
+    _atomic_write(CURRENT_FILE, json.dumps({"session_id": sid}, indent=2))
 
 
-def ensure_current_session(creds: dict, agent_id: str | None = None) -> dict:
+def _pinned_session_id() -> str | None:
+    """The session id pinned for this whole run via EESEL_SESSION, or None.
+
+    Mirrors EESEL_BASE_URL: an agent driving several `eesel chat` runs in
+    parallel sets a distinct EESEL_SESSION per run, so each run reads and writes
+    only its own session file and never touches the shared current.json pointer —
+    which removes the race where two unscoped runs fight over which session is
+    active. The value is used directly as the session filename stem, so it is
+    validated like any other id bound for the filesystem: `EESEL_SESSION=../creds`
+    is rejected before it can escape the sessions directory."""
+    raw = os.environ.get("EESEL_SESSION")
+    if raw is None or not raw.strip():
+        return None
+    return validate_id(raw.strip(), "EESEL_SESSION")
+
+
+def ensure_current_session(creds: dict, agent_id: str | None = None, *, agent_explicit: bool = False) -> dict:
     """Return the active session, creating one if needed.
 
     If a turn names an agent, only reuse an active session for that same agent;
     otherwise the message would go to the session's agent, not the named one.
+
+    When EESEL_SESSION is set, that id *is* this run's session: it is reused if
+    the file exists, else created with that id, and the shared current.json
+    pointer is never read or written — so parallel runs with distinct
+    EESEL_SESSION values can't interleave into one session.
+
+    `agent_explicit` marks that `agent_id` came from an explicit `--agent` flag
+    or the EESEL_AGENT env var (not an auto-picked sole agent). When an explicit
+    agent conflicts with a pinned session's agent, the run is aborted rather than
+    silently routed to the pinned session's agent — a non-interactive agent must
+    not have its target swapped without notice.
     """
+    pinned = _pinned_session_id()
+    if pinned is not None:
+        sess = load_session(pinned)
+        if sess is None:
+            return new_session(creds, agent_id=agent_id, name=None, switch_to=False, session_id=pinned)
+        if agent_id is not None and sess.get("agent_id") != agent_id:
+            if agent_explicit:
+                # An explicit --agent/EESEL_AGENT disagrees with the pinned
+                # session's agent. Routing the turn to the pinned session would
+                # send it to the wrong agent with no signal — a silent target
+                # swap that's unsafe for an unattended agent. Fail loud instead.
+                err(f"session {sess['id']} (pinned via EESEL_SESSION) belongs to agent "
+                    f"{str(sess.get('agent_id'))[:8]}, but --agent/EESEL_AGENT names agent "
+                    f"{agent_id[:8]}. Refusing to route the turn to a different agent than "
+                    "requested. Unset EESEL_SESSION, or drop the explicit agent to use the "
+                    "pinned session's agent.")
+                sys.exit(EXIT_VALIDATION)
+            # The agent was auto-selected (sole agent), not explicitly requested.
+            # The pin is an explicit per-run choice, so it wins; note the mismatch
+            # rather than forking the pinned id.
+            info(f"session {sess['id']} (pinned via EESEL_SESSION) belongs to agent "
+                 f"{str(sess.get('agent_id'))[:8]}; the turn's agent is {agent_id[:8]} — "
+                 "using the pinned session.")
+        return sess
     sid = load_current()
     sess = load_session(sid) if sid else None
     if sess and (agent_id is None or sess.get("agent_id") == agent_id):
@@ -802,8 +1056,10 @@ def find_session_by_task(task_id: str) -> dict | None:
     return None
 
 
-def new_session(creds: dict, *, agent_id: str | None, name: str | None, switch_to: bool = True, trigger_id: str | None = None, trigger_title: str | None = None, task_id: str | None = None) -> dict:
-    sid = uuid.uuid4().hex[:12]
+def new_session(creds: dict, *, agent_id: str | None, name: str | None, switch_to: bool = True, trigger_id: str | None = None, trigger_title: str | None = None, task_id: str | None = None, session_id: str | None = None) -> dict:
+    # `session_id` is set only by the EESEL_SESSION path, which pins a run to a
+    # caller-chosen id (already validated) instead of the generated 12-hex one.
+    sid = session_id or uuid.uuid4().hex[:12]
     sess = {
         "id": sid,
         "name": name or f"chat-{datetime.now().strftime('%Y%m%d-%H%M')}",
@@ -1078,6 +1334,7 @@ _current_creds: dict | None = None
 def _http_send(method: str, url: str, *, token: str | None, body: dict | None, timeout: int, headers: dict | None) -> dict:
     """One HTTP attempt. Returns the parsed JSON dict; lets HTTPError / URLError /
     timeout propagate so callers can decide whether to retry or exit."""
+    assert_url_path_safe(url)
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json", **(headers or {})}
     if token:
@@ -1213,6 +1470,7 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
     On a non-HTTP failure (server unreachable) it still exits, since there's no
     structured body to surface.
     """
+    assert_url_path_safe(url)
     _impersonation_write_backstop(method, url)
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"}
@@ -1286,6 +1544,7 @@ def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
     paths. Mirrors http_request's error handling — sys.exit with the server's
     body on failure.
     """
+    assert_url_path_safe(url)
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1869,18 +2128,30 @@ def resolve_scheduled_job(creds: dict, target: str) -> dict | None:
     substring, or None. First-match — used by the preview binds (`chat
     --schedule`, `new --schedule`). The `fire`/`remove` paths use
     `resolve_scheduled_job_strict`, which refuses an ambiguous value rather than
-    acting on an arbitrary match."""
+    acting on an arbitrary match.
+
+    `target` may be a job *title* substring containing `/`, `%`, etc., so it is
+    resolved first; only the resolved job id — the value that becomes a URL path
+    segment — is validated."""
     matches = match_scheduled_jobs(fetch_all_scheduled_jobs(creds), target)
-    return matches[0] if matches else None
+    if not matches:
+        return None
+    validate_id(matches[0].get("id"), "scheduled job id")
+    return matches[0]
 
 
 def resolve_scheduled_job_strict(creds: dict, target: str) -> dict | None:
     """Resolve `target` to exactly one scheduled job for `fire`/`remove`, or
     print why it could not (no match, or ambiguous with the candidates listed)
     and return None. A title substring can match several jobs, so firing or
-    deleting must not act on an arbitrary first match."""
+    deleting must not act on an arbitrary first match.
+
+    A title substring can legitimately contain `/`, `%`, etc., so `target` is
+    resolved first; only the resolved job id — the value that becomes a URL path
+    segment — is validated."""
     matches = match_scheduled_jobs(fetch_all_scheduled_jobs(creds), target)
     if len(matches) == 1:
+        validate_id(matches[0].get("id"), "scheduled job id")
         return matches[0]
     if not matches:
         err(f"No scheduled job matches '{target}'.")
@@ -2831,6 +3102,7 @@ def _resolve_trigger(creds: dict, trigger_id: str) -> dict | None:
     deleting an arbitrary match. Resolving client-side means a bad or partial id
     is a clean 'no match' here rather than a 500 from `DELETE /triggers/{prefix}`
     (the server has no such row)."""
+    validate_id(trigger_id, "trigger id")
     matches = match_event_triggers(fetch_all_event_triggers(creds), trigger_id)
     return matches[0] if matches else None
 
@@ -2840,6 +3112,7 @@ def resolve_event_trigger_strict(creds: dict, trigger_id: str) -> dict | None:
     print why it could not (no match, or ambiguous with the candidates listed)
     and return None. An id-prefix can match several triggers, so deleting must
     not act on an arbitrary first match."""
+    validate_id(trigger_id, "trigger id")
     matches = match_event_triggers(fetch_all_event_triggers(creds), trigger_id)
     if len(matches) == 1:
         return matches[0]
@@ -3176,6 +3449,9 @@ def cmd_integrations(args) -> int:
             "or omit --agent to act on the whole workspace.")
         return 1
     if agent_arg:
+        # `--agent` may be a human agent name containing `/`, `%`, etc., so it is
+        # resolved first; only the resolved agent_id (the URL path segment) is
+        # validated.
         agent, candidates = resolve_agent_strict(fetch_agents(creds), args.agent)
         if not agent:
             if candidates:
@@ -3188,8 +3464,16 @@ def cmd_integrations(args) -> int:
                 info("Run `eesel agents list` to see available agents.")
             return 1
         creds = dict(creds)
-        creds["agent_id"] = agent["agent_id"]
+        creds["agent_id"] = validate_id(agent["agent_id"], "agent id")
     sub = getattr(args, "integrations_cmd", None) or "list"
+    # The integration reference (`<integration>` / `--id`) and the connect
+    # catalog key both become URL path segments; reject a malformed one before
+    # any lookup runs. `--id` is an opaque instance id; the connect `key` is a
+    # connector key (e.g. `zendesk`), also opaque.
+    if getattr(args, "id", None):
+        validate_id(args.id, "integration")
+    if sub == "connect" and getattr(args, "key", None):
+        validate_id(args.key, "integration key")
     if sub == "list":
         return _integrations_list(args, creds)
     if sub == "available":
@@ -3713,6 +3997,11 @@ def cmd_integration_actions(args) -> int:
     """
     creds = require_creds()
     sub = getattr(args, "actions_cmd", None) or "list"
+    # The action reference may be a display name (e.g. "Search % discounts") that
+    # resolves to a `tool_key` client-side, so it is not validated as a raw key
+    # here — that would reject a legitimate name carrying `% # ?`. The resolved
+    # key is URL-quoted where it becomes a path segment, and the HTTP choke point
+    # (`assert_url_path_safe`) rejects any traversal that reaches the request.
     if sub == "show":
         return _actions_show(args, creds)
     if sub == "enable":
@@ -4046,6 +4335,10 @@ def _json_chat_error(reason: str) -> int:
 
 def cmd_chat(args) -> int:
     creds = require_creds()
+    # Validate EESEL_SESSION up front so a malformed pin (e.g. a traversal) fails
+    # with EXIT_VALIDATION before any network call, not after the agent lookup.
+    # The pin is consumed later in ensure_current_session; this is the early gate.
+    _pinned_session_id()
     json_mode = bool(getattr(args, "json", False))
     # --json is a one-shot machine call: it emits exactly one JSON object for a
     # single turn. The REPL has no JSON form, so refuse it up front (before any
@@ -4146,7 +4439,12 @@ def cmd_chat(args) -> int:
         )
         info(f"Preview session bound to trigger '{sess.get('trigger_title')}' ({sess['trigger_id'][:12]}, agent={match['agent_name']})")
     else:
-        sess = ensure_current_session(creds, agent_id=creds.get("agent_id"))
+        # An agent is "explicit" when named on this command (--agent) or via
+        # EESEL_AGENT, versus auto-picked as the workspace's sole agent. An
+        # explicit agent that conflicts with a pinned EESEL_SESSION aborts rather
+        # than silently routing to the pinned session's agent.
+        agent_explicit = bool(getattr(args, "agent", None)) or bool((os.environ.get("EESEL_AGENT") or "").strip())
+        sess = ensure_current_session(creds, agent_id=creds.get("agent_id"), agent_explicit=agent_explicit)
     show_cost = bool(getattr(args, "cost", False))
 
     if args.message:
@@ -4378,7 +4676,11 @@ def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
 
 
 def resolve_agent_filter(creds: dict, target: str) -> str | None:
-    """Resolve an ``--agent`` value (full id, id-prefix, or name) to an agent_id."""
+    """Resolve an ``--agent`` value (full id, id-prefix, or name) to an agent_id.
+
+    The value may be a human agent name containing `/`, `%`, etc., so it is
+    resolved before validation; only the resolved agent_id — the value that
+    becomes a URL path segment — is checked."""
     agents = fetch_agents(creds)
     match = next((a for a in agents if a.get("agent_id") == target), None)
     if not match:
@@ -4388,11 +4690,12 @@ def resolve_agent_filter(creds: dict, target: str) -> str | None:
     if not match:
         err(f"No agent matches '{target}'. Run `eesel agents list`.")
         return None
-    return match["agent_id"]
+    return validate_id(match["agent_id"], "agent id")
 
 
 def resolve_task_id(creds: dict, target: str) -> str | None:
     """Full uuid → use as-is; otherwise prefix-match against recent tasks."""
+    validate_id(target, "task id")
     if _looks_like_uuid(target):
         return target
     rows, _, _ = fetch_tasks(creds, limit=500)
@@ -4717,6 +5020,7 @@ def resolve_document_id(creds: dict, target: str) -> str | None:
     if not (target or "").strip():
         err("No file given.")
         return None
+    validate_id(target, "document id")
     documents = [doc for doc in fetch_documents(creds, limit=500) if document_matches_agent(creds, doc)]
     exact = next((doc for doc in documents if doc.get("id") == target), None)
     if exact:
@@ -4976,9 +5280,15 @@ def _resolve_one_mcp_server(creds: dict, target: str) -> dict | None:
     """Resolve `target` to a single MCP server for a write/destructive command,
     or print why it couldn't (no match, or ambiguous with the candidates listed)
     and return None — so an ambiguous value can't change or delete an arbitrary
-    server."""
+    server.
+
+    `target` may be a server *name* containing `/`, `#`, etc. (e.g. a base URL
+    like "https://mcp.example.com/sse"), so it is resolved first; only the
+    resolved server id — the value that becomes a URL path segment — is
+    validated."""
     matches = match_mcp_servers(fetch_mcp_servers(creds), target)
     if len(matches) == 1:
+        validate_id(matches[0].get("id"), "server")
         return matches[0]
     if not matches:
         err(f"No MCP server matches '{target}'.")
@@ -5348,6 +5658,13 @@ def cmd_files_read(args) -> int:
     Like `instructions`, the body goes to stdout and the header to stderr, so
     `eesel files read <id> > out.md` captures just the content.
     """
+    # The target may be a document id, a path-like key (files/report.md), or a
+    # human filename that legitimately carries `% # ?` (e.g. "Report 100%.md").
+    # It is resolved against the agent's own files client-side; only the resolved
+    # document id becomes a URL path segment, and the HTTP choke point
+    # (`assert_url_path_safe`) rejects any traversal that reaches the request — so
+    # the raw target is not validated here, which would reject valid filenames.
+    target = getattr(args, "target", None)
     creds = require_creds_scoped(args)
     if not _scope_files_agent(creds, args):
         return 1
@@ -5360,7 +5677,6 @@ def cmd_files_read(args) -> int:
         info(f"(no files{scope})")
         return 0
 
-    target = getattr(args, "target", None)
     if target:
         match = match_document(candidates, target)
         if match is None:
@@ -5405,6 +5721,13 @@ def cmd_files_read(args) -> int:
 
 
 def cmd_files_export(args) -> int:
+    # A `--document-key` is matched exactly against the agent's own files and
+    # resolves to a document id; the key itself never becomes a URL path segment
+    # (it rides a query parameter), and a real key may carry `% # ?` when the
+    # filename does (e.g. "Report 100%.md"). So it is not validated as a raw key
+    # here — only the resolved document id reaches a URL, guarded centrally by
+    # `assert_url_path_safe`. (`--document-id` goes through resolve_document_id,
+    # which validates the resolved id there.)
     creds = require_creds()
     if not _scope_files_agent(creds, args):
         return 1
@@ -5501,6 +5824,9 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     arbitrary agent.
     """
     target = target or os.environ.get("EESEL_AGENT")
+    # `target` may be a human agent name containing `/`, `%`, etc., so it is
+    # resolved before validation; only the resolved agent_id — the value that
+    # becomes a URL path segment — is checked, at each return below.
     agents = fetch_agents(creds)
     if not agents:
         err("No agents in workspace. Create one with `eesel agents create` first.")
@@ -5508,6 +5834,7 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
     if not target:
         # No explicit scope. Only safe when there's a single agent to mean.
         if len(agents) == 1:
+            validate_id(agents[0].get("agent_id"), "agent id")
             return agents[0]
         err(f"This workspace has {len(agents)} agents — name the one to act on:")
         for a in agents:
@@ -5517,6 +5844,7 @@ def resolve_agent_or_error(creds: dict, target: str | None) -> dict | None:
         return None
     agent, candidates = resolve_agent_strict(agents, target)
     if agent:
+        validate_id(agent.get("agent_id"), "agent id")
         return agent
     if candidates:
         err(f"'{target}' is ambiguous — it matches {len(candidates)} agents:")
@@ -5547,6 +5875,11 @@ def cmd_skills(args) -> int:
     if sub is None:
         err("Specify a skills subcommand: list, show, add, remove, or set.")
         return 1
+
+    # skill_id goes straight into the URL path (add/remove/set), so validate it
+    # before the agent lookup makes any network call.
+    if getattr(args, "skill_id", None):
+        validate_id(args.skill_id, "skill id")
 
     agent = resolve_agent_or_error(creds, args.agent)
     if not agent:
