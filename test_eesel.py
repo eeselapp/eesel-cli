@@ -7,6 +7,7 @@ The CLI script has no `.py` extension, so we load it via importlib.
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -7941,6 +7943,48 @@ class TestChatHonestExit:
         assert printed.get("cost") is True  # cost summary still printed despite the failure
 
 
+class TestDryRunGuardsBilledAndLoginPaths:
+    """--dry-run must cover the side effects that spend money or write creds, not
+    only config mutations. A chat turn is a billed POST and login mints/stores a
+    token, so both preview and make no call under --dry-run."""
+
+    def _sess(self):
+        return {"id": "s1", "agent_id": "ag-1", "workspace_id": "ws-test-123",
+                "task_id": "t1", "messages": []}
+
+    def test_send_message_previews_and_makes_no_call(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "_is_tty", lambda: True)
+        monkeypatch.setattr(
+            eesel.urllib.request, "urlopen",
+            lambda *a, **k: pytest.fail("--dry-run must not POST to sandbox/start"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.send_message(fake_creds, self._sess(), "hello")
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["method"] == "POST"
+        assert payload["url"].endswith("/agents/sandbox/start")
+        assert payload["body"]["messages"][-1]["message"] == "hello"
+
+    def test_login_dev_previews_and_writes_no_creds(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_dev", lambda *a, **k: pytest.fail("--dry-run must not log in"))
+        monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--dry-run must not write credentials"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": True, "workspace_id": None})())
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "login" in payload["action"]
+
+    def test_login_prod_previews_and_opens_no_browser(self, tmp_config, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        monkeypatch.setattr(eesel, "login_prod", lambda *a, **k: pytest.fail("--dry-run must not open the OAuth bridge"))
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_login(type("Args", (), {"dev": False, "workspace_id": None})())
+        assert exc.value.code == 0
+        assert "login" in json.loads(capsys.readouterr().out)["action"]
+
+
 class TestChatJson:
     """`eesel chat --json "…"` is the keystone agent call: one JSON object on
     stdout carrying the reply, the ordered tool-calls (with full untruncated
@@ -8618,3 +8662,518 @@ class TestPathScopeUnknownHeadErrors:
         # A flag (not a word) after the agent is ambiguous; leave it untouched
         # rather than erroring, so argparse handles it as before.
         assert self.n("agents", "blog", "--json") == ["agents", "blog", "--json"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Machine-output contract: emit(), --fields, NDJSON, --dry-run, schema
+# (ENG-5030 — self-describing & previewable CLI)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_output_globals():
+    """Restore the output-contract module globals before and after each test.
+
+    Handlers read these globals; a test that flips one (e.g. to JSON) must not
+    leak that into the next test, which may call a handler directly and rely on
+    the human/no-op defaults.
+    """
+    saved = (eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS)
+    eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS = "human", None, False, False
+    # The impersonator-status lookup is memoized per token for a process's life;
+    # clear it between tests so a cached verdict from one test can't leak into
+    # another that reuses the same token with a different mocked response.
+    eesel._IMPERSONATE_STATUS_CACHE.clear()
+    yield
+    eesel._OUTPUT_FORMAT, eesel._OUTPUT_FIELDS, eesel._DRY_RUN, eesel._REVEAL_SECRETS = saved
+    eesel._IMPERSONATE_STATUS_CACHE.clear()
+
+
+class TestProjectFields:
+    def test_keeps_only_requested_top_level_keys(self):
+        row = {"agent_id": "a1", "name": "Bot", "prompt": "long", "is_active": True}
+        assert eesel._project_fields(row, ["agent_id", "name"]) == {"agent_id": "a1", "name": "Bot"}
+
+    def test_applies_elementwise_to_a_list(self):
+        rows = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+        assert eesel._project_fields(rows, ["a"]) == [{"a": 1}, {"a": 3}]
+
+    def test_unknown_field_is_omitted_not_an_error(self):
+        assert eesel._project_fields({"a": 1}, ["a", "nope"]) == {"a": 1}
+
+    def test_scalar_payload_passes_through(self):
+        assert eesel._project_fields("hello", ["a"]) == "hello"
+        assert eesel._project_fields(["x", "y"], ["a"]) == ["x", "y"]
+
+
+class TestWantJson:
+    def test_true_from_per_command_flag(self):
+        assert eesel._want_json(type("A", (), {"json": True})()) is True
+
+    def test_true_from_global_format(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        assert eesel._want_json(type("A", (), {})()) is True
+
+    def test_false_by_default(self):
+        assert eesel._want_json(type("A", (), {})()) is False
+
+
+class TestEmit:
+    def test_masks_secrets_by_default(self, capsys):
+        eesel.emit({"name": "x", "access_token": "sk-123"})
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"name": "x", "access_token": "***"}
+
+    def test_reveal_true_leaves_secrets_raw(self, capsys):
+        eesel.emit({"access_token": "sk-123"}, reveal=True)
+        assert json.loads(capsys.readouterr().out)["access_token"] == "sk-123"
+
+    def test_reveal_none_defers_to_global(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", True)
+        eesel.emit({"access_token": "sk-123"})
+        assert json.loads(capsys.readouterr().out)["access_token"] == "sk-123"
+
+    def test_fields_argument_projects(self, capsys):
+        eesel.emit({"a": 1, "b": 2}, fields=["a"])
+        assert json.loads(capsys.readouterr().out) == {"a": 1}
+
+    def test_global_fields_projects_when_no_arg(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_OUTPUT_FIELDS", ["b"])
+        eesel.emit({"a": 1, "b": 2})
+        assert json.loads(capsys.readouterr().out) == {"b": 2}
+
+    def test_list_streams_ndjson_when_json_and_piped(self, monkeypatch, capsys):
+        # JSON active + not a TTY (capsys) → one object per line.
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert [json.loads(l) for l in lines] == [{"a": 1}, {"a": 2}]
+
+    def test_list_is_one_pretty_array_on_a_tty(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_OUTPUT_FORMAT", "json")
+        monkeypatch.setattr(eesel, "_is_tty", lambda: True)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        assert json.loads(capsys.readouterr().out) == [{"a": 1}, {"a": 2}]
+
+    def test_list_is_one_array_when_format_human_even_if_piped(self, monkeypatch, capsys):
+        # A handler invoked directly (no main()) leaves _OUTPUT_FORMAT="human";
+        # its list --json output must stay a parseable whole array, not NDJSON —
+        # this is what keeps the pre-existing direct-handler json.loads tests green.
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        eesel.emit([{"a": 1}, {"a": 2}])
+        assert json.loads(capsys.readouterr().out) == [{"a": 1}, {"a": 2}]
+
+
+class TestExtractGlobalOutputFlags:
+    def test_extracts_booleans_anywhere(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "create", "--dry-run", "--json"])
+        assert rest == ["agents", "create"]
+        assert vals["dry_run"] is True and vals["json"] is True
+
+    def test_fields_consumes_following_token(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--fields", "a,b"])
+        assert rest == ["agents", "list"] and vals["fields"] == "a,b"
+
+    def test_fields_inline_equals(self):
+        rest, vals = eesel._extract_global_output_flags(["--fields=a,b", "x"])
+        assert rest == ["x"] and vals["fields"] == "a,b"
+
+    def test_fields_does_not_swallow_a_following_flag(self):
+        # `--fields --json` must leave --json intact rather than take it as the
+        # fields value (which would silently disable JSON). With no real value,
+        # fields stays unset and the following flag is still parsed.
+        rest, vals = eesel._extract_global_output_flags(["schema", "--fields", "--json"])
+        assert rest == ["schema"]
+        assert vals["fields"] is None
+        assert vals["json"] is True
+
+    def test_fields_at_end_with_no_value_stays_unset(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--fields"])
+        assert rest == ["agents", "list"]
+        assert vals["fields"] is None
+
+    def test_passes_through_unrelated_tokens(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--plain"])
+        assert rest == ["agents", "list", "--plain"]
+        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None}
+
+
+class TestConfigureOutput:
+    def test_env_output_json_sets_json_format(self, monkeypatch):
+        monkeypatch.setenv("EESEL_OUTPUT", "json")
+        args = type("A", (), {"json": False})()
+        eesel._configure_output(args, {"json": False, "dry_run": False, "fields": None}, None)
+        assert eesel._OUTPUT_FORMAT == "json"
+
+    def test_fields_parsed_into_list(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        eesel._configure_output(type("A", (), {"json": True})(), {"json": True, "dry_run": False, "fields": "a, b ,c"}, None)
+        assert eesel._OUTPUT_FIELDS == ["a", "b", "c"]
+
+    def test_dry_run_flag_sets_global(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        eesel._configure_output(type("A", (), {"json": False})(), {"json": False, "dry_run": True, "fields": None}, None)
+        assert eesel._DRY_RUN is True
+
+    def test_secrets_needs_sysadmin(self, monkeypatch):
+        monkeypatch.delenv("EESEL_OUTPUT", raising=False)
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: False)
+        eesel._configure_output(type("A", (), {"json": False, "secrets": True})(), {"json": False, "dry_run": False, "fields": None}, {"token": "t"})
+        assert eesel._REVEAL_SECRETS is False
+        monkeypatch.setattr(eesel, "_is_sysadmin", lambda creds: True)
+        eesel._configure_output(type("A", (), {"json": False, "secrets": True})(), {"json": False, "dry_run": False, "fields": None}, {"token": "t"})
+        assert eesel._REVEAL_SECRETS is True
+
+
+class TestWriteRequestDryRun:
+    def test_dry_run_prints_resolved_request_and_exits_zero(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        called = []
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: called.append(a) or {})
+        with pytest.raises(SystemExit) as exc:
+            eesel.write_request("POST", "https://api/agents", token="t", body={"name": "X"})
+        assert exc.value.code == 0
+        assert called == []  # no real call was made
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"method": "POST", "url": "https://api/agents", "body": {"name": "X"}}
+
+    def test_dry_run_masks_secret_in_previewed_body(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_DRY_RUN", True)
+        with pytest.raises(SystemExit):
+            eesel.write_request("POST", "https://api/x", body={"api_key": "sk-9"})
+        assert json.loads(capsys.readouterr().out)["body"]["api_key"] == "***"
+
+    def test_passthrough_when_not_dry_run(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_DRY_RUN", False)
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"ok": method})
+        assert eesel.write_request("DELETE", "https://api/x", token="t") == {"ok": "DELETE"}
+
+    def test_allow_error_passthrough_returns_tuple(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_DRY_RUN", False)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (400, {"error": "bad"}))
+        assert eesel.write_request("POST", "https://api/x", body={}, allow_error=True) == (400, {"error": "bad"})
+
+
+class TestSchema:
+    def _schema(self):
+        parser = eesel.build_parser(staff=True)
+        return eesel._serialize_parser(parser)
+
+    def test_lists_every_top_level_command(self):
+        s = self._schema()
+        names = set(s["subcommands"])
+        for expected in ("agents", "integrations", "automations", "mcp", "files", "skills", "workspace", "schema"):
+            assert expected in names
+
+    def test_flag_reports_names_required_and_enum_choices(self):
+        s = self._schema()
+        show = s["subcommands"]["files"]["subcommands"]["show"]
+        fmt = next(f for f in show["flags"] if "--format" in f["names"])
+        assert fmt["choices"] == ["md", "html"]  # matches the parser's enum
+        assert fmt["takes_value"] is True
+
+    def test_every_command_resolves_to_a_real_handler(self):
+        s = self._schema()
+        missing = []
+
+        def walk(node, path):
+            subs = node.get("subcommands", {})
+            if not subs and "handler" not in node:
+                missing.append(".".join(path))
+            for name, sub in subs.items():
+                walk(sub, path + [name])
+
+        walk(s, [])
+        assert missing == []
+
+    def test_handler_names_exist_on_the_module(self):
+        s = self._schema()
+
+        def walk(node):
+            if "handler" in node:
+                assert hasattr(eesel, node["handler"]), node["handler"]
+            for sub in node.get("subcommands", {}).values():
+                walk(sub)
+
+        walk(s)
+
+    def test_endpoint_annotation_attached_to_writes(self):
+        s = self._schema()
+        create = s["subcommands"]["agents"]["subcommands"]["create"]
+        assert create["endpoint"] == "POST /agents"
+
+    def test_no_dead_endpoint_keys(self):
+        # Every key in the hand-kept endpoint map points at a command that
+        # actually exists in the parser tree.
+        s = self._schema()
+        paths = set()
+
+        def walk(node, path):
+            if path:
+                paths.add(".".join(path))
+            for name, sub in node.get("subcommands", {}).items():
+                walk(sub, path + [name])
+
+        walk(s, [])
+        dead = [k for k in eesel._COMMAND_ENDPOINTS if k not in paths]
+        assert dead == []
+
+    def test_endpoint_values_match_a_real_request_call(self):
+        # `test_no_dead_endpoint_keys` proves each KEY names a real command; this
+        # pins each VALUE ("POST /agents") against the method+path the CLI's
+        # request helpers actually issue, so a wrong annotation (wrong verb or
+        # wrong path) is caught rather than silently misleading an agent.
+        #
+        # The check is static: parse the CLI source and collect the (method,
+        # path) of every call to the request helpers (http_request /
+        # http_request_allow_error / write_request, and GET-only http_fetch /
+        # http_download). URL f-strings are rendered to a template with each
+        # `{...}` interpolation collapsed to `{}`; the leading `{api_url}` and any
+        # trailing glued query/suffix placeholder are stripped so a path segment
+        # (`/agents/{}`) is distinguished from an appended query (`/integrations`
+        # + `{qs}`). Then every endpoint value must appear among the collected
+        # calls. This confirms the annotation corresponds to a real call with
+        # that verb and path shape; it does not prove the call is reached by that
+        # exact subcommand (branching handlers make several keys share a handler).
+        request_funcs = {"http_request", "http_request_allow_error", "write_request"}
+        fetch_funcs = {"http_fetch", "http_download"}  # GET-only helpers
+
+        tree = ast.parse((_HERE / "eesel").read_text())
+
+        def render(node, name_values):
+            """Render a str constant or f-string to a template. A FormattedValue
+            that is a bare name present in `name_values` is inlined with that
+            literal; every other interpolation becomes `{}`."""
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                parts = []
+                for v in node.values:
+                    if isinstance(v, ast.Constant):
+                        parts.append(str(v.value))
+                    elif (isinstance(v, ast.FormattedValue)
+                          and isinstance(v.value, ast.Name)
+                          and v.value.id in name_values):
+                        parts.append(name_values[v.value.id])
+                    else:
+                        parts.append("{}")
+                return "".join(parts)
+            return None
+
+        # Module-level one-line `return "<f-string>"` helpers (e.g.
+        # `_mcp_server_url`) so a call passing a literal argument (`"/toggle"`)
+        # inlines it and resolves to the real path.
+        helpers = {}
+        for fn in tree.body:
+            if (isinstance(fn, ast.FunctionDef) and len(fn.body) == 1
+                    and isinstance(fn.body[0], ast.Return)
+                    and isinstance(fn.body[0].value, (ast.JoinedStr, ast.Constant))):
+                helpers[fn.name] = ([a.arg for a in fn.args.args], fn.body[0].value)
+
+        def resolve(node, assigns):
+            """Possible URL templates for a url expression: a literal/f-string, a
+            variable assigned one earlier in the function, or a call to a simple
+            return-only helper."""
+            if isinstance(node, (ast.Constant, ast.JoinedStr)):
+                t = render(node, {})
+                return {t} if t is not None else set()
+            if isinstance(node, ast.Name):
+                return set(assigns.get(node.id, set()))
+            if isinstance(node, ast.Call):
+                fname = (node.func.attr if isinstance(node.func, ast.Attribute)
+                         else getattr(node.func, "id", None))
+                if fname in helpers:
+                    params, ret = helpers[fname]
+                    name_values = {
+                        p: a.value for p, a in zip(params, node.args)
+                        if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                    }
+                    t = render(ret, name_values)
+                    return {t} if t is not None else set()
+            return set()
+
+        def norm_path(tpl):
+            if tpl is None:
+                return None
+            m = re.search(r"/.*", tpl)
+            if not m:
+                return None
+            path = m.group(0).split("?")[0]
+            path = re.sub(r"\{[^}]*\}", "{}", path)
+            # A trailing `{}` not preceded by `/` is a glued query/suffix, not a
+            # path segment (e.g. `/integrations` + `{qs}`) — drop it.
+            while path.endswith("{}") and not path.endswith("/{}"):
+                path = path[:-2]
+            return path.rstrip("/") or "/"
+
+        actual = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            assigns: dict = {}
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign):
+                    templates = resolve(stmt.value, assigns)
+                    for tgt in stmt.targets:
+                        if isinstance(tgt, ast.Name) and templates:
+                            assigns.setdefault(tgt.id, set()).update(templates)
+            for call in ast.walk(fn):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = (call.func.attr if isinstance(call.func, ast.Attribute)
+                        else getattr(call.func, "id", None))
+                if name in fetch_funcs and call.args:
+                    for t in resolve(call.args[0], assigns):
+                        p = norm_path(t)
+                        if p:
+                            actual.add(("GET", p))
+                elif name in request_funcs and len(call.args) >= 2:
+                    method = call.args[0].value if isinstance(call.args[0], ast.Constant) else None
+                    if method:
+                        for t in resolve(call.args[1], assigns):
+                            p = norm_path(t)
+                            if p:
+                                actual.add((method, p))
+
+        def norm_ep(path):
+            return re.sub(r"\{[^}]*\}", "{}", path).rstrip("/") or "/"
+
+        # Residual gap: `integrations connect` POSTs to a path the connector
+        # definition supplies at runtime (`option.endpoint`), so no path literal
+        # exists in the source to cross-check — the annotation is a hand-written
+        # approximation of the server's shape. Verified by reading the handler,
+        # not statically here.
+        unverifiable = {"integrations.connect"}
+
+        unmatched = []
+        for key, value in eesel._COMMAND_ENDPOINTS.items():
+            if key in unverifiable:
+                continue
+            method, path = value.split(" ", 1)
+            if path.endswith("/*"):
+                # Wildcard family (e.g. billing → GET /subscription/*): satisfied
+                # by any real call sharing the verb and path prefix.
+                prefix = norm_ep(path[:-1])
+                matched = any(m == method and p.startswith(prefix) for m, p in actual)
+            else:
+                matched = (method, norm_ep(path)) in actual
+            if not matched:
+                unmatched.append(f"{key}: {value}")
+
+        assert unmatched == [], (
+            "endpoint annotations with no matching request call in the source: "
+            + ", ".join(unmatched)
+        )
+
+    def test_cmd_schema_emits_valid_json(self, capsys):
+        eesel.cmd_schema(type("A", (), {})())
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["prog"] == "eesel"
+        assert "agents" in parsed["subcommands"]
+
+
+class TestOutputContractThroughMain:
+    """End-to-end through main() — the path real usage and agents take."""
+
+    def test_json_list_is_ndjson_when_piped(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One"}, {"agent_id": "a2", "name": "Two"}])
+        assert eesel.main(["agents", "list", "--json"]) == 0
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert [json.loads(l)["agent_id"] for l in lines] == ["a1", "a2"]
+
+    def test_env_output_json_matches_json_flag(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One"}])
+        monkeypatch.setenv("EESEL_OUTPUT", "json")
+        assert eesel.main(["agents", "list"]) == 0
+        lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+        assert json.loads(lines[0])["agent_id"] == "a1"
+
+    def test_fields_projection_through_main(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1", "name": "One", "prompt": "big"}])
+        assert eesel.main(["agents", "list", "--json", "--fields", "agent_id,name"]) == 0
+        assert json.loads(capsys.readouterr().out.splitlines()[0]) == {"agent_id": "a1", "name": "One"}
+
+    def test_no_flag_output_unchanged_and_not_json(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: [{"agent_id": "a1b2c3d4e5f6", "name": "One", "is_active": True}])
+        assert eesel.main(["agents", "list"]) == 0
+        out = capsys.readouterr().out
+        assert "[on]" in out and "One" in out  # human table, not JSON
+
+    def test_dry_run_create_makes_no_call(self, fake_creds, monkeypatch, capsys):
+        def boom(*a, **k):
+            raise AssertionError("dry-run must not hit the network")
+
+        monkeypatch.setattr(eesel, "http_request", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["agents", "create", "--name", "Probe", "--dry-run"])
+        assert exc.value.code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["method"] == "POST"
+        assert payload["url"].endswith("/agents")
+        assert payload["body"]["name"] == "Probe"
+
+    def test_dry_run_flag_before_subcommand(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")))
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["--dry-run", "agents", "create", "--name", "Probe"])
+        assert exc.value.code == 0
+        assert json.loads(capsys.readouterr().out)["body"]["name"] == "Probe"
+
+    def test_post_read_is_not_intercepted_by_dry_run(self, fake_creds, monkeypatch, capsys):
+        # tasks list is POST /workspace/tasks — a read. --dry-run must NOT
+        # short-circuit it; it still returns data.
+        monkeypatch.setattr(eesel, "_is_tty", lambda: False)
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "wt")
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"tasks": [{"task_id": "t1"}], "has_next": False, "next_page": None})
+        rc = eesel.main(["--dry-run", "tasks", "list", "--json"])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["tasks"][0]["task_id"] == "t1"
+
+
+class TestRedactionScope:
+    """Redaction masks only string secret material — verify it spares numeric
+    counts and booleans whose key names collide with a secret-hint substring."""
+
+    def test_preserves_numeric_count_under_token_hinted_key(self):
+        red = eesel._redact_secrets({"input_tokens": 1234, "output_tokens": 5, "access_token": "sk-1"})
+        assert red == {"input_tokens": 1234, "output_tokens": 5, "access_token": "***"}
+
+    def test_preserves_boolean_presence_flag(self):
+        assert eesel._redact_secrets({"has_auth_token": True}) == {"has_auth_token": True}
+
+    def test_still_masks_string_secret(self):
+        assert eesel._redact_secrets({"client_secret": "shh"}) == {"client_secret": "***"}
+
+
+class TestEmitRedactBeforeProject:
+    def test_property_entry_value_masked_even_when_projected(self, capsys):
+        # The {key,value} property shape marks `value` secret via its sibling
+        # `key`. Redaction must run before projection, or `--fields value`
+        # (which drops `key`) would leak the raw value.
+        payload = [{"key": "x_access_token", "value": "SECRET"}]
+        eesel.emit(payload, fields=["value"])
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed == [{"value": "***"}]
+
+
+class TestTasksExportDryRun:
+    def test_export_dry_run_previews_and_makes_no_export_call(self, fake_creds, monkeypatch, capsys):
+        calls = []
+
+        def rec(method, url, **k):
+            calls.append((method, url))
+            return {"agents": [], "message": "ok"}
+
+        monkeypatch.setattr(eesel, "http_request", rec)
+        monkeypatch.setattr(eesel, "workspace_token", lambda creds: "wt")
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["tasks", "export", "--dry-run"])
+        assert exc.value.code == 0
+        # The export POST was previewed, never actually sent.
+        assert not any("/tasks/export" in u for _, u in calls)
+        assert "/tasks/export" in json.loads(capsys.readouterr().out)["url"]

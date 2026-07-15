@@ -181,12 +181,96 @@ def confirm(prompt: str) -> bool:
     empty line or EOF on a non-interactive stdin, counts as "no", so
     destructive operations default to not happening.
     """
+    # Under --dry-run nothing is actually written, so don't gate the flow on an
+    # interactive prompt — return True so it reaches write_request(), which
+    # prints the request it *would* send and exits without contacting the server.
+    if _DRY_RUN:
+        return True
     print(_color(prompt, "33"), end="", file=sys.stderr, flush=True)
     try:
         answer = input().strip().lower()
     except EOFError:
         return False
     return answer in ("y", "yes")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Machine-output contract
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Every command that prints a machine-readable (JSON) payload routes through
+# `emit()`, and every state-changing request routes through `write_request()`.
+# That gives one place each for: the JSON format switch, the `--fields`
+# projection, NDJSON-when-piped, secret redaction, and `--dry-run` preview —
+# instead of ~34 hand-written `print(json.dumps(...))` sites that each had to
+# remember to redact and had no way to stream or project.
+#
+# These module globals hold the resolved contract for the current invocation.
+# `main()` sets them once (from the global `--json`/`--fields`/`--dry-run`
+# flags and `EESEL_OUTPUT`) before dispatching. They default to the
+# human/no-op values so that unit tests which call a handler directly — without
+# going through `main()` — behave as they always did.
+_OUTPUT_FORMAT = "human"   # "human" | "json"
+_OUTPUT_FIELDS: list[str] | None = None   # --fields projection (top-level keys)
+_DRY_RUN = False           # --dry-run: preview writes, make no call
+_REVEAL_SECRETS = False    # --secrets on a sysadmin login: emit raw secret values
+
+
+def _want_json(args=None) -> bool:
+    """True when the caller asked for JSON output.
+
+    Honours both the global contract (the top-level `--json` flag or
+    `EESEL_OUTPUT=json`, resolved into `_OUTPUT_FORMAT` by `main()`) and a
+    per-command `--json` set directly on `args` — the latter is how the unit
+    tests drive handlers without running `main()`.
+    """
+    return _OUTPUT_FORMAT == "json" or bool(getattr(args, "json", False))
+
+
+def _project_fields(payload, fields: list[str]):
+    """Keep only `fields` (top-level keys) on each object in the payload.
+
+    Applies element-wise to a list. An unknown field name is silently omitted
+    rather than raising, so an agent can request a superset of keys safely.
+    Non-object payloads (scalars, lists of scalars) pass through untouched.
+    """
+    if isinstance(payload, list):
+        return [_project_fields(item, fields) for item in payload]
+    if isinstance(payload, dict):
+        return {k: payload[k] for k in fields if k in payload}
+    return payload
+
+
+def emit(payload, *, fields: list[str] | None = None, reveal: bool | None = None) -> None:
+    """Print a payload as JSON — the single machine-output choke point.
+
+    - Redacts secret-looking values by default. `reveal` left as None defers to
+      the global `--secrets`+sysadmin gate (`_REVEAL_SECRETS`), which is how the
+      gate reaches previously-raw emitters. A command that computes its own gate
+      (integrations/actions, whose unit tests drive them without `main()`) passes
+      an explicit True/False, which wins over the global.
+    - Applies `--fields` (the argument here, else the global `_OUTPUT_FIELDS`).
+    - When JSON output is active (`_OUTPUT_FORMAT == "json"`), the payload is a
+      list, and stdout is piped, streams as NDJSON — one object per line — so an
+      agent parses a long list line-by-line instead of buffering one giant
+      array. On a TTY, or for a non-list payload, prints one pretty block.
+    """
+    if reveal is None:
+        reveal = _REVEAL_SECRETS
+    # Redact before projecting. `_redact_secrets` masks a property entry's
+    # `value` based on its sibling `key`, so projecting first (which can drop
+    # `key`) would strip the signal redaction relies on and leak the value.
+    # Redaction must see the whole object.
+    if not reveal:
+        payload = _redact_secrets(payload)
+    projection = fields if fields is not None else _OUTPUT_FIELDS
+    if projection is not None:
+        payload = _project_fields(payload, projection)
+    if _OUTPUT_FORMAT == "json" and isinstance(payload, list) and not _is_tty():
+        for item in payload:
+            print(json.dumps(item))
+    else:
+        print(json.dumps(payload, indent=2))
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1168,6 +1252,33 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
         sys.exit(f"{method} {url} failed (server reachable?): {e}")
 
 
+def write_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, allow_error: bool = False):
+    """Send a state-changing request — the single choke point for every write.
+
+    Every real mutation the CLI performs (the enumerated write set: agents
+    create/update/delete, trigger/schedule add/remove/fire, integration
+    connect/sync/remove, action enable/set/disable, mcp add/set/toggle/remove,
+    file add/remove and knowledge-acl set, skill add/remove/set, and the
+    workspace mutations) goes through here instead of calling `http_request`
+    directly. Reads and read-backs — including the POST-shaped reads like
+    `/workspace/tasks` — keep using `http_request`, so they always run even
+    under `--dry-run` (dry-run still needs to resolve an agent id or fetch
+    existing config to build a faithful body).
+
+    Under `--dry-run`, prints the resolved `{method, url, body}` via `emit()`
+    and exits 0 without contacting the server. A command that would issue more
+    than one write stops at the first. Otherwise this is a thin pass-through:
+    `allow_error=True` selects `http_request_allow_error` (returns
+    `(status, body)`); the default returns the parsed JSON dict.
+    """
+    if _DRY_RUN:
+        emit({"method": method, "url": url, "body": body})
+        sys.exit(0)
+    if allow_error:
+        return http_request_allow_error(method, url, token=token, body=body, timeout=timeout)
+    return http_request(method, url, token=token, body=body, timeout=timeout)
+
+
 def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
     """GET a URL with the workspace Bearer token and return the raw bytes.
 
@@ -1662,6 +1773,16 @@ def _tool_row(t: dict) -> dict:
     }
 
 
+# Field names that mark a value as secret. Masking is a substring match against
+# this fixed list (case-insensitive), so it is a best-effort guard, not an
+# exhaustive classifier. Known gaps to be aware of before trusting it:
+#   - Only these hint words match. A field named `bearer`, `pat`, `signature`,
+#     or a bare `key` is NOT masked because none contain one of these substrings.
+#   - Only non-empty *string* values are masked (see `_redact_secrets`). A secret
+#     stored as a number or other non-string type is left in the clear.
+# Adequate for eesel's real property names, which use these words; extend the
+# list (and reconsider the string-only rule) if a new field carries a secret
+# under a name or type not covered here.
 _SECRET_KEY_HINTS = (
     "token", "secret", "password", "passwd", "credential",
     "api_key", "apikey", "private_key", "authorization", "access_key",
@@ -1693,7 +1814,13 @@ def _redact_secrets(obj):
         for k, v in obj.items():
             key_is_secret = isinstance(k, str) and any(h in k.lower() for h in _SECRET_KEY_HINTS)
             mask = key_is_secret or (k == "value" and prop_is_secret)
-            if mask and not isinstance(v, (dict, list)) and v not in (None, ""):
+            # Only a non-empty *string* is secret material. This deliberately
+            # spares numbers and booleans, whose keys can collide with a hint
+            # substring without being secrets — `has_auth_token: true` (a
+            # presence flag) and `input_tokens: 1234` (a usage count) both match
+            # "token" but carry no secret, and masking them would destroy real
+            # information while protecting nothing.
+            if mask and isinstance(v, str) and v:
                 out[k] = "***"
             else:
                 out[k] = _redact_secrets(v)
@@ -1867,6 +1994,13 @@ def send_message(creds: dict, sess: dict, message: str, *, render: bool = True) 
     if sess.get("trigger_id"):
         body["triggerId"] = sess["trigger_id"]
     url = f"{creds['api_url']}/agents/sandbox/start"
+    # A chat turn is a billed side effect, so honour --dry-run here the same way
+    # write_request does for config mutations: print the request that would be
+    # sent and exit 0 without contacting the server. The reads above (agent
+    # resolution) already ran so the preview shows the real resolved body.
+    if _DRY_RUN:
+        emit({"method": "POST", "url": url, "body": body})
+        sys.exit(0)
     # sandbox/start decodes the bearer with HS256 only (it predates the Auth0
     # migration), so an Auth0 login must send a minted workspace token here.
     req = urllib.request.Request(
@@ -2098,6 +2232,12 @@ def stream_reply(creds: dict, task_id: str, stream_url: str | None, *, render: b
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# Per-token cache of the impersonator-status lookup, so repeated `_is_sysadmin`
+# checks in one process (e.g. `_configure_output` + a handler under `--secrets`)
+# make at most one network call.
+_IMPERSONATE_STATUS_CACHE: dict = {}
+
+
 def _get_impersonate_status(creds: dict) -> dict | None:
     """Best-effort impersonation status, normalized to ``{allowed, target_user_id}``.
 
@@ -2112,7 +2252,14 @@ def _get_impersonate_status(creds: dict) -> dict | None:
     only when the two differ — i.e. the caller is acting as a *different* user.
     Testing `target_uid` alone would report a phantom self-impersonation for
     every sysadmin, since the caller's own uid is always present there.
+
+    Memoized per token for the life of the process: a single `--secrets`
+    invocation resolves the sysadmin gate in both `_configure_output` and the
+    integrations handler, and this endpoint is otherwise hit once per lookup.
     """
+    token = creds.get("token") if creds else None
+    if token is not None and token in _IMPERSONATE_STATUS_CACHE:
+        return _IMPERSONATE_STATUS_CACHE[token]
     try:
         req = urllib.request.Request(
             f"{creds['api_url']}/sysadmin/impersonator-status",
@@ -2122,12 +2269,16 @@ def _get_impersonate_status(creds: dict) -> dict | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read() or b"{}")
     except Exception:
-        return None
-    allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
-    impersonator = data.get("impersonator_uid")
-    target_uid = data.get("target_uid")
-    target = target_uid if (impersonator and target_uid and target_uid != impersonator) else None
-    return {"allowed": allowed, "target_user_id": target}
+        result = None
+    else:
+        allowed = bool(data.get("is_impersonator") or data.get("is_sysadmin"))
+        impersonator = data.get("impersonator_uid")
+        target_uid = data.get("target_uid")
+        target = target_uid if (impersonator and target_uid and target_uid != impersonator) else None
+        result = {"allowed": allowed, "target_user_id": target}
+    if token is not None:
+        _IMPERSONATE_STATUS_CACHE[token] = result
+    return result
 
 
 def resolve_effective_workspace_id(creds: dict) -> str | None:
@@ -2194,6 +2345,26 @@ def cache_impersonator_flag(creds: dict) -> bool:
 
 
 def cmd_login(args) -> int:
+    # Logging in is a side effect (dev mints a token from the branch env's
+    # /dev/session; prod opens a browser OAuth bridge), so honour --dry-run:
+    # print what the login would do and exit 0 without contacting anything or
+    # writing credentials to disk.
+    if _DRY_RUN:
+        if args.dev:
+            emit({
+                "action": "login (dev)",
+                "reads": "local Postgres for workspace/user ids, then mints a dev JWT",
+                "api_url": ENVS["dev"]["api"],
+                "writes": f"credentials to {CREDS_FILE}",
+            })
+        else:
+            emit({
+                "action": "login (prod)",
+                "flow": f"opens {ENVS['prod']['dashboard']}/cli in a browser and captures the token via a local HTTP server",
+                "api_url": ENVS["prod"]["api"],
+                "writes": f"credentials to {CREDS_FILE}",
+            })
+        sys.exit(0)
     creds = login_dev(args.workspace_id) if args.dev else login_prod()
     # Cache whether this login is a global impersonator so the staff-only
     # commands can be surfaced/hidden without a network call on every run.
@@ -2293,8 +2464,8 @@ def cmd_agents(args) -> int:
     sub = args.agents_cmd or "list"
     if sub == "list":
         agents = fetch_agents(creds)
-        if getattr(args, "json", False):
-            print(json.dumps(agents, indent=2))
+        if _want_json(args):
+            emit(agents)
             return 0
         if getattr(args, "plain", False):
             for a in agents:
@@ -2334,7 +2505,7 @@ def _agents_create(args, creds: dict) -> int:
         err("--name is required.")
         return 1
     body = build_agent_create_body(creds["workspace_id"], args.name, args.instructions)
-    data = http_request("POST", f"{creds['api_url']}/agents", token=creds["token"], body=body)
+    data = write_request("POST", f"{creds['api_url']}/agents", token=creds["token"], body=body)
     agent_id = data.get("agent_id") or data.get("id") or (data.get("agent") or {}).get("agent_id")
     if agent_id:
         ok(f"Created agent '{args.name}' ({agent_id})")
@@ -2353,7 +2524,7 @@ def _agents_update(args, creds: dict) -> int:
         err("Nothing to change. Pass --name and/or --instructions.")
         return 1
     aid = agent["agent_id"]
-    http_request("PUT", f"{creds['api_url']}/agents/{aid}", token=creds["token"], body=body)
+    write_request("PUT", f"{creds['api_url']}/agents/{aid}", token=creds["token"], body=body)
     # Read the record back rather than trusting the 200: confirm every field the
     # user changed now holds the value we sent.
     updated = http_request("GET", f"{creds['api_url']}/agents/{aid}", token=creds["token"])
@@ -2372,7 +2543,7 @@ def _agents_delete(args, creds: dict) -> int:
     if not args.force and not confirm(f"Remove agent '{agent.get('name')}' ({agent['agent_id']})? [y/N] "):
         info("Aborted.")
         return 1
-    http_request("DELETE", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"])
+    write_request("DELETE", f"{creds['api_url']}/agents/{agent['agent_id']}", token=creds["token"])
     ok(f"Removed {agent.get('name')} ({agent['agent_id']}).")
     return 0
 
@@ -2384,8 +2555,8 @@ def _agents_get(args, creds: dict) -> int:
     agent = resolve_agent_or_error(creds, args.agent_id)
     if not agent:
         return 1
-    if getattr(args, "json", False):
-        print(json.dumps(agent, indent=2))
+    if _want_json(args):
+        emit(agent)
         return 0
     print(f"{agent.get('name', '?')}  ({agent.get('agent_id', '')})")
     if agent.get("agent_type"):
@@ -2555,15 +2726,15 @@ def cmd_triggers(args) -> int:
     if sub == "list":
         return _triggers_list_events(
             creds,
-            as_json=getattr(args, "json", False),
+            as_json=_want_json(args),
             as_plain=getattr(args, "plain", False),
         )
 
     if sub == "show":
-        return _triggers_show(creds, args.trigger_id, as_json=getattr(args, "json", False))
+        return _triggers_show(creds, args.trigger_id, as_json=_want_json(args))
 
     if sub == "registry":
-        return _triggers_registry(creds, as_json=getattr(args, "json", False))
+        return _triggers_registry(creds, as_json=_want_json(args))
 
     if sub == "add":
         return _triggers_add(creds, args)
@@ -2586,7 +2757,7 @@ def _triggers_registry(creds: dict, *, as_json: bool = False) -> int:
     triggers = data.get("triggers") if isinstance(data, dict) else data
     triggers = [t for t in (triggers or []) if t.get("trigger_id") != SCHEDULED_TRIGGER_KEY]
     if as_json:
-        print(json.dumps(triggers, indent=2))
+        emit(triggers)
         return 0
     if not triggers:
         info("(no trigger types in the registry)")
@@ -2626,7 +2797,7 @@ def _triggers_add(creds: dict, args) -> int:
             return 1
 
     url = f"{creds['api_url']}/agents/{agent['agent_id']}/triggers"
-    resp = http_request("POST", url, token=creds["token"], body={"trigger_key": args.key, "config": config})
+    resp = write_request("POST", url, token=creds["token"], body={"trigger_key": args.key, "config": config})
 
     trigger = resp.get("trigger") if isinstance(resp, dict) else None
     trigger_id = (trigger or {}).get("id") or (resp.get("id") if isinstance(resp, dict) else None)
@@ -2702,7 +2873,7 @@ def _triggers_remove(creds: dict, args) -> int:
             info("Cancelled.")
             return 1
 
-    http_request("DELETE", f"{creds['api_url']}/triggers/{trigger_id}", token=creds["token"])
+    write_request("DELETE", f"{creds['api_url']}/triggers/{trigger_id}", token=creds["token"])
     ok(f"Removed trigger {trigger_id}.")
     return 0
 
@@ -2721,7 +2892,7 @@ def _triggers_show(creds: dict, trigger_id: str, *, as_json: bool = False) -> in
         return 1
 
     if as_json:
-        print(json.dumps(match, indent=2))
+        emit(match)
         return 0
 
     enabled = _trigger_enabled(match)
@@ -2755,7 +2926,7 @@ def _triggers_list_events(creds: dict, *, as_json: bool = False, as_plain: bool 
     `eesel automations schedules list`. Read-only."""
     rows = fetch_all_event_triggers(creds)
     if as_json:
-        print(json.dumps(rows, indent=2))
+        emit(rows)
         return 0
     if as_plain:
         for t in rows:
@@ -2829,8 +3000,8 @@ def cmd_tools(args) -> int:
 
     agent_id = agent["agent_id"]
     tools = fetch_tools(creds, agent_id)
-    if getattr(args, "json", False):
-        print(json.dumps(tools, indent=2))
+    if _want_json(args):
+        emit(tools)
         return 0
     if not tools:
         info(f"(no tools/actions configured for {agent.get('name', agent_id)})")
@@ -2854,7 +3025,7 @@ def cmd_schedules(args) -> int:
     sub = args.schedules_cmd or "list"
 
     if sub == "list":
-        return _schedules_list(creds, as_json=getattr(args, "json", False))
+        return _schedules_list(creds, as_json=_want_json(args))
 
     if sub == "add":
         return _schedules_add(creds, args)
@@ -2873,7 +3044,7 @@ def _schedules_list(creds: dict, *, as_json: bool = False) -> int:
     cron and timezone. Read-only."""
     rows = fetch_all_scheduled_jobs(creds)
     if as_json:
-        print(json.dumps(rows, indent=2))
+        emit(rows)
         return 0
     if not rows:
         info("(no scheduled jobs in this workspace)")
@@ -2922,7 +3093,7 @@ def _schedules_add(creds: dict, args) -> int:
         config["timezone"] = args.timezone
 
     url = f"{creds['api_url']}/agents/{agent['agent_id']}/triggers"
-    resp = http_request(
+    resp = write_request(
         "POST", url, token=creds["token"],
         body={"trigger_key": SCHEDULED_TRIGGER_KEY, "config": config},
     )
@@ -2953,7 +3124,7 @@ def _schedules_remove(creds: dict, args) -> int:
             info("Cancelled.")
             return 1
 
-    http_request("DELETE", f"{creds['api_url']}/triggers/{match['id']}", token=creds["token"])
+    write_request("DELETE", f"{creds['api_url']}/triggers/{match['id']}", token=creds["token"])
     ok(f"Removed scheduled job {match['id']}.")
     return 0
 
@@ -2967,7 +3138,7 @@ def _schedules_fire(creds: dict, target: str) -> int:
         return 1
 
     url = f"{creds['api_url']}/triggers/{match['id']}/fire"
-    resp = http_request("POST", url, token=creds["token"], body={})
+    resp = write_request("POST", url, token=creds["token"], body={})
 
     title = (match.get("config") or {}).get("title") or "(untitled)"
     ok(f"Fired '{title}' (job={match['id'][:12]}, agent={match['agent_name']}).")
@@ -3057,9 +3228,8 @@ def _integrations_list(args, creds: dict) -> int:
         if not reveal:
             warn("--secrets is restricted to sysadmin/impersonator accounts — showing non-sensitive fields only.")
 
-    if getattr(args, "json", False):
-        payload = integrations if reveal else _redact_secrets(integrations)
-        print(json.dumps(payload, indent=2))
+    if _want_json(args):
+        emit(integrations, reveal=reveal)
         return 0
     if getattr(args, "plain", False):
         for it in integrations:
@@ -3099,8 +3269,8 @@ def _integrations_available(args, creds: dict) -> int:
     connector's connection-option `type`s — the values accepted by
     `connect --option`."""
     definitions = fetch_integration_definitions(creds)
-    if getattr(args, "json", False):
-        print(json.dumps(definitions, indent=2))
+    if _want_json(args):
+        emit(definitions)
         return 0
     if not definitions:
         info("(no connectable integrations)")
@@ -3134,12 +3304,12 @@ def _integrations_show(args, creds: dict) -> int:
 
     run = _latest_sync_run(creds, integration_id)
 
-    if getattr(args, "json", False):
+    if _want_json(args):
         out = dict(integration)
         out["syncRun"] = run
-        # `show` has no --secrets flag, so there is no way to reveal sensitive
-        # properties here — always mask them, mirroring the list/table gate.
-        print(json.dumps(_redact_secrets(out), indent=2))
+        # Secrets are masked unless the global `--secrets` gate is open for a
+        # sysadmin login (handled inside emit via _REVEAL_SECRETS).
+        emit(out)
         return 0
 
     itype = integration.get("integrationType") or "?"
@@ -3274,6 +3444,12 @@ def _integrations_connect(args, creds: dict) -> int:
             err(f"Connecting '{key}' via '{opt_type}' needs an interactive browser OAuth step, and --no-input was given.")
             return 1
         url = _browser_connect_url(creds, endpoint, fields.get("subdomain") or fields.get("identifier"))
+        if _DRY_RUN:
+            # This connect path hands off to a browser OAuth flow rather than
+            # sending an API write, so preview the redirect and open nothing —
+            # --dry-run must not trigger a side effect.
+            emit({"action": "open_browser", "url": url})
+            return 0
         info(f"Opening your browser to connect '{key}' — complete the authorization there:\n  {url}")
         try:
             webbrowser.open(url)
@@ -3291,8 +3467,8 @@ def _integrations_connect(args, creds: dict) -> int:
             err(f"Could not connect '{key}': missing required field(s): {', '.join(missing)}.")
             info(f"Pass them with --field, e.g. `--field {missing[0]}=<value>`.")
             return 1
-        status, result = http_request_allow_error(
-            "POST", f"{creds['api_url']}{endpoint}", token=creds["token"], body=fields
+        status, result = write_request(
+            "POST", f"{creds['api_url']}{endpoint}", token=creds["token"], body=fields, allow_error=True
         )
         if status >= 400:
             message = result.get("error") or result.get("message") or json.dumps(result)
@@ -3335,11 +3511,12 @@ def _integrations_sync(args, creds: dict) -> int:
         return 1
     integration_id = integration["id"]
 
-    status, result = http_request_allow_error(
+    status, result = write_request(
         "POST",
         f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}/trigger-sync",
         token=creds["token"],
         body={"sync_type": sync_type},
+        allow_error=True,
     )
     if status >= 400:
         err(f"Could not trigger sync: {result.get('error') or result.get('message') or json.dumps(result)}")
@@ -3390,8 +3567,8 @@ def _integrations_sync_status(args, creds: dict) -> int:
     if target_id is not None:
         runs = _runs_for_integration(runs, target_id)
 
-    if getattr(args, "json", False):
-        print(json.dumps(runs, indent=2))
+    if _want_json(args):
+        emit(runs)
         return 0
     if not runs:
         info("(no active or recent sync runs)")
@@ -3456,7 +3633,7 @@ def _integrations_remove(args, creds: dict) -> int:
         # Per-agent removal. The server returns 200, or 207 with an `errors`
         # list when some of the trigger/tool/ACL cleanup partially failed but
         # the removal still stands — surface those as warnings, not a failure.
-        result = http_request(
+        result = write_request(
             "DELETE",
             f"{creds['api_url']}/agents/{urllib.parse.quote(str(agent_id))}/integrations/{urllib.parse.quote(str(integration_id))}",
             token=creds["token"],
@@ -3466,7 +3643,7 @@ def _integrations_remove(args, creds: dict) -> int:
         ok(f"Removed integration {desc} from agent {args.agent}. Other agents keep their access.")
         return 0
 
-    http_request(
+    write_request(
         "DELETE",
         f"{creds['api_url']}/integrations/{urllib.parse.quote(str(integration_id))}",
         token=creds["token"],
@@ -3589,8 +3766,8 @@ def _actions_list(args, creds: dict) -> int:
 
     tools = fetch_tools(creds, agent_id)
     scoped = [t for t in tools if _action_matches_integration(_tool_row(t), integration)]
-    if getattr(args, "json", False):
-        print(json.dumps(scoped, indent=2))
+    if _want_json(args):
+        emit(scoped)
         return 0
     if not scoped:
         info(f"(no '{integration}' actions configured for {agent.get('name', agent_id)})")
@@ -3626,8 +3803,8 @@ def _actions_show(args, creds: dict) -> int:
         err(f"No '{args.action}' action under '{integration}' for {agent.get('name', agent_id)}.")
         info("Run `eesel integrations <integration> actions list` to see action keys (or add --json).")
         return 1
-    if getattr(args, "json", False):
-        print(json.dumps(_redact_secrets(match), indent=2))
+    if _want_json(args):
+        emit(match)
         return 0
     r = _tool_row(match)
     info(f"# {r['name']} ({r['tool_key']})")
@@ -3671,7 +3848,7 @@ def _configure_tool(creds: dict, agent_id: str, tool_key: str, config: dict, int
     if integration_id:
         body["integration_id"] = integration_id
     url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(tool_key, safe='')}"
-    return http_request("POST", url, token=creds["token"], body=body)
+    return write_request("POST", url, token=creds["token"], body=body)
 
 
 def _actions_enable(args, creds: dict) -> int:
@@ -3756,7 +3933,7 @@ def _actions_disable(args, creds: dict) -> int:
     url = f"{creds['api_url']}/agents/{agent_id}/tools/{urllib.parse.quote(action_key, safe='')}"
     if integration_id:
         url += f"?{urllib.parse.urlencode({'integration_id': integration_id})}"
-    http_request("DELETE", url, token=creds["token"])
+    write_request("DELETE", url, token=creds["token"])
     ok(f"Disabled '{action_key}' ({args.integration}) for {agent.get('name', agent_id)}.")
     return 0
 
@@ -4187,7 +4364,11 @@ def export_tasks(
     if agent_id:
         params["agent_id"] = agent_id
     qs = f"?{urllib.parse.urlencode(params)}" if params else ""
-    return http_request("POST", f"{creds['api_url']}/tasks/export{qs}", token=creds["token"], body={"filters": {}})
+    # A real side effect: it starts a background job and emails a link. So it
+    # routes through write_request — `--dry-run` previews the request instead of
+    # firing the export. (The other /workspace/tasks POSTs are pure reads and
+    # stay on http_request so dry-run leaves them working.)
+    return write_request("POST", f"{creds['api_url']}/tasks/export{qs}", token=creds["token"], body={"filters": {}})
 
 
 def fetch_task_history(creds: dict, task_id: str) -> list[dict]:
@@ -4307,12 +4488,12 @@ def _print_task_cost(creds: dict, task_id: str, name: str | None = None, *, as_j
     d = fetch_session_cost(creds, synthetic)
     if d is None:
         if as_json:
-            print(json.dumps({"task_id": task_id, "cost": None}, indent=2))
+            emit({"task_id": task_id, "cost": None})
         else:
             info("cost data is dev-only right now — see /activity in the dashboard for prod")
         return
     if as_json:
-        print(json.dumps(d, indent=2))
+        emit(d)
         return
     print(format_cost_full(d, synthetic, label="task"))
 
@@ -4371,8 +4552,8 @@ def cmd_tasks(args) -> int:
             end_date=getattr(args, "end_date", None),
             agent_id=agent_id,
         )
-        if getattr(args, "json", False):
-            print(json.dumps(data, indent=2))
+        if _want_json(args):
+            emit(data)
             return 0
         render_task_analytics(data)
         return 0
@@ -4405,8 +4586,8 @@ def cmd_tasks(args) -> int:
             if not agent_id:
                 return 1
         n = count_tasks(creds, agent_id=agent_id)
-        if getattr(args, "json", False):
-            print(json.dumps({"count": n, "agent_id": agent_id}, indent=2))
+        if _want_json(args):
+            emit({"count": n, "agent_id": agent_id})
             return 0
         suffix = " for this agent" if agent_id else ""
         print(f"{n} task{'s' if n != 1 else ''}{suffix}")
@@ -4419,8 +4600,8 @@ def cmd_tasks(args) -> int:
             if not agent_id:
                 return 1
         rows, has_next, next_page = fetch_tasks(creds, limit=args.limit, page=args.page, agent_id=agent_id)
-        if getattr(args, "json", False):
-            print(json.dumps({"tasks": rows, "has_next": has_next, "next_page": next_page}, indent=2))
+        if _want_json(args):
+            emit({"tasks": rows, "has_next": has_next, "next_page": next_page})
             return 0
         if getattr(args, "plain", False):
             for r in rows:
@@ -4448,8 +4629,8 @@ def cmd_tasks(args) -> int:
         if not task_id:
             return 1
         runs = fetch_task_history(creds, task_id)
-        if getattr(args, "json", False):
-            print(json.dumps({"task_id": task_id, "runs": runs}, indent=2))
+        if _want_json(args):
+            emit({"task_id": task_id, "runs": runs})
             return 0
         row = find_task_row(creds, task_id)
         print(f"# task {task_id}")
@@ -4469,7 +4650,7 @@ def cmd_tasks(args) -> int:
         if not task_id:
             return 1
         row = find_task_row(creds, task_id)
-        _print_task_cost(creds, task_id, name=row.get("name") if row else None, as_json=getattr(args, "json", False))
+        _print_task_cost(creds, task_id, name=row.get("name") if row else None, as_json=_want_json(args))
         return 0
 
     err(f"Unknown tasks subcommand: {sub!r}. Try one of: list, show, count, cost, analytics, export.")
@@ -4836,8 +5017,8 @@ def cmd_mcp(args) -> int:
 
     if sub == "list":
         servers = fetch_mcp_servers(creds)
-        if getattr(args, "json", False):
-            print(json.dumps(servers, indent=2))
+        if _want_json(args):
+            emit(servers)
             return 0
         if getattr(args, "plain", False):
             for s in servers:
@@ -4863,8 +5044,8 @@ def cmd_mcp(args) -> int:
         server = _resolve_one_mcp_server(creds, args.server)
         if not server:
             return 1
-        if getattr(args, "json", False):
-            print(json.dumps(server, indent=2))
+        if _want_json(args):
+            emit(server)
             return 0
         state = "on" if server.get("is_active") else "off"
         info(f"{server.get('name', '?')}  [{state}]")
@@ -4887,7 +5068,7 @@ def cmd_mcp(args) -> int:
                 err("--config must be a JSON object.")
                 return 1
         body = _mcp_create_body(args.name, args.url, config)
-        data = http_request(
+        data = write_request(
             "POST",
             f"{creds['api_url']}/workspaces/{creds['workspace_id']}/mcp-servers",
             token=creds["token"],
@@ -4909,7 +5090,7 @@ def cmd_mcp(args) -> int:
         if not body:
             err("Nothing to update. Pass --name and/or --url.")
             return 1
-        http_request("PUT", _mcp_server_url(creds, server["id"]), token=creds["token"], body=body)
+        write_request("PUT", _mcp_server_url(creds, server["id"]), token=creds["token"], body=body)
         ok(f"Updated {server.get('name')} ({server['id']}): {', '.join(body.keys())}")
         return 0
 
@@ -4918,7 +5099,7 @@ def cmd_mcp(args) -> int:
         if not server:
             return 1
         is_active = sub == "enable"
-        http_request(
+        write_request(
             "POST",
             _mcp_server_url(creds, server["id"], "/toggle"),
             token=creds["token"],
@@ -4934,7 +5115,7 @@ def cmd_mcp(args) -> int:
         if not args.force and not confirm(f"Remove MCP server '{server.get('name')}' ({server['id']})? [y/N] "):
             info("Aborted.")
             return 1
-        http_request("DELETE", _mcp_server_url(creds, server["id"]), token=creds["token"])
+        write_request("DELETE", _mcp_server_url(creds, server["id"]), token=creds["token"])
         ok(f"Removed {server.get('name')} ({server['id']}).")
         return 0
 
@@ -4978,8 +5159,8 @@ def cmd_files(args) -> int:
             offset=args.offset,
         )
         documents = [doc for doc in documents if document_matches_agent(creds, doc)]
-        if getattr(args, "json", False):
-            print(json.dumps(documents, indent=2))
+        if _want_json(args):
+            emit(documents)
             return 0
         if getattr(args, "plain", False):
             for doc in documents:
@@ -5048,7 +5229,7 @@ def _files_add(args) -> int:
         source_type=args.source_type,
         agent_id=creds.get("agent_id"),
     )
-    data = http_request("POST", f"{creds['api_url']}/documents", token=creds["token"], body=body)
+    data = write_request("POST", f"{creds['api_url']}/documents", token=creds["token"], body=body)
     key = data.get("key") or data.get("document_key")
     doc_id = data.get("id")
     ok(f"Added file '{args.title}'")
@@ -5106,7 +5287,7 @@ def _files_remove(args) -> int:
         if not confirm(f"Remove {len(resolved_keys)} file(s)?\n{listed}\n[y/N] "):
             info("Aborted.")
             return 1
-    http_request("DELETE", f"{creds['api_url']}/documents", token=creds["token"], body={"keys": resolved_keys})
+    write_request("DELETE", f"{creds['api_url']}/documents", token=creds["token"], body={"keys": resolved_keys})
     ok(f"Removed {len(resolved_keys)} file(s).")
     return 0
 
@@ -5127,8 +5308,8 @@ def _files_acl(args) -> int:
     if sub == "show":
         data = http_request("GET", url, token=creds["token"])
         prefixes = data.get("key_prefixes") or []
-        if getattr(args, "json", False):
-            print(json.dumps(prefixes, indent=2))
+        if _want_json(args):
+            emit(prefixes)
             return 0
         if not prefixes:
             info("(no key prefixes)")
@@ -5141,7 +5322,7 @@ def _files_acl(args) -> int:
         # PUT replaces the entire prefix set (it does not append). The server
         # always re-adds the agent's own `files/{agent_id}` prefix, so it can't
         # be removed even if omitted here.
-        http_request("PUT", url, token=creds["token"], body={"key_prefixes": args.prefix})
+        write_request("PUT", url, token=creds["token"], body={"key_prefixes": args.prefix})
         # The PUT response echoes the request; the server normalizes on store
         # (drops a bare `files`, dedupes, re-adds files/{agent_id}). Read the
         # state back with a GET so we report what was actually granted, not what
@@ -5207,12 +5388,12 @@ def cmd_files_read(args) -> int:
         return 1
 
     content = http_fetch(url, token=creds["token"])
-    if getattr(args, "json", False):
+    if _want_json(args):
         try:
             body = content.decode("utf-8")
         except UnicodeDecodeError:
             body = None
-        print(json.dumps({"id": doc_id, "key": key, "format": fmt, "content": body}, indent=2))
+        emit({"id": doc_id, "key": key, "format": fmt, "content": body})
         return 0
     info(f"# {key or doc_id}  ({(doc_id or '')[:12]}, {fmt})")
     try:
@@ -5374,8 +5555,8 @@ def cmd_skills(args) -> int:
 
     if sub == "list" and not getattr(args, "available", False):
         skills = fetch_agent_skills(creds, agent_id)
-        if getattr(args, "json", False):
-            print(json.dumps(skills, indent=2))
+        if _want_json(args):
+            emit(skills)
             return 0
         if getattr(args, "plain", False):
             for s in skills:
@@ -5404,8 +5585,8 @@ def cmd_skills(args) -> int:
         # how you discover a valid <skill_id> without leaving the CLI. Reached by
         # the canonical `skills list --available` or the hidden `skills available`.
         skills = fetch_agent_skills(creds, agent_id, filter_="available")
-        if getattr(args, "json", False):
-            print(json.dumps(skills, indent=2))
+        if _want_json(args):
+            emit(skills)
             return 0
         if getattr(args, "plain", False):
             for s in skills:
@@ -5432,15 +5613,13 @@ def cmd_skills(args) -> int:
         if not match:
             err(f"No skill '{args.skill_id}' installed on {agent.get('name')} ({agent_id}).")
             return 1
-        if getattr(args, "json", False):
-            print(json.dumps(match, indent=2))
-            return 0
-        print(json.dumps(match, indent=2))
+        # A single skill has no human table — always emit it as JSON.
+        emit(match)
         return 0
 
     if sub == "add":
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}"
-        http_request("POST", url, token=creds["token"], body={})
+        write_request("POST", url, token=creds["token"], body={})
         ok(f"Installed skill '{args.skill_id}' on {agent.get('name')} ({agent_id}).")
         info(f"Confirm with: eesel skills list {args.agent or agent_id}")
         return 0
@@ -5452,7 +5631,7 @@ def cmd_skills(args) -> int:
             info("Aborted.")
             return 1
         url = f"{creds['api_url']}/agents/{agent_id}/skills/{args.skill_id}"
-        http_request("DELETE", url, token=creds["token"])
+        write_request("DELETE", url, token=creds["token"])
         ok(f"Removed skill '{args.skill_id}' from {agent.get('name')} ({agent_id}).")
         return 0
 
@@ -5463,7 +5642,7 @@ def cmd_skills(args) -> int:
         # the whole object and drop any field this call didn't mention. The
         # response is the merged config — confirm each field we sent holds the
         # value we sent.
-        saved = http_request("PATCH", url, token=creds["token"], body=config)
+        saved = write_request("PATCH", url, token=creds["token"], body=config)
         if isinstance(saved, dict):
             mismatched = [k for k, v in config.items() if saved.get(k) != v]
             if mismatched:
@@ -5517,8 +5696,8 @@ def cmd_workspace(args) -> int:
 
     if sub == "show":
         ws = fetch_workspace(creds)
-        if getattr(args, "json", False):
-            print(json.dumps(ws, indent=2))
+        if _want_json(args):
+            emit(ws)
             return 0
         # Print the fields the server returns, most useful first; skip the
         # large/structural ones (namespaces) from the default view.
@@ -5547,7 +5726,7 @@ def cmd_workspace(args) -> int:
         field = args.field
         if field == "name":
             url = f"{creds['api_url']}/workspaces/{creds['workspace_id']}"
-            http_request("PUT", url, token=creds["token"], body={"workspaceName": args.value})
+            write_request("PUT", url, token=creds["token"], body={"workspaceName": args.value})
             # The update endpoint returns only a status message, so read the
             # workspace back to confirm and show the new name.
             ws = fetch_workspace(creds)
@@ -5567,7 +5746,7 @@ def cmd_workspace(args) -> int:
                 return 1
             # The server stores the cap under the `value` field and returns
             # {"status": "success"} with no echo.
-            http_request(
+            write_request(
                 "POST",
                 f"{creds['api_url']}/workspace/billing-limit",
                 token=creds["token"],
@@ -5595,8 +5774,8 @@ def cmd_workspace(args) -> int:
 
     if sub == "members":
         members = fetch_workspace_members(creds)
-        if getattr(args, "json", False):
-            print(json.dumps(members, indent=2))
+        if _want_json(args):
+            emit(members)
             return 0
         if not members:
             info("(no members)")
@@ -5610,7 +5789,7 @@ def cmd_workspace(args) -> int:
         return 0
 
     if sub == "extend-trial":
-        resp = http_request(
+        resp = write_request(
             "POST",
             f"{creds['api_url']}/subscription/extend-trial",
             token=creds["token"],
@@ -5850,8 +6029,8 @@ def cmd_billing(args) -> int:
         return 1
 
     data = http_request("GET", f"{creds['api_url']}{path}", token=creds["token"])
-    if getattr(args, "json", False):
-        print(json.dumps(data, indent=2))
+    if _want_json(args):
+        emit(data)
         return 0
     if getattr(args, "plain", False):
         plain_printer(data)
@@ -5916,8 +6095,8 @@ def cmd_settings(args) -> int:
 
     if action == "show":
         data = http_request("GET", url, token=creds["token"])
-        if getattr(args, "json", False):
-            print(json.dumps(data, indent=2))
+        if _want_json(args):
+            emit(data)
             return 0
         if getattr(args, "plain", False):
             _print_notification_settings_plain(data)
@@ -5940,10 +6119,10 @@ def cmd_settings(args) -> int:
             err("Nothing to set. Pass --channel dashboard|email|slack.")
             return 1
 
-    data = http_request("PATCH", url, token=creds["token"], body=body)
+    data = write_request("PATCH", url, token=creds["token"], body=body)
     ok(f"Updated notification settings for {agent.get('name')} ({agent_id[:12]}): {', '.join(body.keys())}")
-    if getattr(args, "json", False):
-        print(json.dumps(data, indent=2))
+    if _want_json(args):
+        emit(data)
         return 0
     _print_notification_settings(data)
     return 0
@@ -6112,6 +6291,164 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
 # commands (see `_normalize_path_scope_argv`); they're real but otherwise
 # invisible — argparse only lists the flat `agents` verbs — so advertise them
 # here. Keep in sync with `_AGENT_SCOPED_CHILDREN` and the reshape's verb heads.
+# The API endpoint each leaf command hits, keyed by its dotted command path
+# (e.g. "agents.create"). Hand-kept because argparse doesn't know it; `eesel
+# schema` merges this onto the parser tree so an agent learns the endpoint
+# without reading the source. The mutations mirror the write_request set;
+# `{id}` marks a path segment resolved at runtime. Commands with no single
+# stable endpoint (login/logout/whoami/link/chat/mcp call) are omitted.
+_COMMAND_ENDPOINTS = {
+    "agents.list": "GET /agents",
+    "agents.show": "GET /agents",
+    "agents.create": "POST /agents",
+    "agents.set": "PUT /agents/{id}",
+    "agents.remove": "DELETE /agents/{id}",
+    "automations.triggers.registry": "GET /triggers/registry",
+    "automations.triggers.list": "GET /agents/{id}/triggers",
+    "automations.triggers.show": "GET /agents/{id}/triggers",
+    "automations.triggers.add": "POST /agents/{id}/triggers",
+    "automations.triggers.remove": "DELETE /triggers/{id}",
+    "automations.schedules.list": "GET /agents/{id}/triggers",
+    "automations.schedules.add": "POST /agents/{id}/triggers",
+    "automations.schedules.remove": "DELETE /triggers/{id}",
+    "automations.schedules.fire": "POST /triggers/{id}/fire",
+    "integrations.list": "GET /integrations",
+    "integrations.available": "GET /integration-definitions",
+    "integrations.show": "GET /integrations",
+    "integrations.connect": "POST /integrations/{key}/{option}",
+    "integrations.sync": "POST /integrations/{id}/trigger-sync",
+    "integrations.sync-status": "GET /v2/sync-runs",
+    "integrations.remove": "DELETE /integrations/{id}",
+    "integrations.actions.list": "GET /agents/{id}/tools",
+    "integrations.actions.show": "GET /agents/{id}/tools",
+    "integrations.actions.enable": "POST /agents/{id}/tools/{key}",
+    "integrations.actions.set": "POST /agents/{id}/tools/{key}",
+    "integrations.actions.disable": "DELETE /agents/{id}/tools/{key}",
+    "mcp.list": "GET /workspaces/{ws}/mcp-servers",
+    "mcp.show": "GET /workspaces/{ws}/mcp-servers",
+    "mcp.add": "POST /workspaces/{ws}/mcp-servers",
+    "mcp.set": "PUT /workspaces/{ws}/mcp-servers/{id}",
+    "mcp.enable": "POST /workspaces/{ws}/mcp-servers/{id}/toggle",
+    "mcp.disable": "POST /workspaces/{ws}/mcp-servers/{id}/toggle",
+    "mcp.remove": "DELETE /workspaces/{ws}/mcp-servers/{id}",
+    "files.list": "GET /documents",
+    "files.show": "GET /documents",
+    "files.read": "GET /documents/{id}/export-link",
+    "files.export": "GET /documents/{id}/export-link",
+    "files.add": "POST /documents",
+    "files.remove": "DELETE /documents",
+    "files.acl.show": "GET /agents/{id}/knowledge-acl",
+    "files.acl.set": "PUT /agents/{id}/knowledge-acl",
+    "skills.list": "GET /agents/{id}/skills",
+    "skills.show": "GET /agents/{id}/skills",
+    "skills.add": "POST /agents/{id}/skills/{id}",
+    "skills.remove": "DELETE /agents/{id}/skills/{id}",
+    "skills.set": "PATCH /agents/{id}/skills/{id}/config",
+    "workspace.show": "GET /workspaces/{ws}",
+    "workspace.members": "GET /workspaces/{ws}/members",
+    # `workspace set` dispatches on the field it's given (name → PUT /workspaces,
+    # billing-limit → POST /workspace/billing-limit), so no single endpoint
+    # string is accurate — annotate nothing rather than mislead an agent.
+    "workspace.extend-trial": "POST /subscription/extend-trial",
+    "settings.notifications.show": "GET /agents/{id}/notification-settings",
+    "settings.notifications.enable": "PATCH /agents/{id}/notification-settings",
+    "settings.notifications.disable": "PATCH /agents/{id}/notification-settings",
+    "settings.notifications.set": "PATCH /agents/{id}/notification-settings",
+    "tasks.list": "POST /workspace/tasks",
+    "tasks.count": "POST /workspace/tasks",
+    "tasks.show": "POST /workspace/tasks",
+    "tasks.analytics": "POST /workspace/tasks/analytics",
+    "tasks.export": "POST /tasks/export",
+    "mcp.token": "POST /workspaces/token",
+    "instructions": "GET /agents",
+    "billing.show": "GET /subscription/*",
+    "billing.list": "GET /subscription/*",
+}
+
+# `document` is a hidden alias of `files` (same parser, same handlers), so it
+# hits the same endpoints — mirror them rather than duplicating the list.
+_COMMAND_ENDPOINTS.update({
+    "document" + k[len("files"):]: v
+    for k, v in list(_COMMAND_ENDPOINTS.items())
+    if k.startswith("files.")
+})
+
+# argparse action classes whose presence means the flag takes no value.
+_STORE_CONST_ACTIONS = (
+    argparse._StoreTrueAction,
+    argparse._StoreFalseAction,
+    argparse._StoreConstAction,
+)
+
+
+def _serialize_flag(action) -> dict:
+    """One `--flag` as a schema entry: its names, whether it takes a value,
+    whether it's required, its closed enum choices (if any), and help text.
+    A suppressed help string (hidden staff flag) is reported as null."""
+    return {
+        "names": list(action.option_strings),
+        "takes_value": not isinstance(action, _STORE_CONST_ACTIONS) and not isinstance(action, argparse._CountAction),
+        "required": bool(action.required),
+        "choices": [str(c) for c in action.choices] if action.choices else None,
+        "help": None if action.help in (None, argparse.SUPPRESS) else action.help,
+    }
+
+
+def _serialize_parser(parser, path: tuple = (), inherited_handler=None) -> dict:
+    """Recursively describe an argparse parser as a JSON-able dict: its flags,
+    positionals, the handler it dispatches to, its API endpoint (from
+    `_COMMAND_ENDPOINTS`), and its nested subcommands. Reads argparse's own
+    parsed structure, so the schema can never drift from what the CLI accepts.
+
+    A leaf command (`agents create`) has no `func` default of its own — the top
+    command (`agents`) owns the handler and routes internally on the subcommand
+    dest. So the effective handler is inherited from the nearest ancestor that
+    sets one, and every command node reports the handler that ultimately runs.
+    """
+    handler = parser.get_default("func") or inherited_handler
+    node: dict = {}
+    flags = []
+    positionals = []
+    subcommands = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for name, subparser in action.choices.items():
+                subcommands[name] = _serialize_parser(subparser, path + (name,), handler)
+        elif isinstance(action, argparse._HelpAction):
+            continue
+        elif action.option_strings:
+            flags.append(_serialize_flag(action))
+        else:
+            positionals.append({
+                "name": action.dest,
+                "required": action.nargs not in ("?", "*", 0),
+                "choices": [str(c) for c in action.choices] if action.choices else None,
+                "help": None if action.help in (None, argparse.SUPPRESS) else action.help,
+            })
+    if handler is not None:
+        node["handler"] = getattr(handler, "__name__", str(handler))
+    key = ".".join(path)
+    if key in _COMMAND_ENDPOINTS:
+        node["endpoint"] = _COMMAND_ENDPOINTS[key]
+    if flags:
+        node["flags"] = flags
+    if positionals:
+        node["positionals"] = positionals
+    if subcommands:
+        node["subcommands"] = subcommands
+    return node
+
+
+def cmd_schema(args) -> int:
+    """Emit the entire command surface as JSON — every command, flag, enum
+    choice, positional, handler, and API endpoint — walked live from the parser
+    so an agent can discover the CLI without reading `--help` or the source."""
+    schema = _serialize_parser(build_parser(staff=True))
+    schema["prog"] = "eesel"
+    emit(schema)
+    return 0
+
+
 _AGENTS_PATH_EPILOG = """\
 scope by path:
   Put an agent's id in the command path to scope a noun to that agent — the
@@ -6147,6 +6484,14 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
                "(e.g. `eesel agents <id> integrations list`). See `eesel agents --help`.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # Global machine-output/preview flags. These work anywhere on the command
+    # line (before or after the subcommand) because `main()` lifts them out of
+    # argv before parsing; they are declared here so `--help` and `eesel schema`
+    # document them, and so the pre-subcommand position (`eesel --json …`) parses.
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON (also: EESEL_OUTPUT=json). Lists stream as NDJSON when piped.")
+    p.add_argument("--fields", metavar="a,b,c", help="With --json: keep only these top-level keys on each object.")
+    p.add_argument("--dry-run", action="store_true", help="Preview a side effect (config mutation, chat turn, or login): print the request that would be sent and make no call.")
+    p.add_argument("--secrets", action="store_true", help="Reveal masked secret values (sysadmin/impersonator accounts only).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)" if staff else "Authenticate")
@@ -6170,6 +6515,15 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     )
     sp.add_argument("url", help="Branch env base URL, e.g. https://<slug>.preprod.eesel.xyz")
     sp.set_defaults(func=cmd_link)
+
+    sp = sub.add_parser(
+        "schema",
+        help="Print the whole command surface as JSON (commands, flags, enums, endpoints)",
+        description="Emit every command, flag, enum choice, and API endpoint as JSON, "
+                    "walked live from the parser. Built for an AI agent to discover the "
+                    "CLI without scraping --help. Combine with --fields to trim it.",
+    )
+    sp.set_defaults(func=cmd_schema)
 
     sp = sub.add_parser(
         "agents",
@@ -6936,6 +7290,66 @@ def _normalize_integrations_argv(argv: list[str]) -> list[str]:
     return argv[: i + 1] + ["actions", integration] + tail
 
 
+def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
+    """Pull the global output/preview flags out of argv, wherever they appear.
+
+    Returns `(remaining_argv, values)`. argparse only accepts a top-level
+    optional before the subcommand, so without this an agent could not write the
+    natural `eesel agents create --name X --dry-run`. Boolean flags (`--json`,
+    `--dry-run`, `--secrets`) are matched exactly; `--fields` consumes the
+    following token as its value only when that token is not itself a flag,
+    or takes a `--fields=…` inline value. Anything not one of these flags is
+    passed through untouched for argparse to handle.
+    """
+    values = {"json": False, "dry_run": False, "secrets": False, "fields": None}
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--json":
+            values["json"] = True
+        elif tok == "--dry-run":
+            values["dry_run"] = True
+        elif tok == "--secrets":
+            values["secrets"] = True
+        elif tok == "--fields":
+            # Only consume the next token as the value when it is a real value,
+            # not another flag. `eesel schema --fields --json` must leave --json
+            # intact rather than swallow it as fields="--json" (which silently
+            # disables JSON). A missing or flag-shaped value leaves fields unset,
+            # matching argparse's "expected one argument" being a no-op here.
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is not None and not nxt.startswith("--"):
+                values["fields"] = nxt
+                i += 1
+        elif tok.startswith("--fields="):
+            values["fields"] = tok.split("=", 1)[1]
+        else:
+            rest.append(tok)
+        i += 1
+    return rest, values
+
+
+def _configure_output(args, global_flags: dict, creds: dict | None) -> None:
+    """Resolve the machine-output contract into module globals for this run.
+
+    Called once by `main()` after parsing. `EESEL_OUTPUT=json` mirrors the
+    existing `EESEL_BASE_URL`/`EESEL_AGENT` env precedent. `_REVEAL_SECRETS` is
+    the generalized secret gate that reaches previously-raw emitters: raw values
+    only for a sysadmin/impersonator login that passed `--secrets`. It is set
+    silently here — the "restricted to sysadmin" warning is emitted by the
+    commands that own an explicit `--secrets` flag (integrations/actions), so
+    resolving it here too would double-warn.
+    """
+    global _OUTPUT_FORMAT, _OUTPUT_FIELDS, _DRY_RUN, _REVEAL_SECRETS
+    want_json = bool(getattr(args, "json", False)) or os.environ.get("EESEL_OUTPUT", "").strip().lower() == "json"
+    _OUTPUT_FORMAT = "json" if want_json else "human"
+    raw_fields = global_flags.get("fields")
+    _OUTPUT_FIELDS = [f.strip() for f in raw_fields.split(",") if f.strip()] if raw_fields else None
+    _DRY_RUN = bool(global_flags.get("dry_run"))
+    _REVEAL_SECRETS = bool(getattr(args, "secrets", False)) and bool(creds) and _is_sysadmin(creds)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Impersonation write-guard
 #
@@ -7062,11 +7476,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser(staff)
     if argv is None:
         argv = sys.argv[1:]
+    # Lift the global output/preview flags out of argv so they work in any
+    # position (argparse only accepts top-level optionals before the
+    # subcommand). The values are re-attached to the parsed namespace below.
+    argv, global_flags = _extract_global_output_flags(argv)
     # Path-as-scope first (`agents <id> integrations …` → flat + `--agent <id>`),
     # then the integrations actions reshape runs on its output.
     argv = _normalize_path_scope_argv(argv)
     argv = _normalize_integrations_argv(argv)
     args = parser.parse_args(argv)
+    # Re-attach the lifted flags: a handler reads `args.json`/`args.secrets`
+    # exactly as before, whether the flag was global or per-command.
+    args.json = bool(getattr(args, "json", False)) or global_flags["json"]
+    args.secrets = bool(getattr(args, "secrets", False)) or global_flags["secrets"]
+    _configure_output(args, global_flags, creds)
     _guard_impersonated_command(args, creds)
     return args.func(args)
 
