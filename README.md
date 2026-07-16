@@ -310,6 +310,31 @@ once with nothing global to race over.
   as a normal `eesel login` / `--dev`.
 - Unlink by deleting `eesel.dev.json`.
 
+## Exit codes
+
+Every command exits `0` on success. A failure carries a code that names its
+class, so a script or an agent can branch on it — retry, re-authenticate, fix
+its input, or give up — without parsing the stderr message. These numbers are
+a stable contract; they won't be renumbered.
+
+| Code | Meaning | Typical cause |
+|------|---------|---------------|
+| `0` | success | the command did its work |
+| `1` | generic failure | an error with no more specific class |
+| `2` | argument-usage error | a malformed or missing flag/argument (from argument parsing) |
+| `3` | auth | the API returned 401 / 403 — re-authenticate with `eesel login` |
+| `4` | not-found | the API returned 404 — the addressed thing doesn't exist |
+| `5` | rate-limit | the API returned 429 — back off and retry later |
+| `6` | validation | the API returned 400 / 422, or the local input was bad/missing (e.g. `eesel chat` with no message on a non-interactive terminal, or an OAuth connect that can't complete headless) |
+| `7` | server | the API returned 5xx, or the server timed out / was unreachable — retry later |
+
+On a non-interactive terminal (a headless agent or CI), commands that would
+otherwise drop into an interactive prompt fail with code `6` instead of hanging
+or silently doing nothing: `eesel chat` with no message, `eesel files read`
+with no target, and `eesel integrations connect` on a browser-OAuth connector.
+Pass the message/target explicitly, and complete OAuth connects from a real
+terminal or the dashboard.
+
 ## Local state
 
 ```

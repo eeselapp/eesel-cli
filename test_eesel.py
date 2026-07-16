@@ -746,23 +746,73 @@ class TestEphemeralCreds:
 
 
 class TestHttpTimeoutHandling:
-    def test_http_request_exits_clean_on_timeout(self, monkeypatch):
+    def test_http_request_exits_clean_on_timeout(self, monkeypatch, capsys):
         def boom(req, timeout=None):
             raise socket.timeout("timed out")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
         with pytest.raises(SystemExit) as exc:
             eesel.http_request("GET", "https://x.preprod.eesel.xyz/dev/logs")
-        assert "timed out" in str(exc.value)  # clean message, not a traceback
+        # A timeout is a server-class failure: typed exit code, clean one-line
+        # message on stderr (not a traceback, and no longer the exit payload).
+        assert exc.value.code == eesel.EXIT_SERVER
+        assert "timed out" in capsys.readouterr().err
 
-    def test_allow_error_exits_clean_on_timeout(self, monkeypatch):
+    def test_allow_error_exits_clean_on_timeout(self, monkeypatch, capsys):
         def boom(req, timeout=None):
             raise socket.timeout("timed out")
 
         monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
         with pytest.raises(SystemExit) as exc:
             eesel.http_request_allow_error("POST", "https://x.preprod.eesel.xyz/dev/session")
-        assert "timed out" in str(exc.value)
+        assert exc.value.code == eesel.EXIT_SERVER
+        assert "timed out" in capsys.readouterr().err
+
+
+class TestExitCodes:
+    """Typed exit codes are a contract a headless agent branches on: a failure
+    carries a code that names its class, so an agent decides retry vs. re-auth
+    vs. give-up without scraping stderr."""
+
+    @pytest.mark.parametrize("status, code", [
+        (401, 3), (403, 3),          # auth
+        (404, 4),                    # not-found
+        (400, 5), (422, 5),          # validation
+        (429, 6),                    # rate-limit
+        (500, 7), (502, 7), (503, 7),  # server
+        (402, 1), (409, 1),          # unclassified 4xx → generic
+    ])
+    def test_code_for_status_maps_each_class(self, status, code):
+        assert eesel.code_for_status(status) == code
+
+    def test_the_five_classes_have_distinct_locked_numbers(self):
+        # The numbers are a committed contract — guard against an accidental
+        # renumber or collision (including with argparse's usage code 2).
+        assert (eesel.EXIT_AUTH, eesel.EXIT_NOT_FOUND, eesel.EXIT_VALIDATION,
+                eesel.EXIT_RATE_LIMIT, eesel.EXIT_SERVER) == (3, 4, 5, 6, 7)
+        assert eesel.EXIT_OK == 0 and eesel.EXIT_GENERIC == 1 and eesel.EXIT_USAGE == 2
+
+    def test_fail_prints_to_stderr_and_exits_with_code(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            eesel.fail(eesel.EXIT_AUTH, "please re-authenticate")
+        assert exc.value.code == eesel.EXIT_AUTH
+        assert "please re-authenticate" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("status, code", [
+        (401, 3), (404, 4), (400, 5), (429, 6), (500, 7),
+    ])
+    def test_http_request_exits_with_typed_code_for_status(self, monkeypatch, capsys, status, code):
+        # Drive each HTTP failure status through the shared request helper and
+        # read the process exit code — the end-to-end contract an agent sees.
+        import io
+
+        def boom(req, timeout=None):
+            raise eesel.urllib.error.HTTPError("http://x/y", status, "err", {}, io.BytesIO(b'{"error":"x"}'))
+
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", boom)
+        with pytest.raises(SystemExit) as exc:
+            eesel.http_request("GET", "http://x/y")
+        assert exc.value.code == code
 
 
 class TestRefreshProdToken:
@@ -1537,6 +1587,8 @@ class TestFilesRead:
             captured["options"] = options
             return 1  # pick the second agent-owned doc
 
+        # The picker path requires an interactive terminal.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "interactive_select", fake_select)
         rc = eesel.cmd_files_read(self._args())
         assert rc == 0
@@ -1546,6 +1598,7 @@ class TestFilesRead:
 
     def test_read_prefix_is_passed_through_and_scopes(self, tmp_config, fake_creds, monkeypatch):
         seen = self._wire(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: 0)
         eesel.cmd_files_read(self._args(prefix="files/"))
         assert seen.get("prefix") == "files/"  # forwarded to fetch_documents
@@ -1570,6 +1623,10 @@ class TestFilesRead:
         assert rc == 1
 
     def test_read_no_files_is_clean_exit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # An empty workspace on an interactive terminal: nothing to pick, so a
+        # clean "(no files)" exit 0. (On a non-TTY, no target errors 6 before
+        # the fetch — see test_read_no_target_non_tty_errors_with_validation_code.)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "fetch_documents", lambda creds, **kw: [])
         rc = eesel.cmd_files_read(self._args(prefix="integrations/"))
         assert rc == 0
@@ -1577,8 +1634,55 @@ class TestFilesRead:
 
     def test_read_cancel_menu_returns_nonzero(self, tmp_config, fake_creds, monkeypatch):
         self._wire(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: None)
         assert eesel.cmd_files_read(self._args()) == 1
+
+    def test_read_no_target_non_tty_errors_before_the_fetch(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # No target on a non-interactive terminal: fail with the validation code
+        # and name the fix — never the misleading "Cancelled." (nothing was
+        # cancelled). The guard runs BEFORE the document fetch, so a down server
+        # can't turn this into a server-class exit 7 ("retry later") for a call
+        # that can never succeed as invoked.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "fetch_documents", lambda *a, **k: pytest.fail("must not fetch before the no-target guard"))
+        monkeypatch.setattr(eesel, "interactive_select", lambda *a, **k: pytest.fail("must not open a picker on a non-TTY"))
+        rc = eesel.cmd_files_read(self._args())
+        assert rc == eesel.EXIT_VALIDATION
+        err = capsys.readouterr().err
+        assert "Cancelled." not in err
+        assert "files read" in err
+
+    def test_read_no_target_consumes_piped_index(self, tmp_config, fake_creds, monkeypatch):
+        # `echo 1 | eesel files read`: no TTY, but stdin carries a picked index.
+        # The no-target guard must NOT fire — the numbered-select fallback reads
+        # the index off stdin and the chosen file is read as if picked from the
+        # menu.
+        seen = self._wire(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "_stdin_has_piped_data", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _="": "1")  # pick the second agent-owned doc
+        rc = eesel.cmd_files_read(self._args())
+        assert rc == 0
+        assert seen["doc_id"] == "doc-bbb33344"
+
+
+class TestBestEffortLookupsStaySilent:
+    """`_latest_sync_run` and `find_task_row` decorate an already-successful
+    command (integrations status / tasks show/cost). When their background fetch
+    fails they must degrade to None *silently* — `fail()` prints via `err()`
+    before exiting, so without suppression the caught SystemExit would still leak
+    a red error banner onto the command's real output."""
+
+    def test_latest_sync_run_swallows_failure_without_printing(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "_fetch_sync_runs", lambda creds: eesel.fail(eesel.EXIT_SERVER, "sync-runs endpoint down"))
+        assert eesel._latest_sync_run({"api_url": "x", "token": "t"}, "int-1") is None
+        assert capsys.readouterr().err == ""
+
+    def test_find_task_row_swallows_failure_without_printing(self, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "fetch_tasks", lambda creds, **k: eesel.fail(eesel.EXIT_AUTH, "401 on tasks list"))
+        assert eesel.find_task_row({"api_url": "x", "token": "t"}, "task-1") is None
+        assert capsys.readouterr().err == ""
 
 
 class TestHttpFetch:
@@ -2483,16 +2587,20 @@ class TestHttpRequestNonJson:
         def __exit__(self, *a):
             return False
 
-    def test_non_json_200_exits_cleanly(self, monkeypatch):
+    def test_non_json_200_exits_cleanly(self, monkeypatch, capsys):
         # A proxy/login HTML page served with status 200 must not raise a raw
-        # JSONDecodeError traceback.
+        # JSONDecodeError traceback, and it exits with the server-class code (7)
+        # like the timeout/unreachable branches — a headless agent treats a
+        # gateway answering instead of the API as "retry later", not a generic
+        # exit 1.
         html = b"<html><body>Gateway timeout</body></html>"
         monkeypatch.setattr(
             eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
         )
         with pytest.raises(SystemExit) as exc:
             eesel.http_request("GET", "http://proxy/agents")
-        msg = str(exc.value)
+        assert exc.value.code == eesel.EXIT_SERVER
+        msg = capsys.readouterr().err
         assert "not JSON" in msg
         assert "JSONDecodeError" not in msg
 
@@ -2659,16 +2767,20 @@ class TestHttpRequestNonJson:
         def __exit__(self, *a):
             return False
 
-    def test_non_json_200_exits_cleanly(self, monkeypatch):
+    def test_non_json_200_exits_cleanly(self, monkeypatch, capsys):
         # A proxy/login HTML page served with status 200 must not raise a raw
-        # JSONDecodeError traceback.
+        # JSONDecodeError traceback, and it exits with the server-class code (7)
+        # like the timeout/unreachable branches — a headless agent treats a
+        # gateway answering instead of the API as "retry later", not a generic
+        # exit 1.
         html = b"<html><body>Gateway timeout</body></html>"
         monkeypatch.setattr(
             eesel.urllib.request, "urlopen", lambda *a, **k: self._FakeResp(html)
         )
         with pytest.raises(SystemExit) as exc:
             eesel.http_request("GET", "http://proxy/agents")
-        msg = str(exc.value)
+        assert exc.value.code == eesel.EXIT_SERVER
+        msg = capsys.readouterr().err
         assert "not JSON" in msg
         assert "JSONDecodeError" not in msg
 
@@ -2769,6 +2881,55 @@ class _FakeStdin:
 
     def isatty(self):
         return self._tty
+
+
+class TestStdinHasPipedData:
+    """`_stdin_has_piped_data` must return True only for a non-TTY stdin that
+    actually carries a byte to read. An empty pipe or file (a headless caller
+    that produced no input) must read as "no piped data" so the no-target /
+    no-message guards fire instead of dropping into a REPL that reads EOF and
+    reports success having done nothing."""
+
+    def test_tty_has_no_piped_data(self, monkeypatch):
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
+        assert eesel._stdin_has_piped_data() is False
+
+    def test_non_empty_file_has_piped_data(self, tmp_path, monkeypatch):
+        p = tmp_path / "msg.txt"
+        p.write_text("summarize this\n")
+        with open(p, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is True
+
+    def test_empty_file_has_no_piped_data(self, tmp_path, monkeypatch):
+        # `eesel chat < empty.txt`: a real regular file, but zero bytes. The old
+        # descriptor-type-only check returned True here and re-opened the exit-0
+        # silent no-op; peeking a byte settles it as empty.
+        p = tmp_path / "empty.txt"
+        p.write_text("")
+        with open(p, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is False
+
+    def test_non_empty_pipe_has_piped_data_without_consuming(self, monkeypatch):
+        # A pipe carrying a message reads as "has data", and the peek must not
+        # consume it — a following read still sees the whole line.
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, b"line one\n")
+        os.close(w_fd)
+        with os.fdopen(r_fd, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is True
+            assert f.readline() == "line one\n"
+
+    def test_empty_closed_pipe_has_no_piped_data(self, monkeypatch):
+        # `produces_nothing | eesel chat`: the writer closes without emitting a
+        # byte, so the peek sees EOF immediately and the guard can fire.
+        r_fd, w_fd = os.pipe()
+        os.close(w_fd)
+        with os.fdopen(r_fd, "r") as f:
+            monkeypatch.setattr(eesel.sys, "stdin", f)
+            assert eesel._stdin_has_piped_data() is False
 
 
 class TestPickAgent:
@@ -5375,6 +5536,8 @@ class TestIntegrationsAgentScope:
         monkeypatch.setattr(eesel, "fetch_agents", lambda creds: list(self._AGENTS))
         monkeypatch.setattr(eesel, "fetch_integration_definition", lambda creds, key: next((d for d in _DEFINITIONS if d["key"] == key), None))
         monkeypatch.setattr(eesel, "webbrowser", type("W", (), {"open": staticmethod(lambda url: True)}))
+        # The browser hand-off only runs on an interactive terminal.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         rc = eesel.cmd_integrations(
             _connect_args(integrations_cmd="connect", key="zendesk", option="oauth", agent="agent-other-789")
         )
@@ -5450,6 +5613,8 @@ class TestIntegrationsConnect:
         self._defs(monkeypatch)
         opened = []
         self._no_browser(monkeypatch, opened)
+        # On an interactive terminal the redirect option hands off to the browser.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: pytest.fail("redirect must not POST"))
         rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="oauth"))
         assert rc == 0
@@ -5515,14 +5680,39 @@ class TestIntegrationsConnect:
             lambda *a, **k: (400, {"error": "Zendesk subdomain or custom hostname is required"}),
         )
         rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="quick_start", field=["subdomain=bad"]))
-        assert rc == 1
+        # A server 400 on a submit connect maps to the validation exit code.
+        assert rc == eesel.EXIT_VALIDATION
         assert "Zendesk subdomain or custom hostname is required" in capsys.readouterr().err
 
     def test_no_input_refuses_redirect(self, fake_creds, monkeypatch, capsys):
+        # --no-input forces the honest refusal even on an interactive terminal:
+        # a browser-OAuth connect can't complete without human interaction.
         self._defs(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(True))
         rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="oauth", no_input=True))
-        assert rc == 1
-        assert "--no-input" in capsys.readouterr().err
+        assert rc == eesel.EXIT_VALIDATION
+        assert "interactive browser" in capsys.readouterr().err
+
+    def test_no_input_flag_is_documented(self):
+        # --no-input is a public, discoverable flag now (no longer suppressed),
+        # so an agent can find it in `eesel integrations connect --help`.
+        import argparse as _argparse
+        parser = eesel.build_parser()
+        integrations = _subparsers_action(parser).choices["integrations"]
+        connect = _subparsers_action(integrations).choices["connect"]
+        action = next(a for a in connect._actions if "--no-input" in a.option_strings)
+        assert action.help and action.help is not _argparse.SUPPRESS
+
+    def test_redirect_refuses_on_non_tty(self, fake_creds, monkeypatch, capsys):
+        # Without --no-input, a non-interactive stdin (a headless agent) must
+        # still refuse a browser-OAuth connect — never print a URL and exit 0
+        # having connected nothing.
+        self._defs(monkeypatch)
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "webbrowser", type("W", (), {"open": staticmethod(lambda url: pytest.fail("must not open a browser on a non-TTY"))}))
+        rc = eesel.cmd_integrations(_connect_args(integrations_cmd="connect", key="zendesk", option="oauth"))
+        assert rc == eesel.EXIT_VALIDATION
+        assert "interactive browser" in capsys.readouterr().err
 
     def test_browser_connect_url_resolves_dashboard_and_fills_params(self, fake_creds):
         # Drops unresolved {{...}} params, fills the identifier param the endpoint
@@ -5592,7 +5782,8 @@ class TestIntegrationsSync:
             lambda *a, **k: (400, {"error": "only zendesk integrations support trigger-sync"}),
         )
         rc = eesel.cmd_integrations(_args(integrations_cmd="sync", id="int-zendesk-1", type="tickets"))
-        assert rc == 1
+        # A server 400 maps to the validation exit code, not the generic 1.
+        assert rc == eesel.EXIT_VALIDATION
         assert "only zendesk integrations support trigger-sync" in capsys.readouterr().err
 
 
@@ -7796,6 +7987,56 @@ class TestChatAgentFlag:
         monkeypatch.setattr(eesel, "save_creds", lambda creds: pytest.fail("--schedule must not persist the active agent"))
         rc = eesel.cmd_chat(_args(schedule="heartbeat", message="go", cost=False, task=None, agent=None))
         assert rc == 0
+
+
+class TestChatNonTtyGuard:
+    """A headless agent that runs `eesel chat` with no message must be told to
+    pass one (the validation exit code), not silently dropped into a REPL that
+    reads end-of-input and exits 0 having sent nothing."""
+
+    def test_no_message_on_non_tty_errors_before_any_work(self, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "pick_agent", lambda *a, **k: pytest.fail("must not resolve an agent"))
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda *a, **k: pytest.fail("must not open a session"))
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: pytest.fail("must not start a chat turn"))
+        rc = eesel.cmd_chat(_args(message=None, agent=None, task=None, schedule=None, cost=False))
+        assert rc == eesel.EXIT_VALIDATION
+        assert "message" in capsys.readouterr().err
+
+    def test_message_on_non_tty_still_runs(self, fake_creds, monkeypatch):
+        # A message provided → the guard doesn't fire; the one-shot turn runs.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: "a1")
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: {"id": "s1", "agent_id": "a1", "task_id": "t1", "messages": []})
+        # send_message returns the chat envelope; a completed turn exits 0.
+        monkeypatch.setattr(eesel, "send_message", lambda *a, **k: {"task_id": "t1", "status": "completed", "reply": "hello back", "tool_calls": [], "error": None})
+        rc = eesel.cmd_chat(_args(message="hi", agent=None, task=None, schedule=None, cost=False))
+        assert rc == 0
+
+    def test_piped_message_on_non_tty_is_sent(self, fake_creds, monkeypatch):
+        # `echo "summarize this" | eesel chat`: no --message and no TTY, but stdin
+        # carries a real message. The guard must NOT fire — the REPL's input()
+        # reads the piped line, sends it, and returns 0 on end-of-input. Refusing
+        # here would drop a delivered instruction as a silent no-op.
+        monkeypatch.setattr(eesel.sys, "stdin", _FakeStdin(False))
+        monkeypatch.setattr(eesel, "_stdin_has_piped_data", lambda: True)
+        monkeypatch.setattr(eesel, "pick_agent", lambda creds, **k: "a1")
+        monkeypatch.setattr(eesel, "ensure_current_session", lambda creds, **k: {"id": "s1", "agent_id": "a1", "task_id": "t1", "messages": []})
+        sent = []
+        monkeypatch.setattr(eesel, "send_message", lambda creds, sess, msg, **k: (sent.append(msg) or "ok"))
+
+        lines = iter(["summarize this"])
+
+        def fake_input(_=""):
+            try:
+                return next(lines)
+            except StopIteration:
+                raise EOFError  # end of the piped input closes the REPL
+
+        monkeypatch.setattr("builtins.input", fake_input)
+        rc = eesel.cmd_chat(_args(message=None, agent=None, task=None, schedule=None, cost=False))
+        assert rc == 0
+        assert sent == ["summarize this"]
 
 
 class TestChatTaskFlag:

@@ -67,17 +67,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import difflib
 import hashlib
 import hmac
 import http.client
 import http.server
+import io
 import json
 import os
 import re
 import secrets as secrets_mod
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -142,26 +145,6 @@ PROD_TOKEN_TTL_FALLBACK_SECONDS = 3600
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Exit codes
-#
-# A stable, machine-branchable contract for agents driving the CLI: an exit code
-# tells the caller *why* a command failed, not just that it did. Today only
-# validation failures use a dedicated code; every other failure still exits
-# EXIT_GENERIC (1). The auth / not-found / rate-limit / server codes are reserved
-# here so a later change can wire them without renumbering — once agents branch
-# on these numbers they are a public contract and must not shift.
-# ──────────────────────────────────────────────────────────────────────────
-EXIT_OK = 0
-EXIT_GENERIC = 1
-EXIT_USAGE = 2          # argparse's own code for a malformed command line
-EXIT_AUTH = 3           # reserved: not logged in / token rejected
-EXIT_NOT_FOUND = 4      # reserved: named resource does not exist
-EXIT_VALIDATION = 5     # input rejected client-side before any network call
-EXIT_RATE_LIMIT = 6     # reserved: server asked us to back off
-EXIT_SERVER = 7         # reserved: server-side failure (5xx)
-
-
-# ──────────────────────────────────────────────────────────────────────────
 # Output helpers
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -212,6 +195,111 @@ def confirm(prompt: str) -> bool:
     except EOFError:
         return False
     return answer in ("y", "yes")
+
+
+def _stdin_has_piped_data() -> bool:
+    """True when stdin is redirected from a pipe or file AND carries at least one
+    byte to read — a real, non-empty source the CLI can read input from without a
+    terminal (e.g. `echo 1 | eesel files read` or `eesel chat < message.txt`).
+
+    False for an interactive TTY (handled by the arrow-key menu / REPL) and for a
+    character device such as /dev/null or a closed descriptor.
+
+    Critically also False for an *empty* pipe or file. A headless agent that
+    supplies no input — `produces_nothing | eesel chat`, or `eesel chat <
+    empty.txt` — leaves an empty FIFO/regular file. The descriptor type alone
+    cannot tell that apart from a pipe carrying a real message, and treating it
+    as "has input" would fall back into the REPL, hit EOF on the first read, and
+    report exit 0 having sent nothing — the exact silent no-op this guard exists
+    to refuse. So emptiness is settled by actually peeking a byte.
+
+    The peek reads through the buffered binary layer (`sys.stdin.buffer.peek`),
+    which fills the read buffer without advancing it: a following input() /
+    readline() in the REPL or numbered picker still sees the whole stream. On a
+    pipe the peek blocks until the first byte or EOF arrives — the same wait
+    input() would incur.
+    """
+    if sys.stdin.isatty():
+        return False
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except (OSError, ValueError, AttributeError):
+        # No real descriptor to inspect (e.g. a replaced stdin in tests, or a
+        # platform without fstat) — treat it as "no piped input" so the honest
+        # failure path stays the default.
+        return False
+    if not (stat.S_ISFIFO(mode) or stat.S_ISREG(mode)):
+        return False
+    # A FIFO or regular file with a real descriptor: peek one byte to tell an
+    # empty source from one carrying input.
+    buffer = getattr(sys.stdin, "buffer", None)
+    peek = getattr(buffer, "peek", None)
+    if peek is None:
+        # No buffered binary layer to peek without consuming (an unusual stdin
+        # replacement). Fall back to the descriptor type and assume the
+        # redirected source has input.
+        return True
+    try:
+        return len(peek(1)) > 0
+    except (OSError, ValueError):
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Exit codes — a stable contract a headless agent branches on
+# ──────────────────────────────────────────────────────────────────────────
+#
+# An agent driving the CLI unattended decides retry vs. re-authenticate vs.
+# give-up from the exit code alone, without scraping the stderr prose. So a
+# failure carries a code that names its class. These numbers are a committed
+# contract — agents branch on them — and must not be renumbered.
+#
+#   0  success
+#   1  generic / unexpected failure
+#   2  argument-usage error (argparse emits this itself; left untouched)
+#   3  auth        — 401 / 403; re-authenticate (e.g. `eesel login`)
+#   4  not-found   — 404; the addressed thing does not exist
+#   5  validation  — 400 / 422, or bad/missing local input; fix the call
+#   6  rate-limit  — 429; back off and retry later
+#   7  server      — 5xx, timeout, or unreachable; retry later
+EXIT_OK = 0
+EXIT_GENERIC = 1
+EXIT_USAGE = 2
+EXIT_AUTH = 3
+EXIT_NOT_FOUND = 4
+EXIT_VALIDATION = 5
+EXIT_RATE_LIMIT = 6
+EXIT_SERVER = 7
+
+
+def code_for_status(status: int) -> int:
+    """Map an HTTP failure status to the CLI's typed exit code.
+
+    Only failure statuses (>= 400) are meaningful. A status without a dedicated
+    class (e.g. 402, 409) falls through to EXIT_GENERIC, so the caller still
+    exits non-zero without inventing a class the contract doesn't define.
+    """
+    if status in (401, 403):
+        return EXIT_AUTH
+    if status == 404:
+        return EXIT_NOT_FOUND
+    if status == 429:
+        return EXIT_RATE_LIMIT
+    if status in (400, 422):
+        return EXIT_VALIDATION
+    if status >= 500:
+        return EXIT_SERVER
+    return EXIT_GENERIC
+
+
+def fail(code: int, msg: str) -> None:
+    """Print `msg` to stderr and exit with a typed code.
+
+    The single exit point for a classified failure, so the message and its code
+    always travel together and the taxonomy can't drift between call-sites.
+    """
+    err(msg)
+    sys.exit(code)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1352,9 +1440,10 @@ def _http_send(method: str, url: str, *, token: str | None, body: dict | None, t
             # with status 200). Surface a clean message rather than letting the
             # JSONDecodeError traceback escape.
             snippet = raw[:200].decode(errors="replace").strip()
-            sys.exit(
+            fail(
+                EXIT_SERVER,
                 f"{method} {url} → {resp.status} but the response was not JSON "
-                f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                f"({len(raw)} bytes; a proxy or login page?): {snippet}",
             )
 
 
@@ -1371,11 +1460,11 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
             if healed is not None:
                 return healed
         body_text = e.read().decode(errors="replace")
-        sys.exit(f"{method} {url} → {e.code}: {body_text}")
+        fail(code_for_status(e.code), f"{method} {url} → {e.code}: {body_text}")
     except (TimeoutError, socket.timeout):
-        sys.exit(f"{method} {url} timed out after {timeout}s (server slow or hung?).")
+        fail(EXIT_SERVER, f"{method} {url} timed out after {timeout}s (server slow or hung?).")
     except urllib.error.URLError as e:
-        sys.exit(f"{method} {url} failed (server reachable?): {e}")
+        fail(EXIT_SERVER, f"{method} {url} failed (server reachable?): {e}")
 
 
 def _deep_contains(obj, value: str) -> bool:
@@ -1490,9 +1579,10 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
                 # message rather than letting the JSONDecodeError traceback
                 # escape — mirrors http_request's handling of the same case.
                 snippet = raw[:200].decode(errors="replace").strip()
-                sys.exit(
+                fail(
+                    EXIT_SERVER,
                     f"{method} {url} → {resp.status} but the response was not JSON "
-                    f"({len(raw)} bytes; a proxy or login page?): {snippet}"
+                    f"({len(raw)} bytes; a proxy or login page?): {snippet}",
                 )
             return resp.status, (parsed if isinstance(parsed, dict) else {"result": parsed})
     except urllib.error.HTTPError as e:
@@ -1505,9 +1595,9 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
             parsed = {"error": parsed}
         return e.code, parsed
     except (TimeoutError, socket.timeout):
-        sys.exit(f"{method} {url} timed out after {timeout}s (server slow or hung?).")
+        fail(EXIT_SERVER, f"{method} {url} timed out after {timeout}s (server slow or hung?).")
     except urllib.error.URLError as e:
-        sys.exit(f"{method} {url} failed (server reachable?): {e}")
+        fail(EXIT_SERVER, f"{method} {url} failed (server reachable?): {e}")
 
 
 def write_request(method: str, url: str, *, token: str | None = None, body: dict | None = None, timeout: int = 60, allow_error: bool = False):
@@ -1550,9 +1640,9 @@ def http_fetch(url: str, *, token: str, timeout: int = 120) -> bytes:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
-        sys.exit(f"GET {url} → {e.code}: {e.read().decode(errors='replace')}")
+        fail(code_for_status(e.code), f"GET {url} → {e.code}: {e.read().decode(errors='replace')}")
     except urllib.error.URLError as e:
-        sys.exit(f"GET {url} failed (server reachable?): {e}")
+        fail(EXIT_SERVER, f"GET {url} failed (server reachable?): {e}")
 
 
 def http_download(url: str, *, token: str, output_path: Path) -> None:
@@ -3628,8 +3718,13 @@ def _runs_for_integration(runs: list, integration_id: str) -> list:
 def _latest_sync_run(creds: dict, integration_id: str):
     """The most recent sync run for an integration, or None — the one with the
     newest `updated_at` (so the result doesn't depend on the feed's order)."""
+    # Best-effort: a failure here must degrade to None silently, not smear the
+    # command's real output. The fetch can `fail()` (which prints via err()
+    # before exiting), so suppress its stderr — otherwise a caught SystemExit
+    # would still leak the error banner onto an otherwise-successful command.
     try:
-        matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
+        with contextlib.redirect_stderr(io.StringIO()):
+            matching = _runs_for_integration(_fetch_sync_runs(creds), integration_id)
     except SystemExit:
         return None
     return max(matching, key=lambda r: r.get("updated_at") or r.get("started_at") or "", default=None)
@@ -3724,9 +3819,17 @@ def _integrations_connect(args, creds: dict) -> int:
     opt_type = option.get("type") or "(unnamed)"
 
     if handler == "redirect":
-        if getattr(args, "no_input", False):
-            err(f"Connecting '{key}' via '{opt_type}' needs an interactive browser OAuth step, and --no-input was given.")
-            return 1
+        # A browser OAuth hand-off can't complete without an interactive
+        # terminal to send the caller to their browser. On a non-interactive
+        # stdin (a headless agent) there is no browser and no way to finish the
+        # authorization, so fail honestly instead of printing a URL and exiting
+        # 0 having connected nothing. --no-input forces the same refusal for a
+        # scripted run that happens to keep a TTY.
+        if getattr(args, "no_input", False) or not sys.stdin.isatty():
+            err(f"Connecting '{key}' via '{opt_type}' needs an interactive browser "
+                f"OAuth step, which can't run on a non-interactive terminal. Run it "
+                f"in an interactive terminal, or complete the connection in the dashboard.")
+            return EXIT_VALIDATION
         url = _browser_connect_url(creds, endpoint, fields.get("subdomain") or fields.get("identifier"))
         if _DRY_RUN:
             # This connect path hands off to a browser OAuth flow rather than
@@ -3759,7 +3862,7 @@ def _integrations_connect(args, creds: dict) -> int:
             err(f"Could not connect '{key}': {message}")
             if result.get("details"):
                 info(str(result["details"]))
-            return 1
+            return code_for_status(status)
         integration_id = result.get("integration_id") or result.get("id")
         identifier = result.get("identifier")
         suffix = (f" ({integration_id})" if integration_id else "") + (f" — {identifier}" if identifier else "")
@@ -3804,7 +3907,7 @@ def _integrations_sync(args, creds: dict) -> int:
     )
     if status >= 400:
         err(f"Could not trigger sync: {result.get('error') or result.get('message') or json.dumps(result)}")
-        return 1
+        return code_for_status(status)
     if result.get("skipped"):
         info(result.get("reason") or "A matching sync is already in progress.")
         return 0
@@ -4346,6 +4449,20 @@ def cmd_chat(args) -> int:
     if json_mode and not args.message:
         err("--json requires a message; the interactive REPL has no JSON form.")
         return 1
+
+    # With no message, `chat` drops into the interactive REPL. A headless agent
+    # with no piped input can't drive it: input() hits end-of-input at once, the
+    # REPL exits, and the agent is told the command succeeded having sent
+    # nothing. Refuse that silent no-op honestly and name the fix. But piped
+    # stdin (e.g. `echo "summarize this" | eesel chat`) IS a real message: the
+    # REPL's input() reads the line, sends it, prints the reply, and returns 0 on
+    # EOF — so only the genuinely-empty case (no message, no TTY, no pipe) is
+    # refused here. Checked before any agent lookup so the honest failure costs
+    # no network.
+    if not getattr(args, "message", None) and not sys.stdin.isatty() and not _stdin_has_piped_data():
+        err('eesel chat needs a message on a non-interactive terminal. '
+            'Pass one, e.g. eesel chat "your question".')
+        return EXIT_VALIDATION
     # `--agent` scopes this one chat to a specific agent (id, id-prefix, or
     # name), like the EESEL_AGENT env var but per-command. It is resolved in
     # memory and not persisted, so it never changes anything on disk. An
@@ -4712,8 +4829,12 @@ def resolve_task_id(creds: dict, target: str) -> str | None:
 
 def find_task_row(creds: dict, task_id: str) -> dict | None:
     """Best-effort lookup of a task's metadata row for the `show` header."""
+    # Silence the fetch's stderr: it can `fail()` (which prints before exiting),
+    # and this lookup must degrade to None quietly rather than leak an error
+    # banner over the `tasks show` header it's decorating.
     try:
-        rows, _, _ = fetch_tasks(creds, limit=200)
+        with contextlib.redirect_stderr(io.StringIO()):
+            rows, _, _ = fetch_tasks(creds, limit=200)
     except SystemExit:
         return None
     return next((r for r in rows if r.get("task_id") == task_id), None)
@@ -5666,13 +5787,29 @@ def cmd_files_read(args) -> int:
     # the raw target is not validated here, which would reject valid filenames.
     target = getattr(args, "target", None)
     creds = require_creds_scoped(args)
+    target = getattr(args, "target", None)
+
+    # No target means "open the picker". On an interactive terminal that's the
+    # arrow-key menu; with piped input (e.g. `echo 1 | eesel files read`) the
+    # numbered-select fallback reads the chosen index off stdin. Only when there
+    # is neither — no TTY and no piped stdin — is there genuinely no way to pick,
+    # so fail honestly and name the fix instead of printing "Cancelled." (nothing
+    # was cancelled — there was no terminal to choose from). Checked before any
+    # network call: otherwise a failure reaching the server would exit 7 ("retry
+    # later") for a call that can never succeed as invoked, however many times
+    # it's retried.
+    if not target and not sys.stdin.isatty() and not _stdin_has_piped_data():
+        err("eesel files read needs a file to read on a non-interactive "
+            "terminal. Name it, e.g. eesel files read <id|key|filename>.")
+        return EXIT_VALIDATION
+
     if not _scope_files_agent(creds, args):
         return 1
     fmt = (getattr(args, "format", None) or "md").lower()
     prefix = getattr(args, "prefix", None)
+    scope = f" under prefix '{prefix}'" if prefix else ""
 
     candidates = agent_documents(creds, prefix=prefix)
-    scope = f" under prefix '{prefix}'" if prefix else ""
     if not candidates:
         info(f"(no files{scope})")
         return 0
@@ -7041,9 +7178,16 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         p.add_argument("--option", help="Which connection option to use (its `type` from `eesel integrations available`); required when a connector has several")
         p.add_argument("--field", action="append", metavar="KEY=VALUE", help="A setup field for a `submit` connection option, e.g. `--field subdomain=acme` (repeatable)")
         p.add_argument("--agent", help="Agent id, id-prefix, or name to attribute the connection to (optional; integrations are a shared workspace pool)")
-        # Headless guard: fail instead of opening a browser for a redirect/OAuth
-        # option. Hidden — niche, for agent/CI runs that can't complete OAuth.
-        p.add_argument("--no-input", action="store_true", help=argparse.SUPPRESS)
+        # Headless guard: refuse a browser/OAuth (redirect) connect instead of
+        # opening a browser. A non-interactive terminal refuses automatically;
+        # this flag forces the same refusal on a run that still holds a TTY
+        # (e.g. a wrapper script), so a CI/agent path can opt in explicitly.
+        p.add_argument(
+            "--no-input",
+            action="store_true",
+            help="Refuse a browser/OAuth (redirect) connect instead of opening a browser "
+                 "(for scripted/CI runs; a non-interactive terminal already refuses).",
+        )
 
     i_connect = ig_sub.add_parser(
         "connect",
