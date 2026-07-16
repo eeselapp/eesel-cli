@@ -327,9 +327,10 @@ across many invocations.
 
 ## What's not here yet
 
-The dashboard does a few things the CLI doesn't cover yet — agent
-enable/disable, simulations, conversation transcripts, member management,
-knowledge articles, and more. [CATALOG.md](CATALOG.md) ranks them and records the
+The platform dashboard does a few things the CLI doesn't cover yet — configuring
+a source's sync scope, stopping/dismissing a sync, document search/share, egress
+policy, skill authoring, and the sensitive workspace writes (member management,
+billing, workspace delete). [CATALOG.md](CATALOG.md) ranks them and records the
 backend route behind each, so the next one can be added on demand.
 
 ## Uninstall
