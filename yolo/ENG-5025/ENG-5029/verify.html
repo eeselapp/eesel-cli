@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ENG-5029 verify — safe under an unattended agent</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#171a21; --card2:#1e222b; --line:#2b303b;
+    --ink:#e7eaf0; --dim:#9aa4b2; --accent:#7aa2f7;
+    --ok:#6bcB77; --warn:#e0af68; --bad:#f7768e; --human:#bb9af7;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7f9; --card:#fff; --card2:#f0f2f5; --line:#dde1e8;
+      --ink:#1a1d23; --dim:#5b6572; --accent:#3b5bdb; --ok:#2f9e44;
+      --warn:#b8860b; --bad:#d6336c; --human:#7048e8; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:920px;margin:0 auto;padding:32px 20px 80px}
+  h1{font-size:24px;margin:0 0 4px} h2{font-size:16px;margin:28px 0 10px}
+  .sub{color:var(--dim);font-size:13px;margin:0 0 20px}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .verdict{display:flex;gap:14px;align-items:flex-start}
+  .badge{font-weight:700;font-size:13px;padding:4px 10px;border-radius:999px;white-space:nowrap}
+  .badge.ok{background:rgba(107,203,119,.15);color:var(--ok);border:1px solid var(--ok)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+  .mini{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .mini h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+  ul{margin:6px 0;padding-left:18px} li{margin:3px 0}
+  code{background:var(--card2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  details{background:var(--card);border:1px solid var(--line);border-radius:12px;margin:12px 0;overflow:hidden}
+  summary{cursor:pointer;padding:14px 18px;font-weight:600;list-style:none;user-select:none}
+  summary::-webkit-details-marker{display:none}
+  summary:before{content:"▸ ";color:var(--dim)}
+  details[open] summary:before{content:"▾ "}
+  .body{padding:0 18px 16px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+  .pass{color:var(--ok);font-weight:700} .flag{color:var(--warn);font-weight:700}
+  .tag{font-size:11px;color:var(--dim);white-space:nowrap}
+  .human{background:rgba(187,154,247,.12);border:1px solid var(--human);border-radius:12px;padding:16px 20px;margin:14px 0}
+  .human h2{margin-top:0;color:var(--human)}
+  .chk{display:flex;gap:10px;align-items:flex-start;margin:8px 0}
+  .chk input{margin-top:4px}
+  .flow{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin:6px 0}
+  .col{flex:1;min-width:230px;border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--card2)}
+  .col h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .col.before h4{color:var(--bad)} .col.after h4{color:var(--ok)}
+  .col p{margin:6px 0;font-size:13px;color:var(--dim)}
+  .col b{color:var(--ink)}
+  .kv{font-size:13px} .kv b{color:var(--ink)}
+  .foot{color:var(--dim);font-size:12.5px;margin-top:6px}
+  .fx{color:var(--ok);font-weight:600} .fl{color:var(--warn);font-weight:600}
+  pre{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ENG-5029 — safe for an agent to drive the CLI unattended &amp; in parallel</h1>
+<p class="sub">P5 (the fifth build slice of ENG-5025) · repo <code>eeselapp/eesel-cli</code> · branch <code>kira/eng-5029-…parallel-safe-sessions</code> ·
+picks up from the <a href="https://github.com/eeselapp/docs-and-designs/blob/kira/eng-5025-kickoff-plan/yolo/ENG-5025/ENG-5029/plan.html">kickoff plan</a> — this checks that what it specified holds.</p>
+
+<h2>The problem this solves</h2>
+<div class="card">
+<p>The <code>eesel</code> CLI is now driven by AI agents — a customer's own Claude Code, and ours — often <b>several at once</b>, sometimes crashing and retrying, sometimes passing an id the model invented. Three behaviours were fine for one human at a terminal but bite an unattended, parallel driver:</p>
+<div class="flow">
+  <div class="col before">
+    <h4>Before — safe for one human</h4>
+    <p>Which conversation is "active" lives in <b>one</b> shared file (<code>current.json</code>, the pointer). Two parallel runs fight over it — one run's turn lands in the other's conversation.</p>
+    <p>Session files are written in place. A crash mid-write leaves a <b>truncated file</b>; the next read fails to parse it and the whole conversation is <b>silently lost</b>.</p>
+    <p>A hallucinated id (<code>../../workspaces/x</code>, control chars, <code>? # %</code>) flows <b>straight to the API</b>; every failure looks like exit&nbsp;1, so the agent can't tell "you sent garbage" from "the server broke".</p>
+  </div>
+  <div class="col after">
+    <h4>After — safe for an agent fleet</h4>
+    <p>An opt-in <code>EESEL_SESSION</code> env var pins a run to its own session — it reads and writes only that session and never touches the shared <code>current.json</code> pointer. (It mirrors the existing <code>EESEL_BASE_URL</code>, which pins a run's server target the same way.)</p>
+    <p>Every write is atomic (write a temp file, then rename it into place). A reader — or a crash — only ever sees a <b>complete</b> file. No conversation is dropped.</p>
+    <p>A malformed id is <b>rejected locally with exit&nbsp;5</b> and a message naming what was wrong, <b>before any network call</b>. Well-formed ids and keys are untouched.</p>
+  </div>
+</div>
+</div>
+
+<h2>Does it work?</h2>
+<div class="card verdict">
+  <span class="badge ok">YES</span>
+  <div>
+    <p style="margin:0 0 8px">All 14 acceptance criteria pass, exercised against the real <code>./eesel</code> binary (plus a mock backend for the chat path) by a panel of fresh-context reviewers who did not write the code. The panel also found <b>one redundant piece of machinery</b> (a file lock that guaranteed nothing the atomic rename didn't) — <b>removed</b> — and <b>one place where validation now accepts fewer values than before</b> that's worth a human's eye (see below).</p>
+    <p class="foot"><b>The single thing to look at:</b> validation now rejects an agent <i>name</i> or schedule <i>title</i> that contains <code>/ ? # %</code> — you'd have to target those by id instead. This is what the spec's rules ask for, but it's a real change for anyone whose agent is literally named e.g. <code>Sales/Support</code>. Details in "Needs a human".</p>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="mini"><h3>What changes for users</h3>
+    <ul>
+      <li><b>Agents (new):</b> per-run session isolation via <code>EESEL_SESSION</code>; distinct exit codes an agent can branch on.</li>
+      <li><b>Everyone:</b> a genuinely malformed id now fails locally with <b>exit&nbsp;5</b> instead of hitting the API and returning a server error.</li>
+      <li>Session/credentials files can no longer be corrupted by a crash or a race.</li>
+    </ul>
+  </div>
+  <div class="mini"><h3>What must not change (and didn't)</h3>
+    <ul>
+      <li>Plain interactive <code>eesel chat</code> keeps one sticky session across turns.</li>
+      <li><code>new</code> / <code>sessions use</code> / <code>list</code> / <code>show</code> still read &amp; repoint the pointer.</li>
+      <li>Well-formed ids and keys reach the API unchanged.</li>
+      <li><code>_redact_secrets</code> still masks token fields; its tests pass.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="human">
+  <h2>🙋 Needs a human (1)</h2>
+  <div class="chk"><input type="checkbox">
+    <div><b>Confirm it's OK that validation now accepts fewer values on the name/title commands.</b>
+    Several commands let you name a thing by its <b>human name or title</b> instead of its id — <code>agents &lt;name&gt; show</code>, <code>automations schedules fire &lt;title&gt;</code>, <code>mcp show &lt;name&gt;</code>. The new validation checks that typed value <i>before</i> looking it up, so a name/title containing <code>/ ? # %</code> is now rejected with exit&nbsp;5 — e.g. an agent named <code>Sales/Marketing</code> or a job titled <code>Q1 50%</code> can no longer be addressed by name (its id still works).
+    <br><br>Why it's shipped this way: the plan's coverage table (§4 — the list of CLI arguments that become part of an API URL) classes these as opaque ids, and criteria AC7/AC9 require rejecting traversal and <code>? # %</code> on id arguments. The typed name/title is matched inside the CLI and never itself becomes part of a URL (only the looked-up id does), so rejecting it there buys no extra safety — it's purely failing fast. <b>The call:</b> keep the strict rule as specified, or relax validation for the by-name lookups (accepting that AC9 is weaker there). I did not relax it unilaterally because it's a product decision the plan already made one way.
+    <br><b>Pass = </b> tick this box to accept it as-is, or open a follow-up to loosen the three by-name lookup commands.</div>
+  </div>
+</div>
+
+<details>
+<summary>🗺️ Footprint — what changed</summary>
+<div class="body">
+  <p><b>New public interface (review these — they're hard to change once agents rely on them):</b></p>
+  <table>
+    <tr><th>Surface</th><th>What</th><th>Contract</th></tr>
+    <tr><td><code>EESEL_SESSION</code> env var</td><td>Pins a run to one session id (the <code>sessions/&lt;id&gt;.json</code> stem)</td><td>A public name, mirrors <code>EESEL_BASE_URL</code>. Renaming later breaks agent config.</td></tr>
+    <tr><td>Exit codes</td><td><code>0</code> ok · <code>1</code> generic · <code>2</code> usage · <code>5</code> validation. <code>3</code>/<code>4</code>/<code>6</code>/<code>7</code> reserved, <b>not emitted yet</b> (P2 wires them).</td><td>Agents branch on these; the numbers are fixed once shipped.</td></tr>
+    <tr><td>Behaviour</td><td>Malformed id/key → exit 5 before any request</td><td>A script that fed garbage and parsed the server error now gets exit 5.</td></tr>
+  </table>
+  <p style="margin-top:14px"><b>New internal helpers:</b> <code>validate_id</code>, <code>validate_key</code>, <code>_atomic_write</code>, <code>_pinned_session_id</code>. No new files, no server change, no migration.</p>
+  <p><b>Diff shape</b> (3 files, ~591 insertions):</p>
+<pre>eesel          +243   validators, exit codes, atomic_write, pinning,
+                      validate_* at ~15 resolver/handler sites
+test_eesel.py  +298   48 new tests (validators, atomic/concurrent,
+                      pinning, exit-5-no-network end-to-end)
+README.md      +60    "Running under an agent" + "Security boundary"</pre>
+</div>
+</details>
+
+<details>
+<summary>✅ Acceptance criteria — 14 passed, 0 failed</summary>
+<div class="body">
+<table>
+  <tr><th>#</th><th></th><th>Criterion</th><th>How verified</th></tr>
+  <tr><td>1</td><td class="pass">PASS</td><td><code>EESEL_SESSION=alpha</code> chat uses session <code>alpha</code>, leaves <code>current.json</code> unchanged</td><td class="tag">ran live · md5 of current.json identical before/after</td></tr>
+  <tr><td>2</td><td class="pass">PASS</td><td>Two parallel pins (<code>alpha</code>/<code>beta</code>) don't cross-contaminate</td><td class="tag">ran live · each session held only its own turn</td></tr>
+  <tr><td>3</td><td class="pass">PASS</td><td><code>EESEL_SESSION=../creds</code> → exit 5, nothing written outside sessions/</td><td class="tag">ran live · exit 5, no network (also with backend down)</td></tr>
+  <tr><td>4</td><td class="pass">PASS</td><td>Under many concurrent/killed writes the file is always parseable JSON</td><td class="tag">ran live · 8 procs, a killed writer, ~18k reads → 0 torn</td></tr>
+  <tr><td>5</td><td class="pass">PASS</td><td>Plain chat (no env var) keeps one sticky session</td><td class="tag">ran live (mock backend) · two turns, same session id</td></tr>
+  <tr><td>6</td><td class="pass">PASS</td><td><code>new</code>/<code>sessions use</code>/<code>list</code>/<code>show</code> still repoint &amp; read the pointer</td><td class="tag">ran live</td></tr>
+  <tr><td>7</td><td class="pass">PASS</td><td>Id with <code>../</code> → exit 5, no network</td><td class="tag">ran live · verified across 8 namespaces, no socket opened</td></tr>
+  <tr><td>8</td><td class="pass">PASS</td><td>Id with control char (newline/NUL) → exit 5, no network</td><td class="tag">ran live (newline) + validator (NUL can't cross argv)</td></tr>
+  <tr><td>9</td><td class="pass">PASS</td><td>Id with <code>?</code> <code>#</code> <code>%</code> → exit 5, no network</td><td class="tag">ran live · message names the metacharacter</td></tr>
+  <tr><td>10</td><td class="pass">PASS</td><td><code>files/report.md</code> accepted &amp; reaches API; <code>files/../secret</code> &amp; leading <code>/</code> rejected</td><td class="tag">ran live · good key reaches network; bad key exit 5</td></tr>
+  <tr><td>11</td><td class="pass">PASS</td><td>Well-formed id and key run as before</td><td class="tag">ran live (mock backend) · <code>agents list</code> returned the mock agent</td></tr>
+  <tr><td>12</td><td class="pass">PASS</td><td>Rejection spans the §4 table, not just chat</td><td class="tag">ran live · agents+files+skills+integrations+mcp+automations</td></tr>
+  <tr><td>13</td><td class="pass">PASS</td><td>"Security boundary" section states ingested content is untrusted, defence is the agent's</td><td class="tag">read · README §"Security boundary — prompt injection"</td></tr>
+  <tr><td>14</td><td class="pass">PASS</td><td><code>_redact_secrets</code> unchanged; masking still works</td><td class="tag">pytest · 7 redact tests + full 738 pass</td></tr>
+</table>
+<p class="foot"><b>Proven by proxy, not observed directly (2 items, not defects):</b> (8) A raw NUL byte can't be passed through a Unix command line at all, so NUL rejection was proven by calling the validator directly (exit 5) rather than through the shell. (10) We confirmed a well-formed key like <code>files/report.md</code> is accepted and proceeds to the network (not rejected) — but we didn't catch the key inside an outgoing request URL, because the CLI first makes an unrelated agent-lookup call before it would use the key. AC10 only requires that the good key is accepted and reaches the network, which it does.</p>
+</div>
+</details>
+
+<details>
+<summary>🔍 Problems found — 4 fixed, 1 flagged for a human</summary>
+<div class="body">
+<p><b>1. <span class="fx">FIXED</span> — the file lock was redundant machinery.</b> The change originally took an <code>fcntl</code> advisory lock around each write. Two reviewers proved (8-process crash-stress, and again with locking forced off) that the atomic temp-write + <code>os.replace</code> with a unique temp name already guarantees no torn file — 0 failures either way. The lock wasn't held across the read-modify-write (load → append → 600s HTTP turn → save), so it prevented no lost update either; the plan itself accepts a benign last-writer-wins on the pointer. Meanwhile it <i>cost</i> an unbounded set of hidden <code>.lock</code> files that <code>delete_session</code> orphaned. Removed the lock and the <code>fcntl</code> import; kept <code>_atomic_write</code>. <span class="foot">This deviates from the plan's "under a short file lock" wording — it delivers the plan's actual guarantee (no dropped conversation) with fewer moving parts. Re-verified: crash-stress still 0 torn; no <code>.lock</code>/<code>.tmp</code> files left behind. Fixed in <code>b95b298</code>.</span></p>
+
+<p><b>2. <span class="fx">FIXED</span> — <code>EESEL_SESSION</code> was validated after a network call.</b> The pin was only checked inside <code>ensure_current_session</code>, which runs after the agent lookup. So a bad pin with the backend down exited 1 (after a wasted request) instead of 5. Now validated at the top of <code>cmd_chat</code>. <span class="foot">Re-verified live: <code>EESEL_SESSION=../creds</code> with an unreachable backend → exit 5, no network. Fixed in <code>b95b298</code>.</span></p>
+
+<p><b>3. <span class="fl">FLAGGED</span> — name/title matchers reject legit values with <code>/ ? # %</code>.</b> See "Needs a human" above. Still open on purpose: it's a product decision the plan already made (reject on id surfaces), and the affected values (a name/title carrying a URL metacharacter) are unusual, with the id as a working fallback. Not silently changed.</p>
+
+<p><b>4. <span class="fx">FIXED</span> — a failed <code>os.replace</code> could strand a temp file.</b> <code>_atomic_write</code> now unlinks the temp and re-raises on failure, so a failed write leaves the existing file intact and nothing behind. <span class="foot">Covered by a new unit test. Fixed in <code>b95b298</code>.</span></p>
+
+<p><b>5. <span class="fx">FIXED</span> — a ticket id in a README comment.</b> Removed. <span class="foot">Fixed in <code>b95b298</code>.</span></p>
+
+<h3 style="margin-top:18px;font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.03em">Safety squad</h3>
+<table>
+  <tr><td><b>Resilience</b></td><td class="pass">PASS</td><td>Crash mid-write never drops a conversation (proven). A failed write leaves the old file intact (fixed #4). The write never blocks on a lock across the HTTP turn (there is no lock).</td></tr>
+  <tr><td><b>Operational load</b></td><td class="pass">PASS</td><td>No new network calls; nothing serializes a fleet; no sidecar files accumulate anymore (lock removed).</td></tr>
+  <tr><td><b>Cost</b></td><td class="pass">PASS</td><td>All added code is local (env read, string checks, temp write + rename). Zero new per-invocation network cost.</td></tr>
+  <tr><td><b>Customer impact</b></td><td class="flag">WATCH</td><td>Interactive flow unchanged; no server/deployed-agent impact. The one behaviour change beyond the intended exit-5 improvement is the name/title narrowing (finding&nbsp;3).</td></tr>
+</table>
+</div>
+</details>
+
+<h2>Ask about this change</h2>
+<div class="card">
+<p class="foot">Paste into a fresh Claude Code session to dig in:</p>
+<pre>I'm reviewing ENG-5029 (P5 of ENG-5025) in eeselapp/eesel-cli — a single-file
+stdlib Python CLI (./eesel) now driven by AI agents. This piece: (1) opt-in
+EESEL_SESSION pins a run to one session so parallel `eesel chat` runs don't race
+current.json, plus atomic (temp + os.replace) session/creds writes so a crash
+can't drop a conversation; (2) validate every id/key that becomes an API URL
+path segment before any network call — reject ../ traversal, control chars, and
+? # % with a typed exit code 5; (3) a documented prompt-injection boundary in
+the README.
+
+Branch: kira/eng-5029-cli-p5-safe-under-an-unattended-agent-parallel-safe-sessions
+Plan:   docs-and-designs/yolo/ENG-5025/ENG-5029/plan.html
+Verify: eesel-cli/yolo/ENG-5025/ENG-5029/verify.html (this file)
+Session transcripts: eesel-ai-yolo-transcripts S3 bucket,
+  transcripts/eesel-cli/&lt;date&gt;/ (read creds in yolo-reader.env).
+
+Help me pressure-test: the removed file lock (is atomic os.replace + unique temp
+name really enough?), and the flagged name/title validation narrowing (should we
+relax validation for the human-name/title resolvers?).</pre>
+</div>
+
+</div>
+</body>
+</html>

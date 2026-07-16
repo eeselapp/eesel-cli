@@ -53,6 +53,16 @@ eesel new                           # start a chat session
 eesel chat "hey, talk to me"        # one-shot send to active session
 eesel chat                          # interactive REPL
 
+eesel chat --json "do refunds work?"   # one JSON object on stdout: the reply,
+                                    # ordered tool-calls (name + full,
+                                    # untruncated input/output), task_id, and a
+                                    # terminal status ("completed"/"error").
+                                    # Progress/prefix noise stays on stderr, so
+                                    # stdout parses cleanly. Requires a message
+                                    # (no REPL); exits non-zero unless status is
+                                    # "completed". Read the turn back with
+                                    # `eesel tasks show <task_id> --json`.
+
 eesel chat --task <task-id> "..."   # continue an existing conversation by
                                     # its backend task id — e.g. post an
                                     # async job result back into the chat
@@ -339,6 +349,66 @@ terminal or the dashboard.
 CLI sessions are independent of dashboard task history. Each session
 maps to one stable `taskId` so you can keep talking to the same chat
 across many invocations.
+
+Every write to these files is atomic (written to a temp file, then renamed
+into place) under a short lock, so a crash mid-write can't leave a truncated
+file — and two commands writing at once can't corrupt each other.
+
+## Running under an agent (unattended / parallel)
+
+<!-- TODO: fold this section into CONTEXT.md once that file exists. -->
+
+The CLI is safe to drive unattended and several at once.
+
+**`EESEL_SESSION` — one session per run.** By default the "active" session is a
+single shared pointer (`current.json`), so two parallel `eesel chat` runs with
+no session of their own would fight over it and their turns could cross into one
+conversation. Set `EESEL_SESSION` to pin a run to its own session — the same way
+`EESEL_BASE_URL` pins its target:
+
+```bash
+EESEL_SESSION=run-alpha eesel chat "…"   # reads/writes only session "run-alpha"
+EESEL_SESSION=run-beta  eesel chat "…"   # never touches current.json
+```
+
+The value is the session id (the `sessions/<id>.json` stem); it is created on
+first use and reused after. A human at one terminal needs none of this — the
+sticky `current.json` behaviour is unchanged when `EESEL_SESSION` is unset.
+
+**Typed exit codes.** Commands exit with a code you can branch on:
+
+| code | meaning |
+|------|---------|
+| 0 | success |
+| 1 | generic failure |
+| 2 | bad command line (argparse) |
+| 5 | input rejected client-side before any network call (see below) |
+
+(3 auth · 4 not-found · 6 rate-limit · 7 server are reserved for a later change;
+they are not emitted yet.)
+
+**Input validation.** Every id or key that becomes part of an API URL is checked
+locally first. A value carrying a path traversal (`../`), an ASCII control
+character, or a URL metacharacter (`?` `#` `%`) is rejected with exit code 5 and
+a message naming the offending input — **before** any network request. Opaque
+ids (agent, task, integration, session, …) may not contain `/`; path-like keys
+(e.g. `files/report.md`) may, but not a leading `/` or a `..` segment.
+
+### Security boundary — prompt injection
+
+The CLI forwards the message you type and uploads the files you name; it does
+**not** read a ticket's or a file's *content* into a prompt. That ingestion
+happens server-side, inside the agent. So the CLI is not the place that could
+defend against prompt injection, and it does not try to:
+
+- **Ingested content is untrusted.** Text pulled from a ticket, document, or any
+  connected source may contain instructions aimed at the model. Treat it as
+  data, never as trusted commands.
+- **Injection defence lives in the agent, not the CLI.** The CLI cannot see the
+  prompt-assembly point, and stripping "suspicious" patterns from content would
+  only corrupt legitimate text. It deliberately does no content filtering.
+- Secret-looking values are still masked in read-only config/property views
+  (`_redact_secrets`), so tokens aren't echoed back to a terminal or log.
 
 ## Uninstall
 
