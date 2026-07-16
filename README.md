@@ -325,6 +325,13 @@ CLI sessions are independent of dashboard task history. Each session
 maps to one stable `taskId` so you can keep talking to the same chat
 across many invocations.
 
+## What's not here yet
+
+The dashboard does a few things the CLI doesn't cover yet — agent
+enable/disable, simulations, conversation transcripts, member management,
+knowledge articles, and more. [CATALOG.md](CATALOG.md) ranks them and records the
+backend route behind each, so the next one can be added on demand.
+
 ## Uninstall
 
 ```bash

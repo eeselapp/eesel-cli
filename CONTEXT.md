@@ -38,6 +38,11 @@ enum `choices`), the handler that runs, and the API endpoint the command hits.
 It is walked live from the parser, so it can't drift from what the CLI actually
 accepts. **Trust it over `--help`.** Combine with `--fields` to trim it.
 
+If you need a capability the CLI doesn't have, don't assume it's impossible:
+[CATALOG.md](CATALOG.md) lists dashboard capabilities absent from the CLI, each
+with the backend route and whether it's buildable today — a map for adding the
+one command a task needs.
+
 ## Preview before you write
 
 Add `--dry-run` to any side effect to see what it would do — with **no call
