@@ -10307,6 +10307,7 @@ class TestLegacyIntegrationsCommand:
 
     def test_show_renders_config_entries(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
         monkeypatch.setattr(eesel, "fetch_connection",
                             lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"})
         monkeypatch.setattr(eesel, "fetch_connection_config",
@@ -10320,6 +10321,7 @@ class TestLegacyIntegrationsCommand:
     def test_show_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._legacy(monkeypatch)
         monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
         monkeypatch.setattr(eesel, "fetch_connection",
                             lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
         monkeypatch.setattr(eesel, "fetch_connection_config",
@@ -10331,6 +10333,7 @@ class TestLegacyIntegrationsCommand:
     def test_show_json_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._legacy(monkeypatch)
         monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
         monkeypatch.setattr(eesel, "fetch_connection",
                             lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
         monkeypatch.setattr(eesel, "fetch_connection_config",
@@ -10345,6 +10348,26 @@ class TestLegacyIntegrationsCommand:
         with pytest.raises(SystemExit) as exc:
             eesel.cmd_integrations(_parse("integrations", "sync", "zendesk"))
         assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_show_resolves_connection_id_prefix_to_full_id(self, tmp_config, fake_creds, monkeypatch):
+        # `integrations list` prints a truncated id; `show` must resolve that
+        # prefix to the full connectionId before hitting /connections/{id},
+        # else the id you see in the list 404s.
+        self._legacy(monkeypatch)
+        full = "08549cf9-16ab-4ce8-83a8-7b965dcfa54d"
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: [{"connectionId": full, "connectionType": "eesel", "connectionName": "Eesel"}])
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: seen.update(detail=cid) or {"connectionId": cid, "connectionType": "eesel"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: seen.update(cfg=cid) or [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9")) == 0
+        assert seen["detail"] == full and seen["cfg"] == full
+
+    def test_show_unknown_connection_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "show", "nope")) == 1
+        assert "no connection matches" in capsys.readouterr().err.lower()
 
 
 class TestLegacyTasksCommand:
