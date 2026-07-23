@@ -10315,3 +10315,82 @@ class TestLegacyIntegrationsCommand:
         with pytest.raises(SystemExit) as exc:
             eesel.cmd_integrations(_parse("integrations", "sync", "zendesk"))
         assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+class TestLegacyTasksCommand:
+    """`tasks` on legacy serves the bot's (namespace's) chat sessions."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"], "isOwner": True}]
+    SESSIONS = [
+        {"sessionId": "s1", "title": "Refund question", "lastUpdated": "2026-07-01", "resolution": "resolved", "aiCsat": 5},
+        {"sessionId": "s2", "title": "Where is my order"},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_list_shows_sessions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: self.SESSIONS)
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert "s1" in out and "Refund question" in out and "s2" in out
+
+    def test_list_passes_scope_and_limit(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: seen.update(nid=nid, **k) or [])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--limit", "10")) == 0
+        assert seen["nid"] == "ns-1" and seen["limit"] == 10
+
+    def test_list_json_emits_sessions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: self.SESSIONS)
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["s1", "s2"]
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        assert "no tasks" in capsys.readouterr().err.lower()
+
+    def test_show_renders_transcript(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "title": "Refund", "messages": [
+                {"userMessage": "Where is my refund?", "agentMessage": "It is processing."},
+            ]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        out = capsys.readouterr().out
+        assert "Where is my refund?" in out and "It is processing." in out
+
+    def test_show_truncates_without_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        long_msg = "x" * 500
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "messages": [{"userMessage": long_msg, "agentMessage": "ok"}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        assert long_msg not in capsys.readouterr().out  # truncated without --full
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--full")) == 0
+        assert long_msg in capsys.readouterr().out  # whole message with --full
+
+    def test_show_json_is_raw(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {"sessionId": "s1", "messages": []})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--json")) == 0
+        assert json.loads(capsys.readouterr().out)["sessionId"] == "s1"
+
+    def test_count_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_tasks(_parse("tasks", "count"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_export_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_tasks(_parse("tasks", "export"))
+        assert exc.value.code == eesel.EXIT_VALIDATION

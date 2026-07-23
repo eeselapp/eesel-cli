@@ -5362,8 +5362,96 @@ def render_task_analytics(data: dict) -> None:
             print(f"  {count or 0:>6}  {name}")
 
 
+def _render_legacy_turn(turn: dict, *, full: bool = False) -> None:
+    """Render one legacy session turn: the user's message then the agent's.
+
+    Long bodies are truncated unless `full`, mirroring the new-platform
+    `tasks show` (which caps tool args/output at 200 chars)."""
+    def body(text: str) -> str:
+        return text if full else text[:200]
+
+    user = turn.get("userMessage")
+    agent = turn.get("agentMessage")
+    if user:
+        print(f"\n{_color('you', '33')}:")
+        print(body(user))
+    if agent:
+        print(f"\n{_color('eesel', '36')}:")
+        print(body(agent))
+
+
+def _legacy_sessions_list(args, creds: dict) -> int:
+    """`tasks list` on legacy: the bot's (namespace's) chat sessions."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
+    if not ns:
+        return 1
+    sessions = fetch_sessions(
+        creds, ns["id"],
+        limit=getattr(args, "limit", None) or 50,
+        search=getattr(args, "search", None),
+    )
+    if _want_json(args):
+        emit(sessions)
+        return 0
+    if not sessions:
+        info("(no tasks)")
+        return 0
+    for s in sessions:
+        # Defensive .get everywhere — a session may omit any of these fields.
+        parts = [str(s.get("sessionId") or "?")[:16]]
+        if s.get("title"):
+            parts.append(str(s.get("title")))
+        if s.get("lastUpdated"):
+            parts.append(str(s.get("lastUpdated")))
+        if s.get("resolution"):
+            parts.append(str(s.get("resolution")))
+        if s.get("aiCsat") is not None:
+            parts.append(f"csat={s.get('aiCsat')}")
+        print(" " + "  ".join(parts))
+    return 0
+
+
+def _legacy_session_show(args, creds: dict) -> int:
+    """`tasks show <session-id>` on legacy: one session's transcript."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
+    if not ns:
+        return 1
+    session = fetch_session(creds, ns["id"], args.task_id)
+    if _want_json(args):
+        emit(session)
+        return 0
+    sid = session.get("sessionId") or args.task_id
+    print(f"# session {sid}")
+    if session.get("title"):
+        print(f"# {session.get('title')}")
+    messages = session.get("messages") or []
+    if not messages:
+        info("(no messages)")
+        return 0
+    for m in messages:
+        _render_legacy_turn(m, full=getattr(args, "full", False))
+    return 0
+
+
+def _tasks_legacy(args, creds: dict) -> int:
+    """Dispatch the `tasks` verbs on a legacy workspace (read-only).
+
+    Legacy tasks are the bot's chat sessions: `list` shows recent sessions,
+    `show <session-id>` prints one session's transcript. count/analytics/export/
+    cost have no v2 analogue and are refused (the guard catches them first; this
+    fails closed if one reaches here)."""
+    sub = getattr(args, "tasks_cmd", None) or "list"
+    if sub == "list":
+        return _legacy_sessions_list(args, creds)
+    if sub == "show":
+        return _legacy_session_show(args, creds)
+    return _legacy_unsupported(f"tasks {sub}")
+
+
 def cmd_tasks(args) -> int:
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _tasks_legacy(args, creds)
     sub = getattr(args, "tasks_cmd", None) or "list"
 
     if sub == "analytics":
