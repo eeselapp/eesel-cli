@@ -68,6 +68,18 @@ you a secret exists without exposing it.
 
 Check who you are with `eesel whoami`.
 
+## Platform (new vs legacy v2)
+
+The CLI serves two backends and auto-detects which one the workspace is on
+(cached; `eesel whoami` shows it). Same commands either way. On the **legacy
+v2** platform the CLI is **read-only**: only `agents list`/`show`,
+`instructions`, `integrations list`/`show`, `tasks list`/`show`, `workspace
+show`/`members`, and the universal commands (`login`/`logout`/`whoami`/`link`/
+`schema`) work — everything else is refused with exit code `5`, and `--help` is
+trimmed to those. Force the platform for one command with `--legacy` or
+`--platform` (mutually exclusive). `eesel schema` marks each command with a
+`legacy_supported` flag, so check there before calling on a legacy workspace.
+
 ## Exit codes
 
 `0` = success · `2` = usage error (bad flags/arguments, from the parser) ·
