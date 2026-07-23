@@ -10394,3 +10394,94 @@ class TestLegacyTasksCommand:
         with pytest.raises(SystemExit) as exc:
             eesel.cmd_tasks(_parse("tasks", "export"))
         assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+class TestLegacySupportsClassification:
+    """`legacy_supports(args)` is the single source of truth for which commands
+    have a read-only meaning on the legacy v2 platform."""
+
+    @pytest.mark.parametrize("argv", [
+        ("agents", "list"), ("agents", "show", "ns-1"),
+        ("integrations", "list"), ("integrations", "show", "c1"),
+        ("tasks", "list"), ("tasks", "show", "s1"),
+        ("workspace", "show"), ("workspace", "members"),
+        ("instructions",), ("whoami",), ("login",), ("logout",),
+        ("link", "https://x.preprod.eesel.xyz"), ("schema",),
+    ])
+    def test_supported(self, argv):
+        assert eesel.legacy_supports(_parse(*argv)) is True
+
+    @pytest.mark.parametrize("argv", [
+        ("agents", "create", "--name", "x"), ("agents", "set", "ns-1", "--name", "y"),
+        ("agents", "remove", "ns-1", "-f"),
+        ("integrations", "sync", "zendesk"), ("integrations", "remove", "c1", "-f"),
+        ("tasks", "count"), ("tasks", "analytics"), ("tasks", "export"),
+        ("workspace", "extend-trial"),
+        ("files", "list"), ("skills", "list", "a"), ("mcp", "list"),
+        ("chat", "hi"), ("new",), ("billing", "show"),
+    ])
+    def test_unsupported(self, argv):
+        assert eesel.legacy_supports(_parse(*argv)) is False
+
+    def test_bare_agents_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("agents")) is True
+
+    def test_bare_workspace_defaults_to_show_supported(self):
+        assert eesel.legacy_supports(_parse("workspace")) is True
+
+    def test_bare_tasks_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("tasks")) is True
+
+    def test_bare_integrations_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("integrations")) is True
+
+
+class TestGuardPlatformCommand:
+    """`_guard_platform_command` refuses unsupported commands on legacy before
+    any handler runs, and stays out of the way otherwise."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+
+    def _platform(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "platform")
+
+    def test_refuses_unsupported_on_legacy(self, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel._guard_platform_command(_parse("files", "list"), fake_creds)
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_allows_supported_on_legacy_without_resolving(self, fake_creds, monkeypatch):
+        # A supported command returns before touching resolve_platform.
+        def boom(*a, **k):
+            raise AssertionError("supported commands must not resolve the platform")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("agents", "list"), fake_creds) is None
+
+    def test_noop_on_new_platform(self, fake_creds, monkeypatch):
+        self._platform(monkeypatch)
+        assert eesel._guard_platform_command(_parse("files", "list"), fake_creds) is None
+
+    def test_no_creds_no_flag_is_noop_without_network(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("must not resolve platform without creds or a flag")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("files", "list"), None) is None
+
+    def test_message_names_the_command(self, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit):
+            eesel._guard_platform_command(_parse("tasks", "count"), fake_creds)
+        assert "tasks count" in capsys.readouterr().err
+
+    def test_end_to_end_through_main_refuses(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["files", "list"])
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_end_to_end_through_main_allows_supported(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [])
+        assert eesel.main(["agents", "list"]) == 0

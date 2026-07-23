@@ -778,6 +778,74 @@ def resolve_platform(creds: dict, args=None) -> str:
     return detected
 
 
+# Which commands have a read-only meaning on the legacy v2 platform. Everything
+# else is refused there — the platform is read-only, and most nouns have no v2
+# analogue. This is the SINGLE source of truth, shared by the pre-dispatch guard
+# (`_guard_platform_command`), the `--help` trimming (`build_parser`), and the
+# `eesel schema` annotation (`_serialize_parser`).
+_LEGACY_UNIVERSAL = frozenset({"login", "logout", "whoami", "link", "schema"})
+# noun → the subcommands supported on legacy (None ⇒ the whole noun is supported).
+_LEGACY_SUPPORTED_SUBS = {
+    "agents": frozenset({"list", "show"}),
+    "instructions": None,
+    "integrations": frozenset({"list", "show"}),
+    "tasks": frozenset({"list", "show"}),
+    "workspace": frozenset({"show", "members"}),
+}
+# The subcommand a bare `eesel <noun>` resolves to, mirroring each handler's
+# `sub = ... or "..."`, so a group invoked with no verb is classified by default.
+_LEGACY_DEFAULT_SUB = {
+    "agents": "list", "integrations": "list", "tasks": "list", "workspace": "show",
+}
+# Where each noun's chosen subcommand is stored on the parsed args namespace.
+_LEGACY_SUB_DEST = {
+    "agents": "agents_cmd", "integrations": "integrations_cmd",
+    "tasks": "tasks_cmd", "workspace": "workspace_cmd",
+}
+
+
+def _legacy_supports_cmd(cmd: str | None, sub: str | None) -> bool:
+    """Whether `<cmd> [sub]` is available on the legacy v2 platform."""
+    if cmd in _LEGACY_UNIVERSAL:
+        return True
+    if cmd not in _LEGACY_SUPPORTED_SUBS:
+        return False
+    subs = _LEGACY_SUPPORTED_SUBS[cmd]
+    return True if subs is None else sub in subs
+
+
+def legacy_supports(args) -> bool:
+    """The single classifier: does the parsed command work on legacy? Keyed on
+    the command plus its resolved subcommand (a bare noun uses its default)."""
+    cmd = getattr(args, "cmd", None)
+    dest = _LEGACY_SUB_DEST.get(cmd)
+    sub = getattr(args, dest, None) if dest else None
+    if sub is None:
+        sub = _LEGACY_DEFAULT_SUB.get(cmd)
+    return _legacy_supports_cmd(cmd, sub)
+
+
+def _legacy_supports_path(path: tuple) -> bool:
+    """`legacy_supports` for a schema command path, e.g. ('agents','create')."""
+    if not path:
+        return False
+    cmd = path[0]
+    sub = path[1] if len(path) > 1 else _LEGACY_DEFAULT_SUB.get(cmd)
+    return _legacy_supports_cmd(cmd, sub)
+
+
+def _command_label(args) -> str:
+    """A human label for the current command (e.g. 'agents create') for the
+    guard's refusal message. Includes the resolved subcommand when the noun
+    tracks one, matching the inline `_legacy_unsupported` fallbacks."""
+    cmd = getattr(args, "cmd", None) or "?"
+    dest = _LEGACY_SUB_DEST.get(cmd)
+    sub = getattr(args, dest, None) if dest else None
+    if sub is None:
+        sub = _LEGACY_DEFAULT_SUB.get(cmd)
+    return f"{cmd} {sub}" if sub else cmd
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Per-worktree branch-env link (`eesel link`)
 # ──────────────────────────────────────────────────────────────────────────
@@ -8444,6 +8512,27 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
         _refuse_impersonated_write()
 
 
+def _guard_platform_command(args, creds: dict | None) -> None:
+    """Before dispatch on a legacy v2 workspace: refuse any command that has no
+    read-only meaning there, client-side, before any handler runs. Mirrors
+    `_guard_impersonated_command`.
+
+    A command that works on legacy is fine on either platform, so it returns at
+    once — before resolving the platform — which keeps the common path free of
+    any probe. Only an unsupported command needs to know the platform, and even
+    then it makes NO network call beyond `resolve_platform` (which is flag- and
+    cache-first). With no stored creds and no explicit `--legacy` there is
+    nothing to resolve offline, so it defers to the handler's require_creds()."""
+    if legacy_supports(args):
+        return
+    if not creds and not getattr(args, "legacy", False):
+        return
+    if resolve_platform(creds, args) != PLATFORM_LEGACY:
+        return
+    fail(EXIT_VALIDATION,
+         f"'{_command_label(args)}' is not available on the legacy (v2) platform (read-only).")
+
+
 def main(argv: list[str] | None = None) -> int:
     # Surface staff-only commands only for global impersonators. Read from the
     # cached creds flag (populated at login / refreshed by `whoami`) so this
@@ -8472,6 +8561,7 @@ def main(argv: list[str] | None = None) -> int:
     args.platform = bool(getattr(args, "platform", False)) or global_flags["platform"]
     _configure_output(args, global_flags, creds)
     _guard_impersonated_command(args, creds)
+    _guard_platform_command(args, creds)
     return args.func(args)
 
 
