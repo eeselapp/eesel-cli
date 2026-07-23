@@ -9788,6 +9788,10 @@ class TestSchema:
         for key, value in eesel._COMMAND_ENDPOINTS.items():
             if key in unverifiable:
                 continue
+            # An entry may document the legacy v2 endpoint after " · legacy: ";
+            # verify the primary (new-platform) clause here — the legacy fetch_*
+            # helpers have their own dedicated URL tests.
+            value = value.split(" · legacy: ")[0]
             method, path = value.split(" ", 1)
             if path.endswith("/*"):
                 # Wildcard family (e.g. billing → GET /subscription/*): satisfied
@@ -9809,6 +9813,32 @@ class TestSchema:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["prog"] == "eesel"
         assert "agents" in parsed["subcommands"]
+
+    def test_legacy_supported_annotated(self):
+        s = self._schema()
+        agents = s["subcommands"]["agents"]["subcommands"]
+        assert agents["list"]["legacy_supported"] is True
+        assert agents["show"]["legacy_supported"] is True
+        assert agents["create"]["legacy_supported"] is False
+        assert agents["remove"]["legacy_supported"] is False
+        tasks = s["subcommands"]["tasks"]["subcommands"]
+        assert tasks["show"]["legacy_supported"] is True
+        assert tasks["count"]["legacy_supported"] is False
+        integ = s["subcommands"]["integrations"]["subcommands"]
+        assert integ["show"]["legacy_supported"] is True
+        assert integ["available"]["legacy_supported"] is False
+        ws = s["subcommands"]["workspace"]["subcommands"]
+        assert ws["members"]["legacy_supported"] is True
+        assert ws["set"]["legacy_supported"] is False
+        # Wholly-unsupported nouns and universal commands.
+        assert s["subcommands"]["files"]["legacy_supported"] is False
+        assert s["subcommands"]["schema"]["legacy_supported"] is True
+
+    def test_legacy_endpoint_documented(self):
+        s = self._schema()
+        assert "legacy: GET /namespaces" in s["subcommands"]["agents"]["subcommands"]["list"]["endpoint"]
+        assert "legacy:" in s["subcommands"]["integrations"]["subcommands"]["list"]["endpoint"]
+        assert "legacy:" in s["subcommands"]["tasks"]["subcommands"]["show"]["endpoint"]
 
 
 class TestOutputContractThroughMain:

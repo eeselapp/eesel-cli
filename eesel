@@ -7358,8 +7358,8 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
 # `{id}` marks a path segment resolved at runtime. Commands with no single
 # stable endpoint (login/logout/whoami/link/chat/mcp call) are omitted.
 _COMMAND_ENDPOINTS = {
-    "agents.list": "GET /agents",
-    "agents.show": "GET /agents",
+    "agents.list": "GET /agents · legacy: GET /namespaces",
+    "agents.show": "GET /agents · legacy: GET /namespaces",
     "agents.create": "POST /agents",
     "agents.set": "PUT /agents/{id}",
     "agents.remove": "DELETE /agents/{id}",
@@ -7372,9 +7372,9 @@ _COMMAND_ENDPOINTS = {
     "automations.schedules.add": "POST /agents/{id}/triggers",
     "automations.schedules.remove": "DELETE /triggers/{id}",
     "automations.schedules.fire": "POST /triggers/{id}/fire",
-    "integrations.list": "GET /integrations",
+    "integrations.list": "GET /integrations · legacy: GET /namespaces/{id}/connections",
     "integrations.available": "GET /integration-definitions",
-    "integrations.show": "GET /integrations",
+    "integrations.show": "GET /integrations · legacy: GET /connections/{id}",
     "integrations.connect": "POST /integrations/{key}/{option}",
     "integrations.sync": "POST /integrations/{id}/trigger-sync",
     "integrations.sync-status": "GET /v2/sync-runs",
@@ -7414,13 +7414,13 @@ _COMMAND_ENDPOINTS = {
     "settings.notifications.enable": "PATCH /agents/{id}/notification-settings",
     "settings.notifications.disable": "PATCH /agents/{id}/notification-settings",
     "settings.notifications.set": "PATCH /agents/{id}/notification-settings",
-    "tasks.list": "POST /workspace/tasks",
+    "tasks.list": "POST /workspace/tasks · legacy: GET /v2/namespaces/{id}/sessions",
     "tasks.count": "POST /workspace/tasks",
-    "tasks.show": "POST /workspace/tasks",
+    "tasks.show": "POST /workspace/tasks · legacy: GET /v2/namespaces/{id}/sessions/{sessionId}",
     "tasks.analytics": "POST /workspace/tasks/analytics",
     "tasks.export": "POST /tasks/export",
     "mcp.token": "POST /workspaces/token",
-    "instructions": "GET /agents",
+    "instructions": "GET /agents · legacy: GET /connections/{id}/configuration",
     "billing.show": "GET /subscription/*",
     "billing.list": "GET /subscription/*",
 }
@@ -7490,6 +7490,10 @@ def _serialize_parser(parser, path: tuple = (), inherited_handler=None) -> dict:
     key = ".".join(path)
     if key in _COMMAND_ENDPOINTS:
         node["endpoint"] = _COMMAND_ENDPOINTS[key]
+    # Every command node says whether it works on the legacy v2 platform, so an
+    # agent can discover the read-only surface without trial and error.
+    if path:
+        node["legacy_supported"] = _legacy_supports_path(path)
     if flags:
         node["flags"] = flags
     if positionals:
