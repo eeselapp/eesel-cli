@@ -10018,3 +10018,132 @@ class TestPlatformFlags:
         with pytest.raises(SystemExit) as exc:
             eesel.main(["agents", "list", "--legacy", "--platform"])
         assert exc.value.code == eesel.EXIT_USAGE
+
+
+class TestNamespaceResolve:
+    """Legacy namespaces (bots): fetch + resolve by id / id-prefix / name,
+    mirroring the agent resolver."""
+
+    NS = [
+        {"id": "ns-abc123", "namespace": "Support Bot", "connections": ["c1", "c2"], "isOwner": True},
+        {"id": "ns-def456", "namespace": "Sales Bot", "connections": [], "isOwner": True},
+    ]
+
+    def test_fetch_reads_namespaces_key(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"namespaces": self.NS})
+        assert eesel.fetch_namespaces(fake_creds) == self.NS
+
+    def test_fetch_accepts_bare_list(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: self.NS)
+        assert eesel.fetch_namespaces(fake_creds) == self.NS
+
+    def test_fetch_hits_namespaces_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(method=method, url=url) or {"namespaces": []})
+        eesel.fetch_namespaces(fake_creds)
+        assert seen["method"] == "GET" and seen["url"].endswith("/namespaces")
+
+    def test_resolve_by_exact_id(self):
+        assert eesel.resolve_namespace(self.NS, "ns-abc123")["namespace"] == "Support Bot"
+
+    def test_resolve_by_id_prefix(self):
+        assert eesel.resolve_namespace(self.NS, "ns-abc")["id"] == "ns-abc123"
+
+    def test_resolve_by_name(self):
+        assert eesel.resolve_namespace(self.NS, "Sales Bot")["id"] == "ns-def456"
+
+    def test_blank_target_matches_nothing(self):
+        assert eesel.resolve_namespace(self.NS, "  ") is None
+
+    def test_strict_unique(self):
+        one, cands = eesel.resolve_namespace_strict(self.NS, "ns-abc123")
+        assert one["id"] == "ns-abc123" and cands == []
+
+    def test_strict_ambiguous_returns_candidates(self):
+        dupes = [{"id": "a", "namespace": "Dup"}, {"id": "b", "namespace": "Dup"}]
+        one, cands = eesel.resolve_namespace_strict(dupes, "Dup")
+        assert one is None and len(cands) == 2
+
+
+class TestLegacyConnectionsData:
+    CONNS = [
+        {"connectionId": "c1", "connectionType": "eesel", "connectionName": "eesel core"},
+        {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"},
+    ]
+
+    def test_fetch_connections_hits_namespace_scoped_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or self.CONNS)
+        assert eesel.fetch_namespace_connections(fake_creds, "ns-1") == self.CONNS
+        assert seen["url"].endswith("/namespaces/ns-1/connections")
+
+    def test_fetch_connections_reads_connections_key(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"connections": self.CONNS})
+        assert eesel.fetch_namespace_connections(fake_creds, "ns-1") == self.CONNS
+
+    def test_fetch_connection_config_returns_entries(self, fake_creds, monkeypatch):
+        entries = [{"name": "customPrompt", "value": "Be nice"}]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"configurationEntries": entries})
+        assert eesel.fetch_connection_config(fake_creds, "c1") == entries
+
+    def test_fetch_connection_config_passes_params(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"configurationEntries": []})
+        eesel.fetch_connection_config(fake_creds, "c1", params="customPrompt")
+        assert "params=customPrompt" in seen["url"]
+
+    def test_get_namespace_prompt_reads_eesel_customprompt(self, fake_creds, monkeypatch):
+        def fake(method, url, **k):
+            if url.endswith("/connections"):
+                return self.CONNS
+            if "/connections/c1/configuration" in url:
+                return {"configurationEntries": [{"name": "customPrompt", "value": "You are helpful."}]}
+            return {}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        assert eesel.get_namespace_prompt(fake_creds, "ns-1") == "You are helpful."
+
+    def test_get_namespace_prompt_empty_when_no_eesel_connection(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "http_request",
+            lambda method, url, **k: [{"connectionId": "c2", "connectionType": "zendesk"}] if url.endswith("/connections") else {},
+        )
+        assert eesel.get_namespace_prompt(fake_creds, "ns-1") == ""
+
+
+class TestLegacySessionsData:
+    def test_fetch_session_hits_scoped_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"sessionId": "s1", "messages": []})
+        eesel.fetch_session(fake_creds, "ns-1", "s1")
+        assert seen["url"].endswith("/v2/namespaces/ns-1/sessions/s1")
+
+    def test_fetch_sessions_follows_cursor_to_fill_limit(self, fake_creds, monkeypatch):
+        pages = [
+            {"sessions": [{"sessionId": "s1"}, {"sessionId": "s2"}], "lastEvaluatedKey": "k1"},
+            {"sessions": [{"sessionId": "s3"}], "lastEvaluatedKey": None},
+        ]
+        calls = []
+
+        def fake(method, url, **k):
+            calls.append(url)
+            return pages[len(calls) - 1]
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        got = eesel.fetch_sessions(fake_creds, "ns-1", limit=10)
+        assert [s["sessionId"] for s in got] == ["s1", "s2", "s3"]
+        assert len(calls) == 2  # followed the cursor exactly once
+
+    def test_fetch_sessions_stops_at_limit(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "http_request",
+            lambda method, url, **k: {"sessions": [{"sessionId": "a"}, {"sessionId": "b"}, {"sessionId": "c"}], "lastEvaluatedKey": "more"},
+        )
+        got = eesel.fetch_sessions(fake_creds, "ns-1", limit=2)
+        assert len(got) == 2
+
+    def test_fetch_sessions_passes_search(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"sessions": [], "lastEvaluatedKey": None})
+        eesel.fetch_sessions(fake_creds, "ns-1", limit=5, search="refund")
+        assert "search=refund" in seen["url"]

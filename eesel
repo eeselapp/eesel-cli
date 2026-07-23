@@ -1926,6 +1926,148 @@ def fetch_agents(creds: dict) -> list[dict]:
     return items
 
 
+# ── Legacy v2 namespaces (bots) ───────────────────────────────────────────
+# The legacy platform's unit is a "namespace" (user-facing "bot"), addressed by
+# `id`, with a display name in the `namespace` field. These mirror the agent
+# resolvers so the same --agent/EESEL_AGENT scoping resolves a bot in legacy mode.
+
+
+def fetch_namespaces(creds: dict) -> list[dict]:
+    """Return the workspace's legacy v2 namespaces from GET /namespaces.
+
+    The endpoint is user-scoped (resolved from the token), so no query param.
+    Response is `{namespaces: [...]}`; a bare list is tolerated.
+    """
+    data = http_request("GET", f"{creds['api_url']}/namespaces", token=creds.get("token"))
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("namespaces") or data.get("items") or []
+    return []
+
+
+def match_namespaces(namespaces: list[dict], target: str) -> list[dict]:
+    """Namespaces matching `target`, in resolution-priority order: exact id,
+    then id-prefix, then exact `namespace` (name). A blank target matches
+    nothing (so it can't resolve as a lone match on a single-bot workspace).
+    Mirrors `match_agents`."""
+    if not (target or "").strip():
+        return []
+    exact_id = [n for n in namespaces if n.get("id") == target]
+    if exact_id:
+        return exact_id
+    prefix = [n for n in namespaces if (n.get("id") or "").startswith(target)]
+    name = [n for n in namespaces if n.get("namespace") == target and n not in prefix]
+    return prefix + name
+
+
+def resolve_namespace(namespaces: list[dict], target: str) -> dict | None:
+    """First namespace matching `target`, or None (first-match; arbitrary
+    tie-break). Use `resolve_namespace_strict` where ambiguity must be refused."""
+    matches = match_namespaces(namespaces, target)
+    return matches[0] if matches else None
+
+
+def resolve_namespace_strict(namespaces: list[dict], target: str) -> tuple[dict | None, list[dict]]:
+    """Resolve `target` to exactly one namespace. Returns (ns, []) on a unique
+    match, (None, candidates) when more than one matches, (None, []) when none."""
+    matches = match_namespaces(namespaces, target)
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+# ── Legacy v2 connections + configuration ─────────────────────────────────
+# Legacy "connections" are the v2 equivalent of integrations. The system prompt
+# is NOT a namespace field — it's a config entry named `customPrompt` on the
+# connection whose type is `eesel`.
+CONNECTION_TYPE_EESEL = "eesel"
+CONNECTION_CONFIG_CUSTOM_PROMPT = "customPrompt"
+
+
+def fetch_namespace_connections(creds: dict, namespace_id: str) -> list[dict]:
+    """A namespace's connections from GET /namespaces/{id}/connections."""
+    nid = validate_id(namespace_id, "namespace id")
+    data = http_request("GET", f"{creds['api_url']}/namespaces/{nid}/connections", token=creds.get("token"))
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("connections") or []
+    return []
+
+
+def fetch_connection(creds: dict, connection_id: str) -> dict:
+    """One connection's detail from GET /connections/{id}."""
+    cid = validate_id(connection_id, "connection id")
+    data = http_request("GET", f"{creds['api_url']}/connections/{cid}", token=creds.get("token"))
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def fetch_connection_config(creds: dict, connection_id: str, params: str | None = None) -> list[dict]:
+    """A connection's configuration entries from GET
+    /connections/{id}/configuration. `params` optionally filters to
+    comma-separated entry names (e.g. "customPrompt"). Returns the
+    `configurationEntries` list."""
+    cid = validate_id(connection_id, "connection id")
+    url = f"{creds['api_url']}/connections/{cid}/configuration"
+    if params:
+        url += "?" + urllib.parse.urlencode({"params": params})
+    data = http_request("GET", url, token=creds.get("token"))
+    if isinstance(data, dict):
+        return data.get("configurationEntries") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def get_namespace_prompt(creds: dict, namespace_id: str) -> str:
+    """The namespace's system prompt: the `customPrompt` config entry on its
+    `eesel` connection. Empty string when there's no eesel connection or no
+    customPrompt entry (a clean 'no prompt set')."""
+    conns = fetch_namespace_connections(creds, namespace_id)
+    eesel_conn = next((c for c in conns if c.get("connectionType") == CONNECTION_TYPE_EESEL), None)
+    if not eesel_conn:
+        return ""
+    entries = fetch_connection_config(creds, eesel_conn.get("connectionId"), params=CONNECTION_CONFIG_CUSTOM_PROMPT)
+    entry = next((e for e in entries if e.get("name") == CONNECTION_CONFIG_CUSTOM_PROMPT), None)
+    return (entry.get("value") if entry else "") or ""
+
+
+# ── Legacy v2 chat history (sessions) ─────────────────────────────────────
+
+
+def fetch_session(creds: dict, namespace_id: str, session_id: str) -> dict:
+    """One conversation's full transcript from
+    GET /v2/namespaces/{id}/sessions/{sessionId}."""
+    nid = validate_id(namespace_id, "namespace id")
+    sid = validate_id(session_id, "session id")
+    data = http_request("GET", f"{creds['api_url']}/v2/namespaces/{nid}/sessions/{sid}", token=creds.get("token"))
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def fetch_sessions(creds: dict, namespace_id: str, *, limit: int = 50, search: str | None = None) -> list[dict]:
+    """List chat sessions from GET /v2/namespaces/{id}/sessions, following the
+    opaque `lastEvaluatedKey` cursor internally until `limit` rows are gathered
+    (or the source is exhausted)."""
+    nid = validate_id(namespace_id, "namespace id")
+    base = f"{creds['api_url']}/v2/namespaces/{nid}/sessions"
+    out: list[dict] = []
+    cursor: str | None = None
+    while len(out) < limit:
+        params: dict = {"limit": limit}
+        if search:
+            params["search"] = search
+        if cursor:
+            params["lastEvaluatedKey"] = cursor
+        data = http_request("GET", f"{base}?{urllib.parse.urlencode(params)}", token=creds.get("token"))
+        page = data.get("sessions") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        out.extend(page or [])
+        cursor = data.get("lastEvaluatedKey") if isinstance(data, dict) else None
+        if not cursor or not page:
+            break
+    return out[:limit]
+
+
 def match_agents(agents: list[dict], target: str) -> list[dict]:
     """All agents matching `target`, in resolution-priority order: an exact id
     first, then id-prefix matches, then exact-name matches.
