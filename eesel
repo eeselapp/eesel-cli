@@ -3046,6 +3046,10 @@ def cmd_whoami(args) -> int:
     print(f"env          : {creds.get('env')}")
     print(f"api_url      : {creds.get('api_url')}")
     print(f"workspace_id : {shown.get('workspace_id')}")
+    # Which product this login resolves to — legacy v2 (bots/namespaces) or the
+    # new platform (agents). Flag/cache-first, so this is normally a local read.
+    platform = resolve_platform(creds, args)
+    print(f"platform     : {'legacy (v2)' if platform == PLATFORM_LEGACY else platform}")
     # No stored "active agent": each agent-scoped command names its own agent
     # (path `agents <id> …`, `--agent`, or EESEL_AGENT), and a single-agent
     # workspace is used automatically.

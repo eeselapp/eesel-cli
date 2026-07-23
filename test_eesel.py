@@ -10487,6 +10487,22 @@ class TestGuardPlatformCommand:
         assert eesel.main(["agents", "list"]) == 0
 
 
+class TestWhoamiPlatform:
+    """`whoami` reports the resolved platform."""
+
+    def test_shows_platform_legacy(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda creds: None)
+        assert eesel.cmd_whoami(_parse("whoami")) == 0
+        assert "platform     : legacy (v2)" in capsys.readouterr().out
+
+    def test_shows_platform_new(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "platform")
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda creds: None)
+        assert eesel.cmd_whoami(_parse("whoami")) == 0
+        assert "platform     : platform" in capsys.readouterr().out
+
+
 class TestLegacyHelpHiding:
     """With platform_hint='legacy', build_parser trims `--help` to the read
     commands, but every hidden command stays parseable (guard gives the note)."""
