@@ -9910,3 +9910,80 @@ class TestTasksExportDryRun:
         # The export POST was previewed, never actually sent.
         assert not any("/tasks/export" in u for _, u in calls)
         assert "/tasks/export" in json.loads(capsys.readouterr().out)["url"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Legacy v2 platform — detection
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestResolvePlatform:
+    """`resolve_platform(creds, args)` decides legacy vs platform:
+    explicit flag → cached value → a one-time license probe (fail-open)."""
+
+    def test_legacy_flag_forces_legacy_without_network(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds, platform="platform")  # opposite cache, must be ignored
+
+        def no_net(*a, **k):
+            raise AssertionError("resolve_platform must not hit the network when a flag is set")
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_net)
+        args = argparse.Namespace(legacy=True, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+
+    def test_platform_flag_forces_platform(self, tmp_config, fake_creds):
+        creds = dict(fake_creds, platform="legacy")  # opposite cache, must be ignored
+        args = argparse.Namespace(legacy=False, platform=True)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_flag_override_is_not_persisted(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: (200, {}))
+        eesel.resolve_platform(creds, argparse.Namespace(legacy=True, platform=False))
+        # A forced value never writes the cache.
+        assert "platform" not in (eesel.load_creds() or {})
+
+    def test_cached_value_used_without_network(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds, platform="legacy")
+        calls = []
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: calls.append(1) or (200, {}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+        assert calls == []
+
+    def test_detects_legacy_from_license_and_caches(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (200, {"isPlatform": False}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+        assert creds["platform"] == "legacy"  # cached on the dict
+        assert (eesel.load_creds() or {}).get("platform") == "legacy"  # and persisted
+
+    def test_detects_platform_from_license(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (200, {"isPlatform": True}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_fails_open_to_platform_on_probe_error(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+
+        def boom(*a, **k):
+            raise SystemExit(eesel.EXIT_SERVER)
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", boom)
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_fails_open_to_platform_on_non_200(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (500, {"error": "boom"}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"

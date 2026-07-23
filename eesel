@@ -719,6 +719,66 @@ def save_creds(creds: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Platform detection (legacy v2 vs the new platform)
+# ──────────────────────────────────────────────────────────────────────────
+
+# eesel serves two products from one backend: the new "platform" (agents) and
+# the legacy "v2" platform (bots/namespaces). Read commands work on both; the
+# CLI serves the right backend per invocation. The signal is the same one the
+# dashboard middleware routes on — `GET /subscription/license` → `isPlatform`,
+# the server-side `eesel-agents` flag.
+PLATFORM_LEGACY = "legacy"
+PLATFORM_NEW = "platform"
+
+
+def fetch_platform_from_license(creds: dict) -> str:
+    """Probe the workspace's platform from `GET /subscription/license`.
+
+    Returns "legacy" only when the license reports `isPlatform is False` — the
+    exact signal the dashboard routes on. Any other value, a non-200, or a
+    transport error fails **open** to "platform", so a detection hiccup never
+    blocks a new-platform user.
+    """
+    try:
+        status, data = http_request_allow_error(
+            "GET", f"{creds['api_url']}/subscription/license", token=creds.get("token")
+        )
+    except SystemExit:
+        return PLATFORM_NEW
+    except Exception:
+        return PLATFORM_NEW
+    if status == 200 and isinstance(data, dict) and data.get("isPlatform") is False:
+        return PLATFORM_LEGACY
+    return PLATFORM_NEW
+
+
+def resolve_platform(creds: dict, args=None) -> str:
+    """Decide whether this invocation targets the legacy v2 platform or the new
+    platform, once per run.
+
+    Priority: an explicit ``--legacy`` / ``--platform`` flag (never persisted) →
+    the cached ``creds["platform"]`` → a one-time license probe, whose result is
+    cached back onto ``creds`` (and to disk, minus transient ``_``-keys) so later
+    commands stay offline. Linked branch envs are ephemeral, so `save_creds`
+    won't persist the cache there — each command re-probes (or pass `--legacy`).
+    """
+    if getattr(args, "legacy", False):
+        return PLATFORM_LEGACY
+    if getattr(args, "platform", False):
+        return PLATFORM_NEW
+    cached = creds.get("platform")
+    if cached in (PLATFORM_LEGACY, PLATFORM_NEW):
+        return cached
+    detected = fetch_platform_from_license(creds)
+    creds["platform"] = detected
+    try:
+        save_creds({k: v for k, v in creds.items() if not k.startswith("_")})
+    except Exception:
+        pass
+    return detected
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Per-worktree branch-env link (`eesel link`)
 # ──────────────────────────────────────────────────────────────────────────
 
