@@ -3022,8 +3022,107 @@ def cmd_link(args) -> int:
     return 0
 
 
+def _legacy_unsupported(cmd_label: str) -> int:
+    """Refuse a command that has no read-only meaning on the legacy v2 platform.
+    Fails client-side (no network) with EXIT_VALIDATION."""
+    fail(EXIT_VALIDATION, f"'{cmd_label}' is not available on the legacy (v2) platform (read-only).")
+
+
+def resolve_namespace_or_error(creds: dict, target: str | None) -> dict | None:
+    """Legacy counterpart of `resolve_agent_or_error`: resolve which bot
+    (namespace) a command acts on, or print why it couldn't and return None.
+    Scope comes from `--agent`/EESEL_AGENT (a single-bot workspace needs none);
+    an ambiguous name is refused rather than resolved arbitrarily."""
+    target = target or os.environ.get("EESEL_AGENT")
+    namespaces = fetch_namespaces(creds)
+    if not namespaces:
+        err("No bots in this workspace.")
+        return None
+    if not target:
+        if len(namespaces) == 1:
+            validate_id(namespaces[0].get("id"), "namespace id")
+            return namespaces[0]
+        err(f"This workspace has {len(namespaces)} bots — name the one to act on:")
+        for n in namespaces:
+            err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+        err("Scope it with `eesel agents <id> <command>`, a `--agent <id|name>` flag, "
+            "or EESEL_AGENT=<id|name>.")
+        return None
+    ns, candidates = resolve_namespace_strict(namespaces, target)
+    if ns:
+        validate_id(ns.get("id"), "namespace id")
+        return ns
+    if candidates:
+        err(f"'{target}' is ambiguous — it matches {len(candidates)} bots:")
+        for n in candidates:
+            err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+        err("Re-run with a full bot id to disambiguate.")
+    else:
+        err(f"No bot matches '{target}'.")
+    return None
+
+
+def _namespaces_list(args, creds: dict) -> int:
+    """`agents list` on legacy: the workspace's bots (namespaces)."""
+    namespaces = fetch_namespaces(creds)
+    if _want_json(args):
+        emit(namespaces)
+        return 0
+    if getattr(args, "plain", False):
+        for n in namespaces:
+            print(f"{str(n.get('id') or '')}\t{str(n.get('namespace') or '')}")
+        return 0
+    if not namespaces:
+        info("(no bots)")
+        return 0
+    for n in namespaces:
+        nconns = len(n.get("connections") or [])
+        print(f" {str(n.get('id', '?'))[:12]}  {n.get('namespace', '?')}"
+              f"  [{nconns} connection{'' if nconns == 1 else 's'}]")
+    return 0
+
+
+def _namespace_show(args, creds: dict) -> int:
+    """`agents show <bot>` on legacy: the namespace's fields + its prompt."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent_id", None))
+    if not ns:
+        return 1
+    prompt = get_namespace_prompt(creds, ns["id"])
+    if _want_json(args):
+        emit({**ns, "prompt": prompt})
+        return 0
+    print(f"{ns.get('namespace', '?')}  ({ns.get('id', '')})")
+    print(f"  owner:       {'yes' if ns.get('isOwner') else 'no'}")
+    print(f"  connections: {len(ns.get('connections') or [])}")
+    p = (prompt or "").strip()
+    if not p:
+        print("  instructions: (none)")
+        return 0
+    print("  instructions:")
+    print()
+    print(p)
+    return 0
+
+
+def _agents_legacy(args, creds: dict) -> int:
+    """Dispatch the `agents` verbs on a legacy workspace (read-only). Write
+    verbs are refused; the pre-dispatch guard normally catches them first, but
+    this fails closed if one reaches here."""
+    sub = args.agents_cmd or "list"
+    if sub == "list":
+        return _namespaces_list(args, creds)
+    if sub == "show":
+        if getattr(args, "show_instructions", False):
+            args.agent = args.agent_id
+            return cmd_instructions(args)
+        return _namespace_show(args, creds)
+    return _legacy_unsupported(f"agents {sub}")
+
+
 def cmd_agents(args) -> int:
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _agents_legacy(args, creds)
     sub = args.agents_cmd or "list"
     if sub == "list":
         agents = fetch_agents(creds)
@@ -3146,6 +3245,8 @@ def cmd_instructions(args) -> int:
     so `eesel instructions > prompt.md` captures just the prompt.
     """
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _instructions_legacy(args, creds)
     agent = resolve_agent_or_error(creds, getattr(args, "agent", None))
     if not agent:
         return 1
@@ -3154,6 +3255,21 @@ def cmd_instructions(args) -> int:
     prompt = (agent.get("prompt") or "").strip()
     if not prompt:
         info("(no instructions set for this agent)")
+        return 0
+    print(prompt)
+    return 0
+
+
+def _instructions_legacy(args, creds: dict) -> int:
+    """`instructions` on legacy: the bot's customPrompt to stdout (header to
+    stderr, so a redirect captures just the prompt)."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
+    if not ns:
+        return 1
+    info(f"# {ns.get('namespace', '?')} ({str(ns.get('id', ''))[:12]}) — instructions")
+    prompt = (get_namespace_prompt(creds, ns["id"]) or "").strip()
+    if not prompt:
+        info("(no instructions set for this bot)")
         return 0
     print(prompt)
     return 0

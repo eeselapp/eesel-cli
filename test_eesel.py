@@ -75,6 +75,10 @@ def fake_creds(tmp_config):
         "agent_id": "agent-test-456",
         "token": "test-jwt-token",
         "expires_at": int(time.time()) + 3600,
+        # These tests target the new platform; caching it here keeps every
+        # command's resolve_platform() a local read (no license probe / network).
+        # Legacy-detection tests pop or override this explicitly.
+        "platform": "platform",
     }
     eesel.save_creds(creds)
     return creds
@@ -10147,3 +10151,80 @@ class TestLegacySessionsData:
         monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"sessions": [], "lastEvaluatedKey": None})
         eesel.fetch_sessions(fake_creds, "ns-1", limit=5, search="refund")
         assert "search=refund" in seen["url"]
+
+
+class TestLegacyAgentsCommand:
+    """`agents list/show` on a legacy workspace serves bots (namespaces)."""
+
+    NS = [
+        {"id": "ns-abc123def", "namespace": "Support Bot", "connections": ["c1", "c2"], "isOwner": True},
+        {"id": "ns-def456ghi", "namespace": "Sales Bot", "connections": [], "isOwner": True},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+
+    def test_list_shows_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "Sales Bot" in out
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [])
+        assert eesel.cmd_agents(_parse("agents", "list")) == 0
+        # empty-state note goes to stderr via info(), like `(no agents)` does
+        assert "no bots" in capsys.readouterr().err.lower()
+
+    def test_list_json_emits_namespaces(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [n["id"] for n in parsed] == ["ns-abc123def", "ns-def456ghi"]
+
+    def test_show_includes_prompt(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "You are a support bot.")
+        assert eesel.cmd_agents(_parse("agents", "show", "ns-abc123def")) == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "You are a support bot." in out
+
+    def test_show_not_found(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "show", "nope")) == 1
+        assert "no bot matches" in capsys.readouterr().err.lower()
+
+    def test_write_verb_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_agents(_parse("agents", "create", "--name", "x"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+class TestLegacyInstructionsCommand:
+    """`instructions` on legacy prints the bot's customPrompt to stdout."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"]}]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_prints_customprompt_to_stdout(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "Be concise.")
+        assert eesel.cmd_instructions(_parse("instructions", "ns-1")) == 0
+        # header goes to stderr; only the prompt lands on stdout (redirect-friendly)
+        assert capsys.readouterr().out.strip() == "Be concise."
+
+    def test_empty_prompt_is_clean(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "")
+        assert eesel.cmd_instructions(_parse("instructions", "ns-1")) == 0
+        assert capsys.readouterr().out.strip() == ""
