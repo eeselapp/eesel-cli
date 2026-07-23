@@ -802,6 +802,12 @@ _LEGACY_SUB_DEST = {
     "agents": "agents_cmd", "integrations": "integrations_cmd",
     "tasks": "tasks_cmd", "workspace": "workspace_cmd",
 }
+# Top-level nouns with no legacy read meaning at all — hidden wholesale from
+# `--help` on legacy (they stay parseable; the guard refuses them).
+_LEGACY_HIDDEN_NOUNS = (
+    "files", "skills", "mcp", "settings", "chat", "new", "cost",
+    "automations", "billing",
+)
 
 
 def _legacy_supports_cmd(cmd: str | None, sub: str | None) -> bool:
@@ -7177,6 +7183,28 @@ def hide_subcommands(sub_action, *names: str) -> None:
     sub_action.metavar = "{" + ",".join(ca.dest for ca in sub_action._choices_actions) + "}"
 
 
+def _hide_unsupported_legacy(top_sub) -> None:
+    """Trim `--help` to the legacy v2 read commands: hide the nouns with no
+    legacy meaning, and (under the partially-supported nouns) every subcommand
+    that isn't in `_LEGACY_SUPPORTED_SUBS`. Everything stays PARSEABLE — hiding
+    only drops it from help — so the pre-dispatch guard still answers with the
+    friendly 'not available on the legacy (v2) platform' message. Reuses the
+    same classification the guard and schema read, so the three can't drift."""
+    hide_subcommands(top_sub, *[n for n in _LEGACY_HIDDEN_NOUNS if n in top_sub.choices])
+    for noun, supported in _LEGACY_SUPPORTED_SUBS.items():
+        if supported is None:
+            continue  # whole noun supported (e.g. instructions) — nothing to trim
+        parser = top_sub.choices.get(noun)
+        if parser is None:
+            continue
+        child = next((a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None)
+        if child is None:
+            continue
+        hide = [name for name in child.choices if name not in supported]
+        if hide:
+            hide_subcommands(child, *hide)
+
+
 def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
     """Register the files command tree under `name`.
 
@@ -7495,7 +7523,7 @@ scope by path:
 """
 
 
-def build_parser(staff: bool = False) -> argparse.ArgumentParser:
+def build_parser(staff: bool = False, platform_hint: str | None = None) -> argparse.ArgumentParser:
     """Build the CLI parser.
 
     `staff` is whether the current login is on the global impersonator
@@ -7504,6 +7532,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     `impersonate` command — are hidden from `--help`. They remain parseable so
     nothing breaks for someone who knows them, but the server-side allowlist
     (and, for dev login, the local-only dev secret) is the real gate.
+
+    `platform_hint` is the resolved platform for this run ("legacy"/"platform"/
+    None). On "legacy" the commands with no read-only meaning there are hidden
+    from `--help` (see `_hide_unsupported_legacy`) — they stay parseable so the
+    pre-dispatch guard can still give its friendly message. Anything else (the
+    new platform, or unknown) hides nothing.
     """
     p = argparse.ArgumentParser(
         prog="eesel",
@@ -8065,6 +8099,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         _hidden_top.append("impersonate")
     hide_subcommands(sub, *_hidden_top)
 
+    # On a legacy v2 workspace, trim `--help` to the read commands that work
+    # there. New-platform / unknown hints leave the full surface visible.
+    if platform_hint == PLATFORM_LEGACY:
+        _hide_unsupported_legacy(sub)
+
     p._eesel_relocations = {
         "documents": "`documents` was renamed to `files` — use `eesel files …` "
                      "(e.g. `eesel files list`).",
@@ -8539,15 +8578,24 @@ def main(argv: list[str] | None = None) -> int:
     # stays a local read — no network call on every invocation.
     creds = load_creds()
     staff = bool(creds and creds.get("is_impersonator"))
-    parser = build_parser(staff)
     if argv is None:
         argv = sys.argv[1:]
     # Lift the global output/preview flags out of argv so they work in any
     # position (argparse only accepts top-level optionals before the
     # subcommand). The values are re-attached to the parsed namespace below.
+    # This runs BEFORE build_parser so the lifted --legacy/--platform can pick
+    # the help surface.
     argv, global_flags = _extract_global_output_flags(argv)
     if global_flags["legacy"] and global_flags["platform"]:
         fail(EXIT_USAGE, "--legacy and --platform are mutually exclusive.")
+    # An explicit flag wins; else the cached platform decides which `--help`
+    # surface to build. Unknown/None → show everything (hide nothing).
+    platform_hint = (
+        PLATFORM_LEGACY if global_flags["legacy"]
+        else PLATFORM_NEW if global_flags["platform"]
+        else (creds.get("platform") if creds else None)
+    )
+    parser = build_parser(staff, platform_hint)
     # Path-as-scope first (`agents <id> integrations …` → flat + `--agent <id>`),
     # then the integrations actions reshape runs on its output.
     argv = _normalize_path_scope_argv(argv)

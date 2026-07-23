@@ -3198,9 +3198,9 @@ class TestMainStaffGating:
         seen = {}
         real = eesel.build_parser
 
-        def spy(staff=False):
+        def spy(staff=False, platform_hint=None):
             seen["staff"] = staff
-            return real(staff)
+            return real(staff, platform_hint)
 
         monkeypatch.setattr(eesel, "build_parser", spy)
         eesel.main(["logout"])  # no network; safe with tmp_config
@@ -10485,3 +10485,76 @@ class TestGuardPlatformCommand:
         monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
         monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [])
         assert eesel.main(["agents", "list"]) == 0
+
+
+class TestLegacyHelpHiding:
+    """With platform_hint='legacy', build_parser trims `--help` to the read
+    commands, but every hidden command stays parseable (guard gives the note)."""
+
+    def _legacy(self):
+        return eesel.build_parser(staff=False, platform_hint="legacy")
+
+    def _child(self, parser, noun):
+        return _subparsers_action(_subparsers_action(parser).choices[noun])
+
+    def test_hides_wholly_unsupported_nouns(self):
+        visible = _visible_commands(self._legacy())
+        for hidden in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing"):
+            assert hidden not in visible, hidden
+        for shown in ("agents", "integrations", "tasks", "workspace", "whoami", "schema"):
+            assert shown in visible, shown
+
+    def test_hides_write_subcommands_under_agents(self):
+        visible = {a.dest for a in self._child(self._legacy(), "agents")._choices_actions}
+        assert visible == {"list", "show"}
+
+    def test_hides_partial_subcommands(self):
+        parser = self._legacy()
+        for noun, expected in [
+            ("integrations", {"list", "show"}),
+            ("tasks", {"list", "show"}),
+            ("workspace", {"show", "members"}),
+        ]:
+            visible = {a.dest for a in self._child(parser, noun)._choices_actions}
+            assert visible == expected, (noun, visible)
+
+    def test_help_text_omits_hidden(self):
+        help_text = self._legacy().format_help()
+        assert "files" not in help_text and "skills" not in help_text
+
+    def test_agents_help_omits_write_verbs(self):
+        # Assert on the write subparsers' unique help strings — the path-scope
+        # epilog legitimately references `set`/`remove`, so a bare word check
+        # would be a false positive.
+        agents_help = _subparsers_action(self._legacy()).choices["agents"].format_help()
+        assert "Create a new agent" not in agents_help
+        assert "Remove an agent" not in agents_help
+        assert "Change an agent's name" not in agents_help
+        # ...and they stay for the new platform.
+        full = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"].format_help()
+        assert "Create a new agent" in full and "Remove an agent" in full
+
+    def test_metavar_does_not_leak_hidden(self):
+        # The usage-line metavar is rebuilt, so no hidden noun leaks into `{...}`.
+        top = _subparsers_action(self._legacy())
+        listed = set((top.metavar or "").strip("{}").split(","))
+        assert "files" not in listed and "skills" not in listed
+
+    def test_platform_hint_none_shows_everything(self):
+        visible = _visible_commands(eesel.build_parser(staff=False))
+        for shown in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing"):
+            assert shown in visible, shown
+
+    def test_platform_hint_platform_shows_everything(self):
+        visible = _visible_commands(eesel.build_parser(staff=False, platform_hint="platform"))
+        assert "files" in visible and "skills" in visible
+        agents = {a.dest for a in self._child(eesel.build_parser(staff=False, platform_hint="platform"), "agents")._choices_actions}
+        assert {"create", "set", "remove"}.issubset(agents)
+
+    def test_hidden_noun_still_parses(self):
+        args = self._legacy().parse_args(["files", "list"])
+        assert args.cmd == "files"
+
+    def test_hidden_subcommand_still_parses(self):
+        args = self._legacy().parse_args(["agents", "create", "--name", "X"])
+        assert args.cmd == "agents" and args.agents_cmd == "create"
