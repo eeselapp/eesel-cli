@@ -9529,7 +9529,8 @@ class TestExtractGlobalOutputFlags:
     def test_passes_through_unrelated_tokens(self):
         rest, vals = eesel._extract_global_output_flags(["agents", "list", "--plain"])
         assert rest == ["agents", "list", "--plain"]
-        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None}
+        # legacy/platform were added as global platform-override flags.
+        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None, "legacy": False, "platform": False}
 
 
 class TestConfigureOutput:
@@ -9987,3 +9988,33 @@ class TestResolvePlatform:
         monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (500, {"error": "boom"}))
         args = argparse.Namespace(legacy=False, platform=False)
         assert eesel.resolve_platform(creds, args) == "platform"
+
+
+class TestPlatformFlags:
+    """`--legacy` / `--platform` are global flags: declared for help/schema,
+    lifted from anywhere in argv, and mutually exclusive."""
+
+    def test_extractor_lifts_legacy_after_subcommand(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--legacy"])
+        assert rest == ["agents", "list"]
+        assert vals["legacy"] is True
+        assert vals["platform"] is False
+
+    def test_extractor_lifts_platform_before_subcommand(self):
+        rest, vals = eesel._extract_global_output_flags(["--platform", "whoami"])
+        assert rest == ["whoami"]
+        assert vals["platform"] is True
+        assert vals["legacy"] is False
+
+    def test_parser_declares_legacy_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(["--legacy", "agents", "list"])
+        assert args.legacy is True
+
+    def test_parser_declares_platform_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(["--platform", "agents", "list"])
+        assert args.platform is True
+
+    def test_main_rejects_both_flags(self, tmp_config, fake_creds):
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["agents", "list", "--legacy", "--platform"])
+        assert exc.value.code == eesel.EXIT_USAGE

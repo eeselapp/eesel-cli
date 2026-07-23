@@ -7022,6 +7022,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     p.add_argument("--fields", metavar="a,b,c", help="With --json: keep only these top-level keys on each object.")
     p.add_argument("--dry-run", action="store_true", help="Preview a side effect (config mutation, chat turn, or login): print the request that would be sent and make no call.")
     p.add_argument("--secrets", action="store_true", help="Reveal masked secret values (sysadmin/impersonator accounts only).")
+    # Platform override: normally the CLI auto-detects legacy v2 vs the new
+    # platform (see resolve_platform). These force it for one command — e.g.
+    # when a just-migrated workspace's cached/flagged state lags. Mutually
+    # exclusive (enforced in main after they're lifted from argv).
+    p.add_argument("--legacy", action="store_true", help="Force legacy v2-platform mode for this command (overrides auto-detection).")
+    p.add_argument("--platform", action="store_true", help="Force new-platform mode for this command (overrides auto-detection).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)" if staff else "Authenticate")
@@ -7838,7 +7844,7 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
     or takes a `--fields=…` inline value. Anything not one of these flags is
     passed through untouched for argparse to handle.
     """
-    values = {"json": False, "dry_run": False, "secrets": False, "fields": None}
+    values = {"json": False, "dry_run": False, "secrets": False, "fields": None, "legacy": False, "platform": False}
     rest: list[str] = []
     i = 0
     while i < len(argv):
@@ -7849,6 +7855,10 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
             values["dry_run"] = True
         elif tok == "--secrets":
             values["secrets"] = True
+        elif tok == "--legacy":
+            values["legacy"] = True
+        elif tok == "--platform":
+            values["platform"] = True
         elif tok == "--fields":
             # Only consume the next token as the value when it is a real value,
             # not another flag. `eesel schema --fields --json` must leave --json
@@ -8017,6 +8027,8 @@ def main(argv: list[str] | None = None) -> int:
     # position (argparse only accepts top-level optionals before the
     # subcommand). The values are re-attached to the parsed namespace below.
     argv, global_flags = _extract_global_output_flags(argv)
+    if global_flags["legacy"] and global_flags["platform"]:
+        fail(EXIT_USAGE, "--legacy and --platform are mutually exclusive.")
     # Path-as-scope first (`agents <id> integrations …` → flat + `--agent <id>`),
     # then the integrations actions reshape runs on its output.
     argv = _normalize_path_scope_argv(argv)
@@ -8026,6 +8038,8 @@ def main(argv: list[str] | None = None) -> int:
     # exactly as before, whether the flag was global or per-command.
     args.json = bool(getattr(args, "json", False)) or global_flags["json"]
     args.secrets = bool(getattr(args, "secrets", False)) or global_flags["secrets"]
+    args.legacy = bool(getattr(args, "legacy", False)) or global_flags["legacy"]
+    args.platform = bool(getattr(args, "platform", False)) or global_flags["platform"]
     _configure_output(args, global_flags, creds)
     _guard_impersonated_command(args, creds)
     return args.func(args)
