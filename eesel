@@ -806,7 +806,7 @@ _LEGACY_SUB_DEST = {
 # `--help` on legacy (they stay parseable; the guard refuses them).
 _LEGACY_HIDDEN_NOUNS = (
     "files", "skills", "mcp", "settings", "chat", "new", "cost",
-    "automations", "billing",
+    "automations", "billing", "sessions",
 )
 
 

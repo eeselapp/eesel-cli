@@ -10545,7 +10545,9 @@ class TestLegacyHelpHiding:
 
     def test_hides_wholly_unsupported_nouns(self):
         visible = _visible_commands(self._legacy())
-        for hidden in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing"):
+        # `sessions` (local chat-session mgmt) belongs with chat/new — all hidden
+        # on legacy, so nothing is visible-but-refused.
+        for hidden in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing", "sessions"):
             assert hidden not in visible, hidden
         for shown in ("agents", "integrations", "tasks", "workspace", "whoami", "schema"):
             assert shown in visible, shown
