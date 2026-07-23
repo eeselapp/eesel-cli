@@ -3840,6 +3840,8 @@ def cmd_integrations(args) -> int:
     `remove`.
     """
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _integrations_legacy(args, creds)
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
     # the EESEL_AGENT env var but per-command. It is resolved in memory and not
     # persisted, so the scope stays local to this command. Connection status in
@@ -4014,6 +4016,88 @@ def _integrations_show(args, creds: dict) -> int:
     sync = f"{run.get('status')} — {_sync_run_progress(run)}" if run else "—"
     print(f" sync        {sync}")
     return 0
+
+
+def _mask_legacy_config(entries: list, reveal: bool) -> list:
+    """Mask legacy connection-config values whose `name` looks like a secret.
+
+    Config entries are `{name, value}` (not the `{key, value}` property shape
+    `_redact_secrets` recognizes), so mask off the same `_SECRET_KEY_HINTS`
+    behind the same reveal gate the rest of the CLI uses. `customPrompt` isn't a
+    secret, so it passes through untouched."""
+    if reveal:
+        return entries
+    out = []
+    for e in entries:
+        if isinstance(e, dict):
+            name, value = e.get("name"), e.get("value")
+            if (isinstance(name, str) and isinstance(value, str) and value
+                    and any(h in name.lower() for h in _SECRET_KEY_HINTS)):
+                out.append({**e, "value": "***"})
+                continue
+        out.append(e)
+    return out
+
+
+def _legacy_connections_list(args, creds: dict) -> int:
+    """`integrations list` on legacy: the bot's (namespace's) connections."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
+    if not ns:
+        return 1
+    conns = fetch_namespace_connections(creds, ns["id"])
+    if _want_json(args):
+        emit(conns)
+        return 0
+    if not conns:
+        info("(no connections)")
+        return 0
+    fmt = " {:<12}  {:<18}  {}"
+    info(fmt.format("id", "type", "name"))
+    for c in conns:
+        cid = str(c.get("connectionId") or "—")[:12]
+        ctype = (str(c.get("connectionType") or "?"))[:18]
+        print(fmt.format(cid, ctype, c.get("connectionName") or ""))
+    return 0
+
+
+def _legacy_connection_show(args, creds: dict) -> int:
+    """`integrations show <conn>` on legacy: one connection's detail + its
+    configuration entries (secret-looking values masked like everywhere else)."""
+    conn = fetch_connection(creds, args.id)
+    reveal = _REVEAL_SECRETS
+    entries = _mask_legacy_config(fetch_connection_config(creds, args.id), reveal)
+    if _want_json(args):
+        emit({**conn, "configurationEntries": entries}, reveal=reveal)
+        return 0
+    ctype = conn.get("connectionType") or "?"
+    cid = conn.get("connectionId") or args.id
+    info(f"# {ctype} [{cid}]")
+    print(f" id     {cid}")
+    print(f" type   {ctype}")
+    if conn.get("connectionName"):
+        print(f" name   {conn.get('connectionName')}")
+    if not entries:
+        print(" config (none)")
+        return 0
+    print(" config:")
+    for e in entries:
+        print(f"   {e.get('name')} = {e.get('value')}")
+    return 0
+
+
+def _integrations_legacy(args, creds: dict) -> int:
+    """Dispatch the `integrations` verbs on a legacy workspace (read-only).
+
+    Legacy integrations are the bot's connections: `list` shows them, `show
+    <conn>` shows one connection's detail + config. Every other verb is refused;
+    the pre-dispatch guard normally catches those first, but this fails closed if
+    one reaches here."""
+    sub = getattr(args, "integrations_cmd", None) or "list"
+    if sub == "list":
+        return _legacy_connections_list(args, creds)
+    if sub == "show":
+        return _legacy_connection_show(args, creds)
+    return _legacy_unsupported(f"integrations {sub}")
 
 
 def _fetch_sync_runs(creds: dict) -> list:

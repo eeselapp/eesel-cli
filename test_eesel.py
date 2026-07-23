@@ -10228,3 +10228,90 @@ class TestLegacyInstructionsCommand:
         monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "")
         assert eesel.cmd_instructions(_parse("instructions", "ns-1")) == 0
         assert capsys.readouterr().out.strip() == ""
+
+
+class TestLegacyIntegrationsCommand:
+    """`integrations` on legacy serves the bot's (namespace's) connections."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"], "isOwner": True}]
+    CONNS = [
+        {"connectionId": "c1", "connectionType": "eesel", "connectionName": "eesel core"},
+        {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_list_shows_connections(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        out = capsys.readouterr().out
+        assert "c1" in out and "zendesk" in out and "ACME ZD" in out
+
+    def test_list_json_emits_connections(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [c["connectionId"] for c in parsed] == ["c1", "c2"]
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: [])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        # empty-state note goes to stderr via info(), like the other lists
+        assert "no connections" in capsys.readouterr().err.lower()
+
+    def test_list_scopes_named_bot(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: seen.update(nid=nid) or [])
+        # A two-bot workspace needs the bot named; --agent resolves it.
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--agent", "Bot Two")) == 0
+        assert seen["nid"] == "ns-2"
+
+    def test_show_renders_config_entries(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "subdomain", "value": "acme"}, {"name": "customPrompt", "value": "Be nice"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2")) == 0
+        out = capsys.readouterr().out
+        assert "subdomain" in out and "acme" in out
+        # customPrompt is not a secret — its value is shown in full
+        assert "customPrompt" in out and "Be nice" in out
+
+    def test_show_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "accessToken", "value": "sk-secret"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2")) == 0
+        out = capsys.readouterr().out
+        assert "sk-secret" not in out and "***" in out
+
+    def test_show_json_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "accessToken", "value": "sk-secret"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        entry = next(e for e in parsed["configurationEntries"] if e["name"] == "accessToken")
+        assert entry["value"] == "***"
+
+    def test_write_verb_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_integrations(_parse("integrations", "sync", "zendesk"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
