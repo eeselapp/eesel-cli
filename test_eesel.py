@@ -8785,6 +8785,7 @@ class TestPathScopeParsesEndToEnd:
             ("agents", "blog", "integrations", "zd", "actions", "enable", "reply"),
             ("agents", "blog", "files", "list"),
             ("agents", "blog", "tasks", "list"),
+            ("agents", "blog", "tasks", "show", "s1"),
             ("agents", "blog", "skills", "list"),
             ("agents", "blog", "skills", "show", "translation"),
             ("agents", "blog", "skills"),
@@ -8839,6 +8840,7 @@ class TestPathScopeVerbScoping:
         assert self.n("agents", "blog", "files", "add", "--title", "t") == ["files", "add", "--title", "t", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "count") == ["tasks", "count", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "analytics") == ["tasks", "analytics", "--agent", "blog"]
+        assert self.n("agents", "blog", "tasks", "show", "s1") == ["tasks", "show", "s1", "--agent", "blog"]
 
     def test_non_accepting_verbs_exit_naming_the_verb(self, capsys):
         # A verb the flat parser can't scope by agent exits (code 2) and the error
@@ -8850,7 +8852,10 @@ class TestPathScopeVerbScoping:
                 self.n("agents", "blog", "files", verb, "x")
             assert exc.value.code == 2
             assert f"`{verb}` is not an agent-scoped `files` verb" in capsys.readouterr().err
-        for verb in ("show", "cost"):
+        # `show` IS an agent-scoped tasks verb now (legacy sessions are
+        # namespace-scoped; the path reshapes to `tasks show <id> --agent <id>`).
+        # `cost` still isn't (its flat parser has no --agent).
+        for verb in ("cost",):
             with pytest.raises(SystemExit):
                 self.n("agents", "blog", "tasks", verb, "x")
             assert f"`{verb}` is not an agent-scoped `tasks` verb" in capsys.readouterr().err
@@ -10796,3 +10801,56 @@ class TestLegacyIntegrationsAggregate:
         monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: [])
         assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
         assert "no connections" in capsys.readouterr().err.lower()
+
+
+class TestLegacyTasksShowScoping:
+    """`tasks show` accepts `--agent` (so it can be scoped on legacy and the
+    `agents X tasks show` path reshape works), and without a named bot it finds
+    the owning bot by a cross-bot probe."""
+
+    def test_show_accepts_agent_flag(self):
+        # The exact command the user hit must PARSE (was: unrecognized arguments).
+        args = _parse("tasks", "show", "zendesk-chat-6a5", "--agent", "Chatboks")
+        assert args.agent == "Chatboks"
+
+    def test_path_scope_reshapes_tasks_show(self):
+        assert eesel._normalize_path_scope_argv(["agents", "Chatboks", "tasks", "show", "s1"]) == \
+            ["tasks", "show", "s1", "--agent", "Chatboks"]
+
+    def test_path_scope_tasks_show_parses_end_to_end(self):
+        argv = eesel._normalize_path_scope_argv(["agents", "blog", "tasks", "show", "s1"])
+        args = eesel.build_parser().parse_args(argv)
+        assert args.cmd == "tasks" and args.tasks_cmd == "show" and args.agent == "blog"
+
+    def _legacy_multi(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_show_finds_owning_bot_when_not_named(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "http_request_allow_error",
+                            lambda method, url, **k: (200, {}) if "/namespaces/ns-2/sessions/s9" in url else (404, {}))
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: seen.update(nid=nid) or {
+            "sessionId": sid, "messages": [{"userMessage": "hi", "agentMessage": "yo"}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s9")) == 0
+        assert seen["nid"] == "ns-2"  # resolved the owning bot by probing
+        assert "hi" in capsys.readouterr().out
+
+    def test_show_not_found_in_any_bot(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (404, {}))
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s9")) == 1
+        assert "no session" in capsys.readouterr().err.lower()
+
+    def test_show_named_bot_scopes_directly(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        # A probe must NOT happen when the bot is named.
+        monkeypatch.setattr(eesel, "http_request_allow_error",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not probe when named")))
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: seen.update(nid=nid) or {"sessionId": sid, "messages": []})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--agent", "Bot Two")) == 0
+        assert seen["nid"] == "ns-2"

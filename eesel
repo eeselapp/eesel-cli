@@ -5578,11 +5578,48 @@ def _legacy_sessions_list(args, creds: dict) -> int:
     return 0
 
 
+def _find_session_namespace(creds: dict, sid: str, namespaces: list[dict]) -> dict | None:
+    """Which bot owns session `sid`, found by probing each namespace's session
+    endpoint non-fatally (200 = found). First hit wins; None if no bot has it.
+    Used when `tasks show` is given a session id with no bot named."""
+    vsid = validate_id(sid, "session id")
+    for ns in namespaces:
+        nid = validate_id(ns.get("id"), "namespace id")
+        try:
+            status, _ = http_request_allow_error(
+                "GET", f"{creds['api_url']}/v2/namespaces/{nid}/sessions/{vsid}", token=creds.get("token"))
+        except SystemExit:
+            continue
+        except Exception:
+            continue
+        if status == 200:
+            return ns
+    return None
+
+
 def _legacy_session_show(args, creds: dict) -> int:
-    """`tasks show <session-id>` on legacy: one session's transcript."""
-    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
-    if not ns:
-        return 1
+    """`tasks show <session-id>` on legacy: one session's transcript. With a bot
+    named (`--agent` / EESEL_AGENT) it scopes there; without one it finds the
+    owning bot (a single-bot workspace uses its only bot; a multi-bot one probes
+    each bot for the id)."""
+    target = getattr(args, "agent", None) or os.environ.get("EESEL_AGENT")
+    if target:
+        ns = resolve_namespace_or_error(creds, target)
+        if not ns:
+            return 1
+    else:
+        namespaces = fetch_namespaces(creds)
+        if not namespaces:
+            err("No bots in this workspace.")
+            return 1
+        if len(namespaces) == 1:
+            ns = namespaces[0]
+            validate_id(ns.get("id"), "namespace id")
+        else:
+            ns = _find_session_namespace(creds, args.task_id, namespaces)
+            if not ns:
+                err(f"No session '{args.task_id}' found in this workspace.")
+                return 1
     session = fetch_session(creds, ns["id"], args.task_id)
     if _want_json(args):
         emit(session)
@@ -7820,6 +7857,11 @@ def build_parser(staff: bool = False, platform_hint: str | None = None) -> argpa
     tk_sh.add_argument("--json", action="store_true", help="Emit the raw history payload instead of a rendered transcript")
     tk_sh.add_argument("--full", action="store_true", help="Don't truncate tool arguments/outputs")
     tk_sh.add_argument("--cost", action="store_true", help="Append a cost + token breakdown (dev mode only)")
+    # On legacy, sessions are namespace-scoped: `--agent` names the bot directly
+    # (else the CLI finds the owning bot by id). New-platform task ids are
+    # workspace-unique, so it's accepted and ignored there. Also lets the
+    # `agents <id> tasks show <sid>` path form reshape to `--agent <id>`.
+    tk_sh.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     tk_co = tk_sub.add_parser("cost", help="Print cost + token usage for one task (includes sub-agents). Dev mode only.")
     tk_co.add_argument("task_id", help="Full task id or id-prefix")
     tk_co.add_argument("--json", action="store_true", help="Emit the raw cost breakdown as JSON instead of a summary")
@@ -8277,7 +8319,7 @@ _REMOVED_AGENTS_VERBS = {
 _AGENT_SCOPED_CHILDREN = {
     "integrations": ("flag", None),
     "files": ("flag", frozenset({"list", "show", "read", "add", "remove", "export"})),
-    "tasks": ("flag", frozenset({"list", "count", "analytics", "export"})),
+    "tasks": ("flag", frozenset({"list", "show", "count", "analytics", "export"})),
     "skills": ("pos", None),
 }
 
