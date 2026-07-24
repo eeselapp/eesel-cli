@@ -10611,6 +10611,21 @@ class TestLegacyHelpHiding:
         listed = set((top.metavar or "").strip("{}").split(","))
         assert "files" not in listed and "skills" not in listed
 
+    def test_agents_path_epilog_trimmed_on_legacy(self):
+        # The "scope by path" epilog must not advertise verbs/nouns that don't
+        # apply on legacy (set, skills, files, chat, remove-integration).
+        agents_help = _subparsers_action(self._legacy()).choices["agents"].format_help()
+        for gone in ("agents <id> set", "skills list", "files list", 'chat "', "remove <integration>"):
+            assert gone not in agents_help, gone
+        # ...but the supported path examples stay.
+        assert "integrations list" in agents_help
+        assert "tasks list" in agents_help
+
+    def test_agents_path_epilog_full_on_platform(self):
+        agents_help = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"].format_help()
+        for shown in ("agents <id> set", "skills list", "files list", 'chat "'):
+            assert shown in agents_help, shown
+
     def test_platform_hint_none_shows_everything(self):
         visible = _visible_commands(eesel.build_parser(staff=False))
         for shown in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing"):

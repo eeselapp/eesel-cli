@@ -7571,6 +7571,20 @@ scope by path:
     eesel agents <id> chat "..."             chat with this agent
 """
 
+# Legacy (v2) is read-only and only exposes bots + connections + prompt +
+# history, so the path-scope epilog is trimmed to just those — no write verbs,
+# no skills/files/chat that don't apply.
+_AGENTS_PATH_EPILOG_LEGACY = """\
+scope by path:
+  Put a bot's id in the command path to scope a noun to that bot — the same as
+  the flat command with --agent. The id can be a full id, id-prefix, or name.
+
+    eesel agents <id>                        show the bot (= `agents show <id>`)
+    eesel agents <id> show --instructions    print just its prompt
+    eesel agents <id> integrations list      that bot's connections (list/show)
+    eesel agents <id> tasks list             that bot's chat history (list/show)
+"""
+
 
 def build_parser(staff: bool = False, platform_hint: str | None = None) -> argparse.ArgumentParser:
     """Build the CLI parser.
@@ -7645,7 +7659,7 @@ def build_parser(staff: bool = False, platform_hint: str | None = None) -> argpa
     sp = sub.add_parser(
         "agents",
         help="List, inspect, or manage agents",
-        epilog=_AGENTS_PATH_EPILOG,
+        epilog=_AGENTS_PATH_EPILOG_LEGACY if platform_hint == PLATFORM_LEGACY else _AGENTS_PATH_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     a_sub = sp.add_subparsers(dest="agents_cmd")
