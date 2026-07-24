@@ -5534,24 +5534,32 @@ def _render_legacy_turn(turn: dict, *, full: bool = False) -> None:
 
 
 def _legacy_sessions_list(args, creds: dict) -> int:
-    """`tasks list` on legacy: the bot's (namespace's) chat sessions."""
-    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
-    if not ns:
-        return 1
-    sessions = fetch_sessions(
-        creds, ns["id"],
-        limit=getattr(args, "limit", None) or 50,
-        search=getattr(args, "search", None),
-    )
+    """`tasks list` on legacy: chat sessions. Workspace-wide by default —
+    aggregated across every bot, newest first — or scoped to one with
+    `--agent` / EESEL_AGENT. Each row is tagged with the bot it came from."""
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    limit = getattr(args, "limit", None) or 50
+    search = getattr(args, "search", None)
+    rows = []
+    for ns in namespaces:
+        for s in fetch_sessions(creds, ns["id"], limit=limit, search=search):
+            rows.append({**s, "namespaceId": ns["id"], "botName": ns.get("namespace")})
+    # Newest first; a missing/None lastUpdated sorts last. Coerce to str so mixed
+    # ISO-string / numeric timestamps across bots can't raise on comparison.
+    rows.sort(key=lambda s: str(s.get("lastUpdated") or ""), reverse=True)
+    rows = rows[:limit]
     if _want_json(args):
-        emit(sessions)
+        emit(rows)
         return 0
-    if not sessions:
+    if not rows:
         info("(no tasks)")
         return 0
-    for s in sessions:
+    for s in rows:
         # Defensive .get everywhere — a session may omit any of these fields.
-        parts = [str(s.get("sessionId") or "?")[:16]]
+        parts = [str(s.get("botName") or s.get("namespaceId") or "?")[:18],
+                 str(s.get("sessionId") or "?")[:16]]
         if s.get("title"):
             parts.append(str(s.get("title")))
         if s.get("lastUpdated"):

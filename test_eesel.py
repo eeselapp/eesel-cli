@@ -10694,3 +10694,68 @@ class TestLegacyScopeNamespaces:
         nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="nope"))
         assert nss == [] and rc == 1
         assert "no bot matches" in capsys.readouterr().err.lower()
+
+
+class TestLegacyTasksAggregate:
+    """`tasks list` on legacy is workspace-wide: aggregate across all bots
+    (newest first, bot-tagged) unless a bot is named with --agent / EESEL_AGENT."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_aggregates_across_all_bots_newest_first(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        by_bot = {
+            "ns-1": [{"sessionId": "a1", "lastUpdated": "2026-07-01"}],
+            "ns-2": [{"sessionId": "b1", "lastUpdated": "2026-07-05"},
+                     {"sessionId": "b2", "lastUpdated": "2026-06-01"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: by_bot[nid])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1", "a1", "b2"]  # newest first across bots
+        tags = {s["sessionId"]: (s["namespaceId"], s["botName"]) for s in parsed}
+        assert tags["a1"] == ("ns-1", "Bot One")
+        assert tags["b1"] == ("ns-2", "Bot Two")
+
+    def test_missing_lastupdated_sorts_last(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        by_bot = {
+            "ns-1": [{"sessionId": "a1"}],  # no lastUpdated
+            "ns-2": [{"sessionId": "b1", "lastUpdated": "2026-07-05"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: by_bot[nid])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1", "a1"]
+
+    def test_respects_overall_limit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [
+            {"sessionId": f"{nid}-a", "lastUpdated": "2026-07-01"},
+            {"sessionId": f"{nid}-b", "lastUpdated": "2026-07-02"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--limit", "3", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert len(parsed) == 3  # 4 total across 2 bots, capped at the overall limit
+
+    def test_human_view_shows_bot_column(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k:
+                            [{"sessionId": "a1", "lastUpdated": "2026-07-01"}] if nid == "ns-1"
+                            else [{"sessionId": "b1", "lastUpdated": "2026-07-02"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Bot One" in out and "Bot Two" in out and "a1" in out and "b1" in out
+
+    def test_agent_filter_scopes_to_one_bot(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        calls = []
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k:
+                            calls.append(nid) or ([{"sessionId": "b1", "lastUpdated": "x"}] if nid == "ns-2" else []))
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--agent", "Bot Two", "--json")) == 0
+        assert calls == ["ns-2"]  # only the named bot is fetched
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1"]
