@@ -310,6 +310,39 @@ once with nothing global to race over.
   as a normal `eesel login` / `--dev`.
 - Unlink by deleting `eesel.dev.json`.
 
+## Legacy (v2) platform
+
+eesel serves two products from one backend: the new **platform** (agents) and
+the legacy **v2** platform (bots). The CLI detects which one your workspace is
+on and serves the right backend automatically — you use the same commands
+either way.
+
+- **Auto-detect.** The platform is read once from `GET /subscription/license`
+  (`isPlatform`) — the same signal the dashboard routes on — and cached on your
+  credentials so later commands stay offline. `eesel whoami` shows which one you
+  resolved to.
+- **Override + caching.** Force a single command with `--legacy` or `--platform`
+  (mutually exclusive; they work anywhere on the line and are never persisted).
+  Use them if a just-migrated workspace's cached state lags.
+- **Read-only.** On legacy the CLI is read-only — it lists and inspects, it does
+  not change anything. Write commands are refused with a clear message, and
+  `--help` is trimmed to just the read commands that work there.
+
+The same nouns map onto the v2 concepts:
+
+| Command | New platform | Legacy v2 |
+|---------|--------------|-----------|
+| `agents list` / `show` | agents | bots (namespaces) |
+| `instructions` | agent prompt | the bot's `customPrompt` |
+| `integrations list` / `show` | integrations | connections (+ their config) |
+| `tasks list` / `show` | workspace activity | chat sessions / history |
+| `workspace show` / `members` | workspace | workspace |
+
+Everything else (`files`, `skills`, `mcp`, `chat`, `automations`, `billing`,
+agent/integration/task writes, …) has no read-only v2 meaning and is refused on
+legacy. `eesel schema` marks each command with a `legacy_supported` flag and, for
+the mapped commands, documents the legacy endpoint after `· legacy:`.
+
 ## Exit codes
 
 Every command exits `0` on success. A failure carries a code that names its
@@ -324,12 +357,12 @@ a stable contract; they won't be renumbered.
 | `2` | argument-usage error | a malformed or missing flag/argument (from argument parsing) |
 | `3` | auth | the API returned 401 / 403 — re-authenticate with `eesel login` |
 | `4` | not-found | the API returned 404 — the addressed thing doesn't exist |
-| `5` | rate-limit | the API returned 429 — back off and retry later |
-| `6` | validation | the API returned 400 / 422, or the local input was bad/missing (e.g. `eesel chat` with no message on a non-interactive terminal, or an OAuth connect that can't complete headless) |
+| `5` | validation | the API returned 400 / 422, the local input was bad/missing (e.g. `eesel chat` with no message on a non-interactive terminal, or an OAuth connect that can't complete headless), or the command isn't available on the legacy (v2) platform |
+| `6` | rate-limit | the API returned 429 — back off and retry later |
 | `7` | server | the API returned 5xx, or the server timed out / was unreachable — retry later |
 
 On a non-interactive terminal (a headless agent or CI), commands that would
-otherwise drop into an interactive prompt fail with code `6` instead of hanging
+otherwise drop into an interactive prompt fail with code `5` instead of hanging
 or silently doing nothing: `eesel chat` with no message, `eesel files read`
 with no target, and `eesel integrations connect` on a browser-OAuth connector.
 Pass the message/target explicitly, and complete OAuth connects from a real
@@ -384,8 +417,8 @@ sticky `current.json` behaviour is unchanged when `EESEL_SESSION` is unset.
 | 2 | bad command line (argparse) |
 | 5 | input rejected client-side before any network call (see below) |
 
-(3 auth · 4 not-found · 6 rate-limit · 7 server are reserved for a later change;
-they are not emitted yet.)
+(3 auth · 4 not-found · 6 rate-limit · 7 server are also emitted — see the full
+table under **Exit codes** above.)
 
 **Input validation.** Every id or key that becomes part of an API URL is checked
 locally first. A value carrying a path traversal (`../`), an ASCII control

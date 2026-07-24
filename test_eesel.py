@@ -75,6 +75,10 @@ def fake_creds(tmp_config):
         "agent_id": "agent-test-456",
         "token": "test-jwt-token",
         "expires_at": int(time.time()) + 3600,
+        # These tests target the new platform; caching it here keeps every
+        # command's resolve_platform() a local read (no license probe / network).
+        # Legacy-detection tests pop or override this explicitly.
+        "platform": "platform",
     }
     eesel.save_creds(creds)
     return creds
@@ -3194,9 +3198,9 @@ class TestMainStaffGating:
         seen = {}
         real = eesel.build_parser
 
-        def spy(staff=False):
+        def spy(staff=False, platform_hint=None):
             seen["staff"] = staff
-            return real(staff)
+            return real(staff, platform_hint)
 
         monkeypatch.setattr(eesel, "build_parser", spy)
         eesel.main(["logout"])  # no network; safe with tmp_config
@@ -8781,6 +8785,7 @@ class TestPathScopeParsesEndToEnd:
             ("agents", "blog", "integrations", "zd", "actions", "enable", "reply"),
             ("agents", "blog", "files", "list"),
             ("agents", "blog", "tasks", "list"),
+            ("agents", "blog", "tasks", "show", "s1"),
             ("agents", "blog", "skills", "list"),
             ("agents", "blog", "skills", "show", "translation"),
             ("agents", "blog", "skills"),
@@ -8835,6 +8840,7 @@ class TestPathScopeVerbScoping:
         assert self.n("agents", "blog", "files", "add", "--title", "t") == ["files", "add", "--title", "t", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "count") == ["tasks", "count", "--agent", "blog"]
         assert self.n("agents", "blog", "tasks", "analytics") == ["tasks", "analytics", "--agent", "blog"]
+        assert self.n("agents", "blog", "tasks", "show", "s1") == ["tasks", "show", "s1", "--agent", "blog"]
 
     def test_non_accepting_verbs_exit_naming_the_verb(self, capsys):
         # A verb the flat parser can't scope by agent exits (code 2) and the error
@@ -8846,7 +8852,10 @@ class TestPathScopeVerbScoping:
                 self.n("agents", "blog", "files", verb, "x")
             assert exc.value.code == 2
             assert f"`{verb}` is not an agent-scoped `files` verb" in capsys.readouterr().err
-        for verb in ("show", "cost"):
+        # `show` IS an agent-scoped tasks verb now (legacy sessions are
+        # namespace-scoped; the path reshapes to `tasks show <id> --agent <id>`).
+        # `cost` still isn't (its flat parser has no --agent).
+        for verb in ("cost",):
             with pytest.raises(SystemExit):
                 self.n("agents", "blog", "tasks", verb, "x")
             assert f"`{verb}` is not an agent-scoped `tasks` verb" in capsys.readouterr().err
@@ -9529,7 +9538,8 @@ class TestExtractGlobalOutputFlags:
     def test_passes_through_unrelated_tokens(self):
         rest, vals = eesel._extract_global_output_flags(["agents", "list", "--plain"])
         assert rest == ["agents", "list", "--plain"]
-        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None}
+        # legacy/platform were added as global platform-override flags.
+        assert vals == {"json": False, "dry_run": False, "secrets": False, "fields": None, "legacy": False, "platform": False}
 
 
 class TestConfigureOutput:
@@ -9783,6 +9793,10 @@ class TestSchema:
         for key, value in eesel._COMMAND_ENDPOINTS.items():
             if key in unverifiable:
                 continue
+            # An entry may document the legacy v2 endpoint after " · legacy: ";
+            # verify the primary (new-platform) clause here — the legacy fetch_*
+            # helpers have their own dedicated URL tests.
+            value = value.split(" · legacy: ")[0]
             method, path = value.split(" ", 1)
             if path.endswith("/*"):
                 # Wildcard family (e.g. billing → GET /subscription/*): satisfied
@@ -9804,6 +9818,32 @@ class TestSchema:
         parsed = json.loads(capsys.readouterr().out)
         assert parsed["prog"] == "eesel"
         assert "agents" in parsed["subcommands"]
+
+    def test_legacy_supported_annotated(self):
+        s = self._schema()
+        agents = s["subcommands"]["agents"]["subcommands"]
+        assert agents["list"]["legacy_supported"] is True
+        assert agents["show"]["legacy_supported"] is True
+        assert agents["create"]["legacy_supported"] is False
+        assert agents["remove"]["legacy_supported"] is False
+        tasks = s["subcommands"]["tasks"]["subcommands"]
+        assert tasks["show"]["legacy_supported"] is True
+        assert tasks["count"]["legacy_supported"] is False
+        integ = s["subcommands"]["integrations"]["subcommands"]
+        assert integ["show"]["legacy_supported"] is True
+        assert integ["available"]["legacy_supported"] is False
+        ws = s["subcommands"]["workspace"]["subcommands"]
+        assert ws["members"]["legacy_supported"] is True
+        assert ws["set"]["legacy_supported"] is False
+        # Wholly-unsupported nouns and universal commands.
+        assert s["subcommands"]["files"]["legacy_supported"] is False
+        assert s["subcommands"]["schema"]["legacy_supported"] is True
+
+    def test_legacy_endpoint_documented(self):
+        s = self._schema()
+        assert "legacy: GET /namespaces" in s["subcommands"]["agents"]["subcommands"]["list"]["endpoint"]
+        assert "legacy:" in s["subcommands"]["integrations"]["subcommands"]["list"]["endpoint"]
+        assert "legacy:" in s["subcommands"]["tasks"]["subcommands"]["show"]["endpoint"]
 
 
 class TestOutputContractThroughMain:
@@ -9910,3 +9950,1072 @@ class TestTasksExportDryRun:
         # The export POST was previewed, never actually sent.
         assert not any("/tasks/export" in u for _, u in calls)
         assert "/tasks/export" in json.loads(capsys.readouterr().out)["url"]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Legacy v2 platform — detection
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestResolvePlatform:
+    """`resolve_platform(creds, args)` decides legacy vs platform:
+    explicit flag → cached value → a one-time license probe (fail-open)."""
+
+    def test_legacy_flag_forces_legacy_without_network(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds, platform="platform")  # opposite cache, must be ignored
+
+        def no_net(*a, **k):
+            raise AssertionError("resolve_platform must not hit the network when a flag is set")
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", no_net)
+        args = argparse.Namespace(legacy=True, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+
+    def test_platform_flag_forces_platform(self, tmp_config, fake_creds):
+        creds = dict(fake_creds, platform="legacy")  # opposite cache, must be ignored
+        args = argparse.Namespace(legacy=False, platform=True)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_flag_override_is_not_persisted(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: (200, {}))
+        eesel.resolve_platform(creds, argparse.Namespace(legacy=True, platform=False))
+        # A forced value never writes the cache.
+        assert "platform" not in (eesel.load_creds() or {})
+
+    def test_cached_value_used_without_network(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds, platform="legacy")
+        calls = []
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda *a, **k: calls.append(1) or (200, {}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+        assert calls == []
+
+    def test_detects_legacy_from_license_and_caches(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        eesel.save_creds(creds)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (200, {"isPlatform": False}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "legacy"
+        assert creds["platform"] == "legacy"  # cached on the dict
+        assert (eesel.load_creds() or {}).get("platform") == "legacy"  # and persisted
+
+    def test_detects_platform_from_license(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (200, {"isPlatform": True}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_fails_open_to_platform_on_probe_error(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+
+        def boom(*a, **k):
+            raise SystemExit(eesel.EXIT_SERVER)
+
+        monkeypatch.setattr(eesel, "http_request_allow_error", boom)
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+    def test_fails_open_to_platform_on_non_200(self, tmp_config, fake_creds, monkeypatch):
+        creds = dict(fake_creds)
+        creds.pop("platform", None)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (500, {"error": "boom"}))
+        args = argparse.Namespace(legacy=False, platform=False)
+        assert eesel.resolve_platform(creds, args) == "platform"
+
+
+class TestPlatformFlags:
+    """`--legacy` / `--platform` are global flags: declared for help/schema,
+    lifted from anywhere in argv, and mutually exclusive."""
+
+    def test_extractor_lifts_legacy_after_subcommand(self):
+        rest, vals = eesel._extract_global_output_flags(["agents", "list", "--legacy"])
+        assert rest == ["agents", "list"]
+        assert vals["legacy"] is True
+        assert vals["platform"] is False
+
+    def test_extractor_lifts_platform_before_subcommand(self):
+        rest, vals = eesel._extract_global_output_flags(["--platform", "whoami"])
+        assert rest == ["whoami"]
+        assert vals["platform"] is True
+        assert vals["legacy"] is False
+
+    def test_parser_declares_legacy_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(["--legacy", "agents", "list"])
+        assert args.legacy is True
+
+    def test_parser_declares_platform_flag(self):
+        args = eesel.build_parser(staff=False).parse_args(["--platform", "agents", "list"])
+        assert args.platform is True
+
+    def test_main_rejects_both_flags(self, tmp_config, fake_creds):
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["agents", "list", "--legacy", "--platform"])
+        assert exc.value.code == eesel.EXIT_USAGE
+
+
+class TestNamespaceResolve:
+    """Legacy namespaces (bots): fetch + resolve by id / id-prefix / name,
+    mirroring the agent resolver."""
+
+    NS = [
+        {"id": "ns-abc123", "namespace": "Support Bot", "connections": ["c1", "c2"], "isOwner": True},
+        {"id": "ns-def456", "namespace": "Sales Bot", "connections": [], "isOwner": True},
+    ]
+
+    def test_fetch_reads_namespaces_key(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: {"namespaces": self.NS})
+        assert eesel.fetch_namespaces(fake_creds) == self.NS
+
+    def test_fetch_accepts_bare_list(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: self.NS)
+        assert eesel.fetch_namespaces(fake_creds) == self.NS
+
+    def test_fetch_hits_namespaces_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(method=method, url=url) or {"namespaces": []})
+        eesel.fetch_namespaces(fake_creds)
+        assert seen["method"] == "GET" and seen["url"].endswith("/namespaces")
+
+    def test_resolve_by_exact_id(self):
+        assert eesel.resolve_namespace(self.NS, "ns-abc123")["namespace"] == "Support Bot"
+
+    def test_resolve_by_id_prefix(self):
+        assert eesel.resolve_namespace(self.NS, "ns-abc")["id"] == "ns-abc123"
+
+    def test_resolve_by_name(self):
+        assert eesel.resolve_namespace(self.NS, "Sales Bot")["id"] == "ns-def456"
+
+    def test_blank_target_matches_nothing(self):
+        assert eesel.resolve_namespace(self.NS, "  ") is None
+
+    def test_strict_unique(self):
+        one, cands = eesel.resolve_namespace_strict(self.NS, "ns-abc123")
+        assert one["id"] == "ns-abc123" and cands == []
+
+    def test_strict_ambiguous_returns_candidates(self):
+        dupes = [{"id": "a", "namespace": "Dup"}, {"id": "b", "namespace": "Dup"}]
+        one, cands = eesel.resolve_namespace_strict(dupes, "Dup")
+        assert one is None and len(cands) == 2
+
+
+class TestLegacyConnectionsData:
+    CONNS = [
+        {"connectionId": "c1", "connectionType": "eesel", "connectionName": "eesel core"},
+        {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"},
+    ]
+
+    def test_fetch_connections_hits_namespace_scoped_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or self.CONNS)
+        assert eesel.fetch_namespace_connections(fake_creds, "ns-1") == self.CONNS
+        assert seen["url"].endswith("/namespaces/ns-1/connections")
+
+    def test_fetch_connections_reads_connections_key(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"connections": self.CONNS})
+        assert eesel.fetch_namespace_connections(fake_creds, "ns-1") == self.CONNS
+
+    def test_fetch_connection_config_returns_entries(self, fake_creds, monkeypatch):
+        entries = [{"name": "customPrompt", "value": "Be nice"}]
+        monkeypatch.setattr(eesel, "http_request", lambda *a, **k: {"configurationEntries": entries})
+        assert eesel.fetch_connection_config(fake_creds, "c1") == entries
+
+    def test_fetch_connection_config_passes_params(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"configurationEntries": []})
+        eesel.fetch_connection_config(fake_creds, "c1", params="customPrompt")
+        assert "params=customPrompt" in seen["url"]
+
+    def test_get_namespace_prompt_reads_eesel_customprompt(self, fake_creds, monkeypatch):
+        def fake(method, url, **k):
+            if url.endswith("/connections"):
+                return self.CONNS
+            if "/connections/c1/configuration" in url:
+                return {"configurationEntries": [{"name": "customPrompt", "value": "You are helpful."}]}
+            return {}
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        assert eesel.get_namespace_prompt(fake_creds, "ns-1") == "You are helpful."
+
+    def test_get_namespace_prompt_empty_when_no_eesel_connection(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "http_request",
+            lambda method, url, **k: [{"connectionId": "c2", "connectionType": "zendesk"}] if url.endswith("/connections") else {},
+        )
+        assert eesel.get_namespace_prompt(fake_creds, "ns-1") == ""
+
+
+class TestLegacySessionsData:
+    def test_fetch_session_hits_scoped_endpoint(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"sessionId": "s1", "messages": []})
+        eesel.fetch_session(fake_creds, "ns-1", "s1")
+        assert seen["url"].endswith("/v2/namespaces/ns-1/sessions/s1")
+
+    def test_fetch_sessions_follows_cursor_to_fill_limit(self, fake_creds, monkeypatch):
+        pages = [
+            {"sessions": [{"sessionId": "s1"}, {"sessionId": "s2"}], "lastEvaluatedKey": "k1"},
+            {"sessions": [{"sessionId": "s3"}], "lastEvaluatedKey": None},
+        ]
+        calls = []
+
+        def fake(method, url, **k):
+            calls.append(url)
+            return pages[len(calls) - 1]
+
+        monkeypatch.setattr(eesel, "http_request", fake)
+        got = eesel.fetch_sessions(fake_creds, "ns-1", limit=10)
+        assert [s["sessionId"] for s in got] == ["s1", "s2", "s3"]
+        assert len(calls) == 2  # followed the cursor exactly once
+
+    def test_fetch_sessions_stops_at_limit(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(
+            eesel, "http_request",
+            lambda method, url, **k: {"sessions": [{"sessionId": "a"}, {"sessionId": "b"}, {"sessionId": "c"}], "lastEvaluatedKey": "more"},
+        )
+        got = eesel.fetch_sessions(fake_creds, "ns-1", limit=2)
+        assert len(got) == 2
+
+    def test_fetch_sessions_passes_search(self, fake_creds, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(eesel, "http_request", lambda method, url, **k: seen.update(url=url) or {"sessions": [], "lastEvaluatedKey": None})
+        eesel.fetch_sessions(fake_creds, "ns-1", limit=5, search="refund")
+        assert "search=refund" in seen["url"]
+
+
+class TestLegacyAgentsCommand:
+    """`agents list/show` on a legacy workspace serves bots (namespaces)."""
+
+    NS = [
+        {"id": "ns-abc123def", "namespace": "Support Bot", "connections": ["c1", "c2"], "isOwner": True},
+        {"id": "ns-def456ghi", "namespace": "Sales Bot", "connections": [], "isOwner": True},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+
+    def test_list_shows_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "Sales Bot" in out
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [])
+        assert eesel.cmd_agents(_parse("agents", "list")) == 0
+        # empty-state note goes to stderr via info(), like `(no agents)` does
+        assert "no bots" in capsys.readouterr().err.lower()
+
+    def test_list_json_emits_namespaces(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [n["id"] for n in parsed] == ["ns-abc123def", "ns-def456ghi"]
+
+    def test_show_includes_prompt(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "You are a support bot.")
+        assert eesel.cmd_agents(_parse("agents", "show", "ns-abc123def")) == 0
+        out = capsys.readouterr().out
+        assert "Support Bot" in out and "You are a support bot." in out
+
+    def test_show_not_found(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        assert eesel.cmd_agents(_parse("agents", "show", "nope")) == 1
+        assert "no bot matches" in capsys.readouterr().err.lower()
+
+    def test_write_verb_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_agents(_parse("agents", "create", "--name", "x"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+class TestLegacyInstructionsCommand:
+    """`instructions` on legacy prints the bot's customPrompt to stdout."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"]}]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_prints_customprompt_to_stdout(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "Be concise.")
+        assert eesel.cmd_instructions(_parse("instructions", "ns-1")) == 0
+        # header goes to stderr; only the prompt lands on stdout (redirect-friendly)
+        assert capsys.readouterr().out.strip() == "Be concise."
+
+    def test_empty_prompt_is_clean(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "get_namespace_prompt", lambda creds, nid: "")
+        assert eesel.cmd_instructions(_parse("instructions", "ns-1")) == 0
+        assert capsys.readouterr().out.strip() == ""
+
+
+class TestLegacyIntegrationsCommand:
+    """`integrations` on legacy serves the bot's (namespace's) connections."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"], "isOwner": True}]
+    CONNS = [
+        {"connectionId": "c1", "connectionType": "eesel", "connectionName": "eesel core"},
+        {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_list_shows_connections(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        out = capsys.readouterr().out
+        assert "c1" in out and "zendesk" in out and "ACME ZD" in out
+
+    def test_list_json_emits_connections(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [c["connectionId"] for c in parsed] == ["c1", "c2"]
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: [])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        # empty-state note goes to stderr via info(), like the other lists
+        assert "no connections" in capsys.readouterr().err.lower()
+
+    def test_list_scopes_named_bot(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: seen.update(nid=nid) or [])
+        # A two-bot workspace needs the bot named; --agent resolves it.
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--agent", "Bot Two")) == 0
+        assert seen["nid"] == "ns-2"
+
+    def test_show_renders_config_entries(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk", "connectionName": "ACME ZD"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "subdomain", "value": "acme"}, {"name": "customPrompt", "value": "Be nice"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2")) == 0
+        out = capsys.readouterr().out
+        assert "subdomain" in out and "acme" in out
+        # customPrompt is not a secret — its value is shown in full
+        assert "customPrompt" in out and "Be nice" in out
+
+    def test_show_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "accessToken", "value": "sk-secret"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2")) == 0
+        out = capsys.readouterr().out
+        assert "sk-secret" not in out and "***" in out
+
+    def test_show_json_masks_secret_config_value(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", False)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        monkeypatch.setattr(eesel, "fetch_connection",
+                            lambda creds, cid: {"connectionId": "c2", "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config",
+                            lambda creds, cid, params=None: [{"name": "accessToken", "value": "sk-secret"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "c2", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        entry = next(e for e in parsed["configurationEntries"] if e["name"] == "accessToken")
+        assert entry["value"] == "***"
+
+    def test_write_verb_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_integrations(_parse("integrations", "sync", "zendesk"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_show_resolves_connection_id_prefix_to_full_id(self, tmp_config, fake_creds, monkeypatch):
+        # `integrations list` prints a truncated id; `show` must resolve that
+        # prefix to the full connectionId before hitting /connections/{id},
+        # else the id you see in the list 404s.
+        self._legacy(monkeypatch)
+        full = "08549cf9-16ab-4ce8-83a8-7b965dcfa54d"
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: [{"connectionId": full, "connectionType": "eesel", "connectionName": "Eesel"}])
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: seen.update(detail=cid) or {"connectionId": cid, "connectionType": "eesel"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: seen.update(cfg=cid) or [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9")) == 0
+        assert seen["detail"] == full and seen["cfg"] == full
+
+    def test_show_unknown_connection_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: self.CONNS)
+        assert eesel.cmd_integrations(_parse("integrations", "show", "nope")) == 1
+        assert "no connection matches" in capsys.readouterr().err.lower()
+
+
+class TestLegacyTasksCommand:
+    """`tasks` on legacy serves the bot's (namespace's) chat sessions."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot", "connections": ["c1"], "isOwner": True}]
+    SESSIONS = [
+        {"sessionId": "s1", "title": "Refund question", "lastUpdated": "2026-07-01", "resolution": "resolved", "aiCsat": 5},
+        {"sessionId": "s2", "title": "Where is my order"},
+    ]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+
+    def test_list_shows_sessions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: self.SESSIONS)
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert "s1" in out and "Refund question" in out and "s2" in out
+
+    def test_list_passes_scope_and_limit(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: seen.update(nid=nid, **k) or [])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--limit", "10")) == 0
+        assert seen["nid"] == "ns-1" and seen["limit"] == 10
+
+    def test_list_json_emits_sessions(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: self.SESSIONS)
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["s1", "s2"]
+
+    def test_list_empty_state(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        assert "no tasks" in capsys.readouterr().err.lower()
+
+    def test_show_renders_transcript(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "title": "Refund", "messages": [
+                {"userMessage": "Where is my refund?", "agentMessage": "It is processing."},
+            ]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        out = capsys.readouterr().out
+        assert "Where is my refund?" in out and "It is processing." in out
+
+    def test_show_truncates_tool_lines_without_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Matching the platform: tool call/result lines cap at 200 unless --full.
+        self._legacy(monkeypatch)
+        long_input = "x" * 500
+        agent = json.dumps([{"type": "tool", "tool": {"name": "Big", "inputs": long_input}}])
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "messages": [{"userMessage": "hi", "agentMessage": agent}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        assert "x" * 300 not in capsys.readouterr().out  # tool line truncated
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--full")) == 0
+        assert long_input in capsys.readouterr().out  # full tool inputs with --full
+
+    def test_show_prose_shown_in_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # The assistant/user prose is never truncated (matches the platform,
+        # which only caps tool args/output) — so a long reply reads in full.
+        self._legacy(monkeypatch)
+        long_msg = "x" * 500
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "messages": [{"userMessage": long_msg, "agentMessage": "ok"}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        assert long_msg in capsys.readouterr().out
+
+    def test_show_json_is_raw(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {"sessionId": "s1", "messages": []})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--json")) == 0
+        assert json.loads(capsys.readouterr().out)["sessionId"] == "s1"
+
+    def test_count_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_tasks(_parse("tasks", "count"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_export_blocked_on_legacy(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel.cmd_tasks(_parse("tasks", "export"))
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+
+class TestLegacySupportsClassification:
+    """`legacy_supports(args)` is the single source of truth for which commands
+    have a read-only meaning on the legacy v2 platform."""
+
+    @pytest.mark.parametrize("argv", [
+        ("agents", "list"), ("agents", "show", "ns-1"),
+        ("integrations", "list"), ("integrations", "show", "c1"),
+        ("tasks", "list"), ("tasks", "show", "s1"),
+        ("workspace", "show"), ("workspace", "members"),
+        ("instructions",), ("whoami",), ("login",), ("logout",),
+        ("link", "https://x.preprod.eesel.xyz"), ("schema",),
+    ])
+    def test_supported(self, argv):
+        assert eesel.legacy_supports(_parse(*argv)) is True
+
+    @pytest.mark.parametrize("argv", [
+        ("agents", "create", "--name", "x"), ("agents", "set", "ns-1", "--name", "y"),
+        ("agents", "remove", "ns-1", "-f"),
+        ("integrations", "sync", "zendesk"), ("integrations", "remove", "c1", "-f"),
+        ("tasks", "count"), ("tasks", "analytics"), ("tasks", "export"),
+        ("workspace", "extend-trial"),
+        ("files", "list"), ("skills", "list", "a"), ("mcp", "list"),
+        ("chat", "hi"), ("new",), ("billing", "show"),
+    ])
+    def test_unsupported(self, argv):
+        assert eesel.legacy_supports(_parse(*argv)) is False
+
+    def test_bare_agents_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("agents")) is True
+
+    def test_bare_workspace_defaults_to_show_supported(self):
+        assert eesel.legacy_supports(_parse("workspace")) is True
+
+    def test_bare_tasks_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("tasks")) is True
+
+    def test_bare_integrations_defaults_to_list_supported(self):
+        assert eesel.legacy_supports(_parse("integrations")) is True
+
+
+class TestGuardPlatformCommand:
+    """`_guard_platform_command` refuses unsupported commands on legacy before
+    any handler runs, and stays out of the way otherwise."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+
+    def _platform(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "platform")
+
+    def test_refuses_unsupported_on_legacy(self, fake_creds, monkeypatch):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit) as exc:
+            eesel._guard_platform_command(_parse("files", "list"), fake_creds)
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_allows_supported_on_legacy_without_resolving(self, fake_creds, monkeypatch):
+        # A supported command returns before touching resolve_platform.
+        def boom(*a, **k):
+            raise AssertionError("supported commands must not resolve the platform")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("agents", "list"), fake_creds) is None
+
+    def test_noop_on_new_platform(self, fake_creds, monkeypatch):
+        self._platform(monkeypatch)
+        assert eesel._guard_platform_command(_parse("files", "list"), fake_creds) is None
+
+    def test_no_creds_no_flag_is_noop_without_network(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("must not resolve platform without creds or a flag")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("files", "list"), None) is None
+
+    def test_legacy_supports_impersonate(self):
+        # impersonate is a cross-cutting staff command, not a platform surface.
+        assert eesel.legacy_supports(_parse("impersonate", "u-1")) is True
+
+    def test_allows_impersonate_on_legacy_without_resolving(self, fake_creds, monkeypatch):
+        # It must work on legacy too, gated only server-side (the /sysadmin
+        # endpoint) — never refused by, nor even resolving, the platform.
+        def boom(*a, **k):
+            raise AssertionError("impersonate must not be platform-gated")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("impersonate", "u-1"), fake_creds) is None
+
+    def test_message_names_the_command(self, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        with pytest.raises(SystemExit):
+            eesel._guard_platform_command(_parse("tasks", "count"), fake_creds)
+        assert "tasks count" in capsys.readouterr().err
+
+    def test_end_to_end_through_main_refuses(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        with pytest.raises(SystemExit) as exc:
+            eesel.main(["files", "list"])
+        assert exc.value.code == eesel.EXIT_VALIDATION
+
+    def test_end_to_end_through_main_allows_supported(self, tmp_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [])
+        assert eesel.main(["agents", "list"]) == 0
+
+
+class TestWhoamiPlatform:
+    """`whoami` reports the resolved platform."""
+
+    def test_shows_platform_legacy(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda creds: None)
+        assert eesel.cmd_whoami(_parse("whoami")) == 0
+        assert "platform     : legacy (v2)" in capsys.readouterr().out
+
+    def test_shows_platform_new(self, tmp_config, fake_creds, monkeypatch, capsys):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "platform")
+        monkeypatch.setattr(eesel, "_get_impersonate_status", lambda creds: None)
+        assert eesel.cmd_whoami(_parse("whoami")) == 0
+        assert "platform     : platform" in capsys.readouterr().out
+
+
+class TestLegacyMessageParts:
+    """`_legacy_message_parts` classifies a stored message field into ordered
+    (kind, text) pairs — text/think/tool — so `tasks show` can render tool
+    details dimmed like the platform. Never raises."""
+
+    def test_plain_string_is_one_text_part(self):
+        assert eesel._legacy_message_parts("Hello there") == [("text", "Hello there")]
+
+    def test_none_is_empty(self):
+        assert eesel._legacy_message_parts(None) == []
+
+    def test_message_parts_are_text(self):
+        out = eesel._legacy_message_parts('[{"type":"message","message":"Hi there"}]')
+        assert out == [("text", "Hi there")]
+
+    def test_think_tool_shows_the_thought(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "the user needs help"})}}])
+        assert eesel._legacy_message_parts(raw) == [("think", "[thinking] the user needs help")]
+
+    def test_other_tool_shows_name_and_inputs(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "create_ticket", "name": "Create Ticket",
+                                                    "inputs": json.dumps({"email": "a@b.com"})}}])
+        assert eesel._legacy_message_parts(raw) == [("tool", '[tool] Create Ticket {"email": "a@b.com"}')]
+
+    def test_tool_result_rendered_as_arrow(self):
+        raw = json.dumps([{"type": "tool", "tool": {"name": "Create Ticket", "inputs": "{}",
+                                                    "output": {"success": True}}}])
+        out = eesel._legacy_message_parts(raw)
+        assert ("tool", "[tool] Create Ticket {}") in out
+        assert any(k == "tool" and t.startswith("[tool] →") and "success" in t for k, t in out)
+
+    def test_invalid_jsonish_string_passthrough(self):
+        assert eesel._legacy_message_parts("[not json] hello") == [("text", "[not json] hello")]
+
+    def test_mixed_think_then_message(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "hmm"})}},
+                          {"type": "message", "message": "Here you go."}])
+        assert eesel._legacy_message_parts(raw) == [("think", "[thinking] hmm"), ("text", "Here you go.")]
+
+    def test_render_turn_shows_thought_and_reply(self, capsys):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "analyzing"})}},
+                          {"type": "message", "message": "Here is the answer."}])
+        eesel._render_legacy_turn({"userMessage": "help", "agentMessage": raw}, full=True)
+        out = capsys.readouterr().out
+        assert "[thinking] analyzing" in out and "Here is the answer." in out
+        assert "[{" not in out and '"type"' not in out
+
+    def test_render_collapses_consecutive_duplicate_tool_lines(self, capsys):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking", "inputs": "{}"}},
+                          {"type": "tool", "tool": {"key": "think", "name": "Finished Thinking", "inputs": "{}"}}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=True)
+        assert capsys.readouterr().out.count("[thinking]") == 1
+
+    def test_render_does_not_truncate_message_prose(self, capsys):
+        long = "x" * 500
+        raw = json.dumps([{"type": "message", "message": long}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=False)
+        assert long in capsys.readouterr().out  # prose is shown in full even without --full
+
+    def test_render_truncates_tool_line(self, capsys):
+        big = "y" * 500
+        raw = json.dumps([{"type": "tool", "tool": {"name": "Big Tool", "inputs": big}}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=False)
+        out = capsys.readouterr().out
+        # The whole line (prefix + inputs) is capped at 200, so most y's are cut.
+        assert "y" * 100 in out and "y" * 300 not in out
+        assert max(len(ln) for ln in out.splitlines()) <= 200
+
+
+class TestLegacyHelpHiding:
+    """With platform_hint='legacy', build_parser trims `--help` to the read
+    commands, but every hidden command stays parseable (guard gives the note)."""
+
+    def _legacy(self):
+        return eesel.build_parser(staff=False, platform_hint="legacy")
+
+    def _child(self, parser, noun):
+        return _subparsers_action(_subparsers_action(parser).choices[noun])
+
+    def test_hides_wholly_unsupported_nouns(self):
+        visible = _visible_commands(self._legacy())
+        # `sessions` (local chat-session mgmt) belongs with chat/new — all hidden
+        # on legacy, so nothing is visible-but-refused.
+        for hidden in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing", "sessions"):
+            assert hidden not in visible, hidden
+        for shown in ("agents", "integrations", "tasks", "workspace", "whoami", "schema"):
+            assert shown in visible, shown
+
+    def test_hides_write_subcommands_under_agents(self):
+        visible = {a.dest for a in self._child(self._legacy(), "agents")._choices_actions}
+        assert visible == {"list", "show"}
+
+    def test_hides_partial_subcommands(self):
+        parser = self._legacy()
+        for noun, expected in [
+            ("integrations", {"list", "show"}),
+            ("tasks", {"list", "show"}),
+            ("workspace", {"show", "members"}),
+        ]:
+            visible = {a.dest for a in self._child(parser, noun)._choices_actions}
+            assert visible == expected, (noun, visible)
+
+    def test_help_text_omits_hidden(self):
+        help_text = self._legacy().format_help()
+        assert "files" not in help_text and "skills" not in help_text
+
+    def test_agents_help_omits_write_verbs(self):
+        # Assert on the write subparsers' unique help strings — the path-scope
+        # epilog legitimately references `set`/`remove`, so a bare word check
+        # would be a false positive.
+        agents_help = _subparsers_action(self._legacy()).choices["agents"].format_help()
+        assert "Create a new agent" not in agents_help
+        assert "Remove an agent" not in agents_help
+        assert "Change an agent's name" not in agents_help
+        # ...and they stay for the new platform.
+        full = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"].format_help()
+        assert "Create a new agent" in full and "Remove an agent" in full
+
+    def test_metavar_does_not_leak_hidden(self):
+        # The usage-line metavar is rebuilt, so no hidden noun leaks into `{...}`.
+        top = _subparsers_action(self._legacy())
+        listed = set((top.metavar or "").strip("{}").split(","))
+        assert "files" not in listed and "skills" not in listed
+
+    def test_agents_path_epilog_trimmed_on_legacy(self):
+        # The "scope by path" epilog must not advertise verbs/nouns that don't
+        # apply on legacy (set, skills, files, chat, remove-integration).
+        agents_help = _subparsers_action(self._legacy()).choices["agents"].format_help()
+        for gone in ("agents <id> set", "skills list", "files list", 'chat "', "remove <integration>"):
+            assert gone not in agents_help, gone
+        # ...but the supported path examples stay.
+        assert "integrations list" in agents_help
+        assert "tasks list" in agents_help
+
+    def test_agents_path_epilog_full_on_platform(self):
+        agents_help = _subparsers_action(eesel.build_parser(staff=False)).choices["agents"].format_help()
+        for shown in ("agents <id> set", "skills list", "files list", 'chat "'):
+            assert shown in agents_help, shown
+
+    def test_platform_hint_none_shows_everything(self):
+        visible = _visible_commands(eesel.build_parser(staff=False))
+        for shown in ("files", "skills", "mcp", "settings", "chat", "new", "cost", "automations", "billing"):
+            assert shown in visible, shown
+
+    def test_platform_hint_platform_shows_everything(self):
+        visible = _visible_commands(eesel.build_parser(staff=False, platform_hint="platform"))
+        assert "files" in visible and "skills" in visible
+        agents = {a.dest for a in self._child(eesel.build_parser(staff=False, platform_hint="platform"), "agents")._choices_actions}
+        assert {"create", "set", "remove"}.issubset(agents)
+
+    def test_hidden_noun_still_parses(self):
+        args = self._legacy().parse_args(["files", "list"])
+        assert args.cmd == "files"
+
+    def test_hidden_subcommand_still_parses(self):
+        args = self._legacy().parse_args(["agents", "create", "--name", "X"])
+        assert args.cmd == "agents" and args.agents_cmd == "create"
+
+
+class TestLegacyScopeNamespaces:
+    """`_legacy_scope_namespaces` picks which bots a workspace-wide legacy
+    command spans: a named bot → just that one; no name → the sole bot, or ALL
+    bots on a multi-bot workspace (the aggregate behaviour)."""
+
+    def _stub(self, monkeypatch, ns):
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: ns)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_no_bots_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert nss == [] and rc == 1
+        assert "no bots" in capsys.readouterr().err.lower()
+
+    def test_single_bot_no_target(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "Only"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1"]
+
+    def test_multi_bot_no_target_returns_all(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1", "ns-2"]
+
+    def test_target_resolves_one(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="B"))
+        assert rc is None and [n["id"] for n in nss] == ["ns-2"]
+
+    def test_target_from_env(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        monkeypatch.setenv("EESEL_AGENT", "A")
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1"]
+
+    def test_target_ambiguous_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [{"id": "a", "namespace": "Dup"}, {"id": "b", "namespace": "Dup"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="Dup"))
+        assert nss == [] and rc == 1
+        assert "ambiguous" in capsys.readouterr().err.lower()
+
+    def test_target_not_found_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="nope"))
+        assert nss == [] and rc == 1
+        assert "no bot matches" in capsys.readouterr().err.lower()
+
+
+class TestLegacyTasksAggregate:
+    """`tasks list` on legacy is workspace-wide: aggregate across all bots
+    (newest first, bot-tagged) unless a bot is named with --agent / EESEL_AGENT."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_aggregates_across_all_bots_newest_first(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        by_bot = {
+            "ns-1": [{"sessionId": "a1", "lastUpdated": "2026-07-01"}],
+            "ns-2": [{"sessionId": "b1", "lastUpdated": "2026-07-05"},
+                     {"sessionId": "b2", "lastUpdated": "2026-06-01"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: by_bot[nid])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1", "a1", "b2"]  # newest first across bots
+        tags = {s["sessionId"]: (s["namespaceId"], s["botName"]) for s in parsed}
+        assert tags["a1"] == ("ns-1", "Bot One")
+        assert tags["b1"] == ("ns-2", "Bot Two")
+
+    def test_missing_lastupdated_sorts_last(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        by_bot = {
+            "ns-1": [{"sessionId": "a1"}],  # no lastUpdated
+            "ns-2": [{"sessionId": "b1", "lastUpdated": "2026-07-05"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: by_bot[nid])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1", "a1"]
+
+    def test_respects_overall_limit(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [
+            {"sessionId": f"{nid}-a", "lastUpdated": "2026-07-01"},
+            {"sessionId": f"{nid}-b", "lastUpdated": "2026-07-02"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--limit", "3", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert len(parsed) == 3  # 4 total across 2 bots, capped at the overall limit
+
+    def test_human_view_shows_bot_column(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k:
+                            [{"sessionId": "a1", "lastUpdated": "2026-07-01"}] if nid == "ns-1"
+                            else [{"sessionId": "b1", "lastUpdated": "2026-07-02"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Bot One" in out and "Bot Two" in out and "a1" in out and "b1" in out
+
+    def test_agent_filter_scopes_to_one_bot(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        calls = []
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k:
+                            calls.append(nid) or ([{"sessionId": "b1", "lastUpdated": "x"}] if nid == "ns-2" else []))
+        assert eesel.cmd_tasks(_parse("tasks", "list", "--agent", "Bot Two", "--json")) == 0
+        assert calls == ["ns-2"]  # only the named bot is fetched
+        parsed = json.loads(capsys.readouterr().out)
+        assert [s["sessionId"] for s in parsed] == ["b1"]
+
+
+class TestLegacyIntegrationsAggregate:
+    """`integrations list` on legacy is workspace-wide: aggregate connections
+    across all bots (bot-tagged) unless a bot is named."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_aggregates_across_all_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "c1", "connectionType": "eesel", "connectionName": "E1"}] if nid == "ns-1"
+                            else [{"connectionId": "c2", "connectionType": "zendesk", "connectionName": "Z2"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [c["connectionId"] for c in parsed] == ["c1", "c2"]
+        tags = {c["connectionId"]: c["botName"] for c in parsed}
+        assert tags["c1"] == "Bot One" and tags["c2"] == "Bot Two"
+
+    def test_human_view_shows_bot_column(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "c1", "connectionType": "eesel", "connectionName": "E1"}] if nid == "ns-1"
+                            else [{"connectionId": "c2", "connectionType": "zendesk", "connectionName": "Z2"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Bot One" in out and "Bot Two" in out and "zendesk" in out
+
+    def test_empty_across_all_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: [])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        assert "no connections" in capsys.readouterr().err.lower()
+
+
+class TestLegacyTasksShowScoping:
+    """`tasks show` accepts `--agent` (so it can be scoped on legacy and the
+    `agents X tasks show` path reshape works), and without a named bot it finds
+    the owning bot by a cross-bot probe."""
+
+    def test_show_accepts_agent_flag(self):
+        # The exact command the user hit must PARSE (was: unrecognized arguments).
+        args = _parse("tasks", "show", "zendesk-chat-6a5", "--agent", "Chatboks")
+        assert args.agent == "Chatboks"
+
+    def test_path_scope_reshapes_tasks_show(self):
+        assert eesel._normalize_path_scope_argv(["agents", "Chatboks", "tasks", "show", "s1"]) == \
+            ["tasks", "show", "s1", "--agent", "Chatboks"]
+
+    def test_path_scope_tasks_show_parses_end_to_end(self):
+        argv = eesel._normalize_path_scope_argv(["agents", "blog", "tasks", "show", "s1"])
+        args = eesel.build_parser().parse_args(argv)
+        assert args.cmd == "tasks" and args.tasks_cmd == "show" and args.agent == "blog"
+
+    def _legacy_multi(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_show_finds_owning_bot_when_not_named(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "http_request_allow_error",
+                            lambda method, url, **k: (200, {}) if "/namespaces/ns-2/sessions/s9" in url else (404, {}))
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: seen.update(nid=nid) or {
+            "sessionId": sid, "messages": [{"userMessage": "hi", "agentMessage": "yo"}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s9")) == 0
+        assert seen["nid"] == "ns-2"  # resolved the owning bot by probing
+        assert "hi" in capsys.readouterr().out
+
+    def test_show_not_found_in_any_bot(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "http_request_allow_error", lambda method, url, **k: (404, {}))
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s9")) == 1
+        assert "no session" in capsys.readouterr().err.lower()
+
+    def test_show_named_bot_scopes_directly(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        # A probe must NOT happen when the bot is named.
+        monkeypatch.setattr(eesel, "http_request_allow_error",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not probe when named")))
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: seen.update(nid=nid) or {"sessionId": sid, "messages": []})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--agent", "Bot Two")) == 0
+        assert seen["nid"] == "ns-2"
+
+
+class TestLegacyIntegrationsShowScoping:
+    """`integrations show <conn>` on legacy resolves the connection across the
+    scope — all bots by default, or just the named one — so a bare id-prefix
+    works on a multi-bot workspace without naming a bot."""
+
+    FULL = "08549cf9-16ab-4ce8-83a8-7b965dcfa54d"
+
+    def _legacy_multi(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_resolves_prefix_across_all_bots_when_not_named(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy_multi(monkeypatch)
+        by_bot = {
+            "ns-1": [{"connectionId": "aaaa1111-0000-0000-0000-000000000000", "connectionType": "eesel"}],
+            "ns-2": [{"connectionId": self.FULL, "connectionType": "zendesk", "connectionName": "ZD"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: by_bot[nid])
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: seen.update(detail=cid) or {"connectionId": cid, "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: seen.update(cfg=cid) or [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9")) == 0
+        assert seen["detail"] == self.FULL and seen["cfg"] == self.FULL
+
+    def test_ambiguous_prefix_across_bots_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "dup12300-aaaa", "connectionType": "eesel"}] if nid == "ns-1"
+                            else [{"connectionId": "dup12300-bbbb", "connectionType": "zendesk"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "dup123")) == 1
+        assert "ambiguous" in capsys.readouterr().err.lower()
+
+    def test_scoped_to_named_bot(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy_multi(monkeypatch)
+        calls = []
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: calls.append(nid) or ([{"connectionId": self.FULL, "connectionType": "zendesk"}] if nid == "ns-2" else []))
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: {"connectionId": cid, "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9", "--agent", "Bot Two")) == 0
+        assert calls == ["ns-2"]  # only the named bot's connections gathered
+
+
+class TestLegacyTasksListFullId:
+    """The human `tasks list` must show the FULL sessionId: Zendesk chat ids
+    share a long common prefix, so a truncated column renders them identical and
+    unusable for the follow-up `tasks show`."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot"}]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_full_session_id_shown(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        a = "zendesk-chat-6a62acb46a9803691333d01a"
+        b = "zendesk-chat-6a628aa018dc17f505fc140c"  # same 16-char prefix as `a`
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [
+            {"sessionId": a, "lastUpdated": "2026-07-02"},
+            {"sessionId": b, "lastUpdated": "2026-07-01"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert a in out and b in out  # both full ids present and distinguishable

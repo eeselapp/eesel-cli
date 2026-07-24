@@ -719,6 +719,144 @@ def save_creds(creds: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Platform detection (legacy v2 vs the new platform)
+# ──────────────────────────────────────────────────────────────────────────
+
+# eesel serves two products from one backend: the new "platform" (agents) and
+# the legacy "v2" platform (bots/namespaces). Read commands work on both; the
+# CLI serves the right backend per invocation. The signal is the same one the
+# dashboard middleware routes on — `GET /subscription/license` → `isPlatform`,
+# the server-side `eesel-agents` flag.
+PLATFORM_LEGACY = "legacy"
+PLATFORM_NEW = "platform"
+
+
+def fetch_platform_from_license(creds: dict) -> str:
+    """Probe the workspace's platform from `GET /subscription/license`.
+
+    Returns "legacy" only when the license reports `isPlatform is False` — the
+    exact signal the dashboard routes on. Any other value, a non-200, or a
+    transport error fails **open** to "platform", so a detection hiccup never
+    blocks a new-platform user.
+    """
+    try:
+        status, data = http_request_allow_error(
+            "GET", f"{creds['api_url']}/subscription/license", token=creds.get("token")
+        )
+    except SystemExit:
+        return PLATFORM_NEW
+    except Exception:
+        return PLATFORM_NEW
+    if status == 200 and isinstance(data, dict) and data.get("isPlatform") is False:
+        return PLATFORM_LEGACY
+    return PLATFORM_NEW
+
+
+def resolve_platform(creds: dict, args=None) -> str:
+    """Decide whether this invocation targets the legacy v2 platform or the new
+    platform, once per run.
+
+    Priority: an explicit ``--legacy`` / ``--platform`` flag (never persisted) →
+    the cached ``creds["platform"]`` → a one-time license probe, whose result is
+    cached back onto ``creds`` (and to disk, minus transient ``_``-keys) so later
+    commands stay offline. Linked branch envs are ephemeral, so `save_creds`
+    won't persist the cache there — each command re-probes (or pass `--legacy`).
+    """
+    if getattr(args, "legacy", False):
+        return PLATFORM_LEGACY
+    if getattr(args, "platform", False):
+        return PLATFORM_NEW
+    cached = creds.get("platform")
+    if cached in (PLATFORM_LEGACY, PLATFORM_NEW):
+        return cached
+    detected = fetch_platform_from_license(creds)
+    creds["platform"] = detected
+    try:
+        save_creds({k: v for k, v in creds.items() if not k.startswith("_")})
+    except Exception:
+        pass
+    return detected
+
+
+# Which commands have a read-only meaning on the legacy v2 platform. Everything
+# else is refused there — the platform is read-only, and most nouns have no v2
+# analogue. This is the SINGLE source of truth, shared by the pre-dispatch guard
+# (`_guard_platform_command`), the `--help` trimming (`build_parser`), and the
+# `eesel schema` annotation (`_serialize_parser`).
+# Cross-cutting commands that work on either platform. `impersonate` is a staff
+# command gated server-side (the /sysadmin endpoints 401 for non-impersonators)
+# and by the `staff` --help gate — it is NOT a platform surface, so the legacy
+# guard must never refuse it.
+_LEGACY_UNIVERSAL = frozenset({"login", "logout", "whoami", "link", "schema", "impersonate"})
+# noun → the subcommands supported on legacy (None ⇒ the whole noun is supported).
+_LEGACY_SUPPORTED_SUBS = {
+    "agents": frozenset({"list", "show"}),
+    "instructions": None,
+    "integrations": frozenset({"list", "show"}),
+    "tasks": frozenset({"list", "show"}),
+    "workspace": frozenset({"show", "members"}),
+}
+# The subcommand a bare `eesel <noun>` resolves to, mirroring each handler's
+# `sub = ... or "..."`, so a group invoked with no verb is classified by default.
+_LEGACY_DEFAULT_SUB = {
+    "agents": "list", "integrations": "list", "tasks": "list", "workspace": "show",
+}
+# Where each noun's chosen subcommand is stored on the parsed args namespace.
+_LEGACY_SUB_DEST = {
+    "agents": "agents_cmd", "integrations": "integrations_cmd",
+    "tasks": "tasks_cmd", "workspace": "workspace_cmd",
+}
+# Top-level nouns with no legacy read meaning at all — hidden wholesale from
+# `--help` on legacy (they stay parseable; the guard refuses them).
+_LEGACY_HIDDEN_NOUNS = (
+    "files", "skills", "mcp", "settings", "chat", "new", "cost",
+    "automations", "billing", "sessions",
+)
+
+
+def _legacy_supports_cmd(cmd: str | None, sub: str | None) -> bool:
+    """Whether `<cmd> [sub]` is available on the legacy v2 platform."""
+    if cmd in _LEGACY_UNIVERSAL:
+        return True
+    if cmd not in _LEGACY_SUPPORTED_SUBS:
+        return False
+    subs = _LEGACY_SUPPORTED_SUBS[cmd]
+    return True if subs is None else sub in subs
+
+
+def legacy_supports(args) -> bool:
+    """The single classifier: does the parsed command work on legacy? Keyed on
+    the command plus its resolved subcommand (a bare noun uses its default)."""
+    cmd = getattr(args, "cmd", None)
+    dest = _LEGACY_SUB_DEST.get(cmd)
+    sub = getattr(args, dest, None) if dest else None
+    if sub is None:
+        sub = _LEGACY_DEFAULT_SUB.get(cmd)
+    return _legacy_supports_cmd(cmd, sub)
+
+
+def _legacy_supports_path(path: tuple) -> bool:
+    """`legacy_supports` for a schema command path, e.g. ('agents','create')."""
+    if not path:
+        return False
+    cmd = path[0]
+    sub = path[1] if len(path) > 1 else _LEGACY_DEFAULT_SUB.get(cmd)
+    return _legacy_supports_cmd(cmd, sub)
+
+
+def _command_label(args) -> str:
+    """A human label for the current command (e.g. 'agents create') for the
+    guard's refusal message. Includes the resolved subcommand when the noun
+    tracks one, matching the inline `_legacy_unsupported` fallbacks."""
+    cmd = getattr(args, "cmd", None) or "?"
+    dest = _LEGACY_SUB_DEST.get(cmd)
+    sub = getattr(args, dest, None) if dest else None
+    if sub is None:
+        sub = _LEGACY_DEFAULT_SUB.get(cmd)
+    return f"{cmd} {sub}" if sub else cmd
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Per-worktree branch-env link (`eesel link`)
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -1866,6 +2004,148 @@ def fetch_agents(creds: dict) -> list[dict]:
     return items
 
 
+# ── Legacy v2 namespaces (bots) ───────────────────────────────────────────
+# The legacy platform's unit is a "namespace" (user-facing "bot"), addressed by
+# `id`, with a display name in the `namespace` field. These mirror the agent
+# resolvers so the same --agent/EESEL_AGENT scoping resolves a bot in legacy mode.
+
+
+def fetch_namespaces(creds: dict) -> list[dict]:
+    """Return the workspace's legacy v2 namespaces from GET /namespaces.
+
+    The endpoint is user-scoped (resolved from the token), so no query param.
+    Response is `{namespaces: [...]}`; a bare list is tolerated.
+    """
+    data = http_request("GET", f"{creds['api_url']}/namespaces", token=creds.get("token"))
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("namespaces") or data.get("items") or []
+    return []
+
+
+def match_namespaces(namespaces: list[dict], target: str) -> list[dict]:
+    """Namespaces matching `target`, in resolution-priority order: exact id,
+    then id-prefix, then exact `namespace` (name). A blank target matches
+    nothing (so it can't resolve as a lone match on a single-bot workspace).
+    Mirrors `match_agents`."""
+    if not (target or "").strip():
+        return []
+    exact_id = [n for n in namespaces if n.get("id") == target]
+    if exact_id:
+        return exact_id
+    prefix = [n for n in namespaces if (n.get("id") or "").startswith(target)]
+    name = [n for n in namespaces if n.get("namespace") == target and n not in prefix]
+    return prefix + name
+
+
+def resolve_namespace(namespaces: list[dict], target: str) -> dict | None:
+    """First namespace matching `target`, or None (first-match; arbitrary
+    tie-break). Use `resolve_namespace_strict` where ambiguity must be refused."""
+    matches = match_namespaces(namespaces, target)
+    return matches[0] if matches else None
+
+
+def resolve_namespace_strict(namespaces: list[dict], target: str) -> tuple[dict | None, list[dict]]:
+    """Resolve `target` to exactly one namespace. Returns (ns, []) on a unique
+    match, (None, candidates) when more than one matches, (None, []) when none."""
+    matches = match_namespaces(namespaces, target)
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
+
+
+# ── Legacy v2 connections + configuration ─────────────────────────────────
+# Legacy "connections" are the v2 equivalent of integrations. The system prompt
+# is NOT a namespace field — it's a config entry named `customPrompt` on the
+# connection whose type is `eesel`.
+CONNECTION_TYPE_EESEL = "eesel"
+CONNECTION_CONFIG_CUSTOM_PROMPT = "customPrompt"
+
+
+def fetch_namespace_connections(creds: dict, namespace_id: str) -> list[dict]:
+    """A namespace's connections from GET /namespaces/{id}/connections."""
+    nid = validate_id(namespace_id, "namespace id")
+    data = http_request("GET", f"{creds['api_url']}/namespaces/{nid}/connections", token=creds.get("token"))
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("connections") or []
+    return []
+
+
+def fetch_connection(creds: dict, connection_id: str) -> dict:
+    """One connection's detail from GET /connections/{id}."""
+    cid = validate_id(connection_id, "connection id")
+    data = http_request("GET", f"{creds['api_url']}/connections/{cid}", token=creds.get("token"))
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def fetch_connection_config(creds: dict, connection_id: str, params: str | None = None) -> list[dict]:
+    """A connection's configuration entries from GET
+    /connections/{id}/configuration. `params` optionally filters to
+    comma-separated entry names (e.g. "customPrompt"). Returns the
+    `configurationEntries` list."""
+    cid = validate_id(connection_id, "connection id")
+    url = f"{creds['api_url']}/connections/{cid}/configuration"
+    if params:
+        url += "?" + urllib.parse.urlencode({"params": params})
+    data = http_request("GET", url, token=creds.get("token"))
+    if isinstance(data, dict):
+        return data.get("configurationEntries") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def get_namespace_prompt(creds: dict, namespace_id: str) -> str:
+    """The namespace's system prompt: the `customPrompt` config entry on its
+    `eesel` connection. Empty string when there's no eesel connection or no
+    customPrompt entry (a clean 'no prompt set')."""
+    conns = fetch_namespace_connections(creds, namespace_id)
+    eesel_conn = next((c for c in conns if c.get("connectionType") == CONNECTION_TYPE_EESEL), None)
+    if not eesel_conn:
+        return ""
+    entries = fetch_connection_config(creds, eesel_conn.get("connectionId"), params=CONNECTION_CONFIG_CUSTOM_PROMPT)
+    entry = next((e for e in entries if e.get("name") == CONNECTION_CONFIG_CUSTOM_PROMPT), None)
+    return (entry.get("value") if entry else "") or ""
+
+
+# ── Legacy v2 chat history (sessions) ─────────────────────────────────────
+
+
+def fetch_session(creds: dict, namespace_id: str, session_id: str) -> dict:
+    """One conversation's full transcript from
+    GET /v2/namespaces/{id}/sessions/{sessionId}."""
+    nid = validate_id(namespace_id, "namespace id")
+    sid = validate_id(session_id, "session id")
+    data = http_request("GET", f"{creds['api_url']}/v2/namespaces/{nid}/sessions/{sid}", token=creds.get("token"))
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def fetch_sessions(creds: dict, namespace_id: str, *, limit: int = 50, search: str | None = None) -> list[dict]:
+    """List chat sessions from GET /v2/namespaces/{id}/sessions, following the
+    opaque `lastEvaluatedKey` cursor internally until `limit` rows are gathered
+    (or the source is exhausted)."""
+    nid = validate_id(namespace_id, "namespace id")
+    base = f"{creds['api_url']}/v2/namespaces/{nid}/sessions"
+    out: list[dict] = []
+    cursor: str | None = None
+    while len(out) < limit:
+        params: dict = {"limit": limit}
+        if search:
+            params["search"] = search
+        if cursor:
+            params["lastEvaluatedKey"] = cursor
+        data = http_request("GET", f"{base}?{urllib.parse.urlencode(params)}", token=creds.get("token"))
+        page = data.get("sessions") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        out.extend(page or [])
+        cursor = data.get("lastEvaluatedKey") if isinstance(data, dict) else None
+        if not cursor or not page:
+            break
+    return out[:limit]
+
+
 def match_agents(agents: list[dict], target: str) -> list[dict]:
     """All agents matching `target`, in resolution-priority order: an exact id
     first, then id-prefix matches, then exact-name matches.
@@ -2770,6 +3050,10 @@ def cmd_whoami(args) -> int:
     print(f"env          : {creds.get('env')}")
     print(f"api_url      : {creds.get('api_url')}")
     print(f"workspace_id : {shown.get('workspace_id')}")
+    # Which product this login resolves to — legacy v2 (bots/namespaces) or the
+    # new platform (agents). Flag/cache-first, so this is normally a local read.
+    platform = resolve_platform(creds, args)
+    print(f"platform     : {'legacy (v2)' if platform == PLATFORM_LEGACY else platform}")
     # No stored "active agent": each agent-scoped command names its own agent
     # (path `agents <id> …`, `--agent`, or EESEL_AGENT), and a single-agent
     # workspace is used automatically.
@@ -2820,8 +3104,141 @@ def cmd_link(args) -> int:
     return 0
 
 
+def _legacy_unsupported(cmd_label: str) -> int:
+    """Refuse a command that has no read-only meaning on the legacy v2 platform.
+    Fails client-side (no network) with EXIT_VALIDATION."""
+    fail(EXIT_VALIDATION, f"'{cmd_label}' is not available on the legacy (v2) platform (read-only).")
+
+
+def resolve_namespace_or_error(creds: dict, target: str | None) -> dict | None:
+    """Legacy counterpart of `resolve_agent_or_error`: resolve which bot
+    (namespace) a command acts on, or print why it couldn't and return None.
+    Scope comes from `--agent`/EESEL_AGENT (a single-bot workspace needs none);
+    an ambiguous name is refused rather than resolved arbitrarily."""
+    target = target or os.environ.get("EESEL_AGENT")
+    namespaces = fetch_namespaces(creds)
+    if not namespaces:
+        err("No bots in this workspace.")
+        return None
+    if not target:
+        if len(namespaces) == 1:
+            validate_id(namespaces[0].get("id"), "namespace id")
+            return namespaces[0]
+        err(f"This workspace has {len(namespaces)} bots — name the one to act on:")
+        for n in namespaces:
+            err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+        err("Scope it with `eesel agents <id> <command>`, a `--agent <id|name>` flag, "
+            "or EESEL_AGENT=<id|name>.")
+        return None
+    ns, candidates = resolve_namespace_strict(namespaces, target)
+    if ns:
+        validate_id(ns.get("id"), "namespace id")
+        return ns
+    if candidates:
+        err(f"'{target}' is ambiguous — it matches {len(candidates)} bots:")
+        for n in candidates:
+            err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+        err("Re-run with a full bot id to disambiguate.")
+    else:
+        err(f"No bot matches '{target}'.")
+    return None
+
+
+def _legacy_scope_namespaces(creds: dict, args) -> tuple[list[dict], int | None]:
+    """Which bots a workspace-wide legacy command spans.
+
+    Returns `(namespaces, err_rc)`: the bots to act on, and an exit code to
+    return on failure (None on success). A named bot (`--agent` / EESEL_AGENT)
+    resolves to exactly that one; with no name a single-bot workspace uses its
+    only bot and a multi-bot workspace uses ALL of them — the aggregate model
+    that mirrors the new platform, where these workspace-wide nouns span every
+    agent and `--agent` is just a filter. Ambiguity is refused (same messages as
+    `resolve_namespace_or_error`); every returned id is validated."""
+    target = getattr(args, "agent", None) or os.environ.get("EESEL_AGENT")
+    namespaces = fetch_namespaces(creds)
+    if not namespaces:
+        err("No bots in this workspace.")
+        return [], 1
+    if target:
+        ns, candidates = resolve_namespace_strict(namespaces, target)
+        if not ns:
+            if candidates:
+                err(f"'{target}' is ambiguous — it matches {len(candidates)} bots:")
+                for n in candidates:
+                    err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+                err("Re-run with a full bot id to disambiguate.")
+            else:
+                err(f"No bot matches '{target}'.")
+            return [], 1
+        selected = [ns]
+    else:
+        selected = namespaces  # the sole bot, or ALL bots on a multi-bot workspace
+    for n in selected:
+        validate_id(n.get("id"), "namespace id")
+    return selected, None
+
+
+def _namespaces_list(args, creds: dict) -> int:
+    """`agents list` on legacy: the workspace's bots (namespaces)."""
+    namespaces = fetch_namespaces(creds)
+    if _want_json(args):
+        emit(namespaces)
+        return 0
+    if getattr(args, "plain", False):
+        for n in namespaces:
+            print(f"{str(n.get('id') or '')}\t{str(n.get('namespace') or '')}")
+        return 0
+    if not namespaces:
+        info("(no bots)")
+        return 0
+    for n in namespaces:
+        nconns = len(n.get("connections") or [])
+        print(f" {str(n.get('id', '?'))[:12]}  {n.get('namespace', '?')}"
+              f"  [{nconns} connection{'' if nconns == 1 else 's'}]")
+    return 0
+
+
+def _namespace_show(args, creds: dict) -> int:
+    """`agents show <bot>` on legacy: the namespace's fields + its prompt."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent_id", None))
+    if not ns:
+        return 1
+    prompt = get_namespace_prompt(creds, ns["id"])
+    if _want_json(args):
+        emit({**ns, "prompt": prompt})
+        return 0
+    print(f"{ns.get('namespace', '?')}  ({ns.get('id', '')})")
+    print(f"  owner:       {'yes' if ns.get('isOwner') else 'no'}")
+    print(f"  connections: {len(ns.get('connections') or [])}")
+    p = (prompt or "").strip()
+    if not p:
+        print("  instructions: (none)")
+        return 0
+    print("  instructions:")
+    print()
+    print(p)
+    return 0
+
+
+def _agents_legacy(args, creds: dict) -> int:
+    """Dispatch the `agents` verbs on a legacy workspace (read-only). Write
+    verbs are refused; the pre-dispatch guard normally catches them first, but
+    this fails closed if one reaches here."""
+    sub = args.agents_cmd or "list"
+    if sub == "list":
+        return _namespaces_list(args, creds)
+    if sub == "show":
+        if getattr(args, "show_instructions", False):
+            args.agent = args.agent_id
+            return cmd_instructions(args)
+        return _namespace_show(args, creds)
+    return _legacy_unsupported(f"agents {sub}")
+
+
 def cmd_agents(args) -> int:
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _agents_legacy(args, creds)
     sub = args.agents_cmd or "list"
     if sub == "list":
         agents = fetch_agents(creds)
@@ -2944,6 +3361,8 @@ def cmd_instructions(args) -> int:
     so `eesel instructions > prompt.md` captures just the prompt.
     """
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _instructions_legacy(args, creds)
     agent = resolve_agent_or_error(creds, getattr(args, "agent", None))
     if not agent:
         return 1
@@ -2952,6 +3371,21 @@ def cmd_instructions(args) -> int:
     prompt = (agent.get("prompt") or "").strip()
     if not prompt:
         info("(no instructions set for this agent)")
+        return 0
+    print(prompt)
+    return 0
+
+
+def _instructions_legacy(args, creds: dict) -> int:
+    """`instructions` on legacy: the bot's customPrompt to stdout (header to
+    stderr, so a redirect captures just the prompt)."""
+    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
+    if not ns:
+        return 1
+    info(f"# {ns.get('namespace', '?')} ({str(ns.get('id', ''))[:12]}) — instructions")
+    prompt = (get_namespace_prompt(creds, ns["id"]) or "").strip()
+    if not prompt:
+        info("(no instructions set for this bot)")
         return 0
     print(prompt)
     return 0
@@ -3522,6 +3956,8 @@ def cmd_integrations(args) -> int:
     `remove`.
     """
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _integrations_legacy(args, creds)
     # `--agent` scopes this command to one agent (id, id-prefix, or name), like
     # the EESEL_AGENT env var but per-command. It is resolved in memory and not
     # persisted, so the scope stays local to this command. Connection status in
@@ -3696,6 +4132,139 @@ def _integrations_show(args, creds: dict) -> int:
     sync = f"{run.get('status')} — {_sync_run_progress(run)}" if run else "—"
     print(f" sync        {sync}")
     return 0
+
+
+def _mask_legacy_config(entries: list, reveal: bool) -> list:
+    """Mask legacy connection-config values whose `name` looks like a secret.
+
+    Config entries are `{name, value}` (not the `{key, value}` property shape
+    `_redact_secrets` recognizes), so mask off the same `_SECRET_KEY_HINTS`
+    behind the same reveal gate the rest of the CLI uses. `customPrompt` isn't a
+    secret, so it passes through untouched."""
+    if reveal:
+        return entries
+    out = []
+    for e in entries:
+        if isinstance(e, dict):
+            name, value = e.get("name"), e.get("value")
+            if (isinstance(name, str) and isinstance(value, str) and value
+                    and any(h in name.lower() for h in _SECRET_KEY_HINTS)):
+                out.append({**e, "value": "***"})
+                continue
+        out.append(e)
+    return out
+
+
+def _legacy_connections_list(args, creds: dict) -> int:
+    """`integrations list` on legacy: connections. Workspace-wide by default —
+    aggregated across every bot — or scoped to one with `--agent` / EESEL_AGENT.
+    Each row is tagged with the bot it belongs to."""
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    rows = []
+    for ns in namespaces:
+        for c in fetch_namespace_connections(creds, ns["id"]):
+            rows.append({**c, "namespaceId": ns["id"], "botName": ns.get("namespace")})
+    if _want_json(args):
+        emit(rows)
+        return 0
+    if not rows:
+        info("(no connections)")
+        return 0
+    fmt = " {:<18}  {:<12}  {:<18}  {}"
+    info(fmt.format("bot", "id", "type", "name"))
+    for c in rows:
+        bot = str(c.get("botName") or c.get("namespaceId") or "?")[:18]
+        cid = str(c.get("connectionId") or "—")[:12]
+        ctype = (str(c.get("connectionType") or "?"))[:18]
+        print(fmt.format(bot, cid, ctype, c.get("connectionName") or ""))
+    return 0
+
+
+def _resolve_connection(conns: list[dict], target: str) -> tuple[dict | None, list[dict]]:
+    """Resolve a connection within a bot's connection list by connectionId
+    (exact, then prefix), then connectionType. Returns (conn, []) on a unique
+    match, (None, candidates) when ambiguous, (None, []) when none. Prefix
+    resolution matters because `integrations list` prints a truncated id."""
+    t = (target or "").strip()
+    if not t:
+        return None, []
+    exact = [c for c in conns if c.get("connectionId") == t]
+    if exact:
+        return exact[0], []
+    prefix = [c for c in conns if str(c.get("connectionId") or "").startswith(t)]
+    if len(prefix) == 1:
+        return prefix[0], []
+    if len(prefix) > 1:
+        return None, prefix
+    typed = [c for c in conns if c.get("connectionType") == t]
+    if len(typed) == 1:
+        return typed[0], []
+    return None, typed
+
+
+def _legacy_connection_show(args, creds: dict) -> int:
+    """`integrations show <conn>` on legacy: one connection's detail + its
+    configuration entries (secret-looking values masked like everywhere else).
+
+    The connection is resolved within the scope (all bots by default, or the
+    one named with `--agent` / EESEL_AGENT) so the truncated id printed by
+    `integrations list` (or a type name) works without naming a bot, then the
+    full id is used for the API calls."""
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    conns = []
+    for ns in namespaces:
+        for c in fetch_namespace_connections(creds, ns["id"]):
+            conns.append({**c, "namespaceId": ns["id"], "botName": ns.get("namespace")})
+    match, candidates = _resolve_connection(conns, args.id)
+    if not match:
+        if candidates:
+            err(f"'{args.id}' is ambiguous — it matches {len(candidates)} connections:")
+            for c in candidates:
+                err(f"  {c.get('connectionId', '?')}  {c.get('connectionType', '?')}  [{c.get('botName', '?')}]")
+            err("Re-run with a full connection id to disambiguate.")
+        else:
+            err(f"No connection matches '{args.id}' in this workspace.")
+        return 1
+    conn_id = match["connectionId"]
+    conn = fetch_connection(creds, conn_id)
+    reveal = _REVEAL_SECRETS
+    entries = _mask_legacy_config(fetch_connection_config(creds, conn_id), reveal)
+    if _want_json(args):
+        emit({**conn, "configurationEntries": entries}, reveal=reveal)
+        return 0
+    ctype = conn.get("connectionType") or "?"
+    cid = conn.get("connectionId") or args.id
+    info(f"# {ctype} [{cid}]")
+    print(f" id     {cid}")
+    print(f" type   {ctype}")
+    if conn.get("connectionName"):
+        print(f" name   {conn.get('connectionName')}")
+    if not entries:
+        print(" config (none)")
+        return 0
+    print(" config:")
+    for e in entries:
+        print(f"   {e.get('name')} = {e.get('value')}")
+    return 0
+
+
+def _integrations_legacy(args, creds: dict) -> int:
+    """Dispatch the `integrations` verbs on a legacy workspace (read-only).
+
+    Legacy integrations are the bot's connections: `list` shows them, `show
+    <conn>` shows one connection's detail + config. Every other verb is refused;
+    the pre-dispatch guard normally catches those first, but this fails closed if
+    one reaches here."""
+    sub = getattr(args, "integrations_cmd", None) or "list"
+    if sub == "list":
+        return _legacy_connections_list(args, creds)
+    if sub == "show":
+        return _legacy_connection_show(args, creds)
+    return _legacy_unsupported(f"integrations {sub}")
 
 
 def _fetch_sync_runs(creds: dict) -> list:
@@ -4960,8 +5529,243 @@ def render_task_analytics(data: dict) -> None:
             print(f"  {count or 0:>6}  {name}")
 
 
+def _legacy_stringify(value) -> str:
+    """A message field's value as a string: a str verbatim, else compact JSON."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _legacy_tool_thought(inputs) -> str:
+    """The readable thought from a think tool's `inputs` (a JSON string / dict
+    like {"thought": "…"}), else the raw inputs stringified."""
+    obj = inputs
+    if isinstance(inputs, str):
+        s = inputs.strip()
+        if s[:1] == "{":
+            try:
+                obj = json.loads(s)
+            except (ValueError, TypeError):
+                return inputs
+        else:
+            return inputs
+    if isinstance(obj, dict) and isinstance(obj.get("thought"), str):
+        return obj["thought"]
+    return _legacy_stringify(inputs)
+
+
+def _legacy_message_parts(value) -> list[tuple[str, str]]:
+    """Parse a legacy message field into ordered ``(kind, text)`` pairs so it can
+    be rendered like the platform `tasks show`. `kind` is one of:
+
+    - ``"text"``  — assistant/user prose (shown plain, in full);
+    - ``"think"`` — a `[thinking] <thought>` line (dimmed, in full);
+    - ``"tool"``  — a `[tool] <name> <inputs>` / `[tool] → <result>` line (dimmed,
+      truncated when not `--full`).
+
+    A plain string, or JSON that doesn't parse, becomes a single text part.
+    Never raises."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        if s[0] not in "[{":
+            return [("text", value)]
+        try:
+            parsed = json.loads(s)
+        except (ValueError, TypeError):
+            return [("text", value)]
+    else:
+        parsed = value
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return [("text", str(parsed))]
+    out: list[tuple[str, str]] = []
+    for part in parsed:
+        if isinstance(part, str):
+            if part.strip():
+                out.append(("text", part))
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "tool":
+            tool = part.get("tool") or {}
+            name = tool.get("name") or tool.get("key") or "tool"
+            key = str(tool.get("key") or "").lower()
+            if key == "think" or "think" in str(name).lower():
+                out.append(("think", f"[thinking] {_legacy_tool_thought(tool.get('inputs'))}".rstrip()))
+            else:
+                inp = _legacy_stringify(tool.get("inputs"))
+                out.append(("tool", f"[tool] {name}" + (f" {inp}" if inp else "")))
+            for of in ("output", "outputs", "result", "results", "response"):
+                val = tool.get(of)
+                if val not in (None, "", [], {}):
+                    out.append(("tool", f"[tool] → {_legacy_stringify(val)}"))
+                    break
+        else:
+            text = part.get("message") or part.get("text") or part.get("content")
+            if isinstance(text, str) and text.strip():
+                out.append(("text", text))
+            elif ptype and ptype != "message":
+                out.append(("tool", f"[{ptype}]"))
+    return out
+
+
+def _render_legacy_turn(turn: dict, *, full: bool = False) -> None:
+    """Render one legacy session turn like the platform `tasks show`: the user's
+    message, then the agent's — with the agent's thinking/tool steps **dimmed**
+    and detailed (`[thinking] <thought>`, `[tool] <name> <inputs>`, `[tool] →
+    <result>`) and its prose shown plain. Tool lines truncate at 200 chars
+    unless `full` (thinking and prose are shown in full, matching the platform);
+    consecutive identical dimmed lines are collapsed."""
+    for who, color, value in (("you", "33", turn.get("userMessage")),
+                              ("eesel", "36", turn.get("agentMessage"))):
+        parts = _legacy_message_parts(value)
+        if not parts:
+            continue
+        print(f"\n{_color(who, color)}:")
+        last_dim = None
+        for kind, text in parts:
+            if kind == "text":
+                last_dim = None
+                print(text)
+                continue
+            if text == last_dim:
+                continue  # collapse the call/result duplicates the API emits
+            last_dim = text
+            shown = text if (full or kind == "think") else text[:200]
+            print(_color(shown, "2;37"))
+
+
+def _legacy_sessions_list(args, creds: dict) -> int:
+    """`tasks list` on legacy: chat sessions. Workspace-wide by default —
+    aggregated across every bot, newest first — or scoped to one with
+    `--agent` / EESEL_AGENT. Each row is tagged with the bot it came from."""
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    limit = getattr(args, "limit", None) or 50
+    search = getattr(args, "search", None)
+    rows = []
+    for ns in namespaces:
+        for s in fetch_sessions(creds, ns["id"], limit=limit, search=search):
+            rows.append({**s, "namespaceId": ns["id"], "botName": ns.get("namespace")})
+    # Newest first; a missing/None lastUpdated sorts last. Coerce to str so mixed
+    # ISO-string / numeric timestamps across bots can't raise on comparison.
+    rows.sort(key=lambda s: str(s.get("lastUpdated") or ""), reverse=True)
+    rows = rows[:limit]
+    if _want_json(args):
+        emit(rows)
+        return 0
+    if not rows:
+        info("(no tasks)")
+        return 0
+    for s in rows:
+        # Defensive .get everywhere — a session may omit any of these fields.
+        # The sessionId is shown in FULL (not truncated): it's what you feed to
+        # `tasks show`, and legacy (Zendesk-chat) ids share a long prefix, so a
+        # truncated column would render them identical and unusable.
+        parts = [str(s.get("botName") or s.get("namespaceId") or "?")[:18],
+                 str(s.get("sessionId") or "?")]
+        if s.get("title"):
+            parts.append(str(s.get("title")))
+        if s.get("lastUpdated"):
+            parts.append(str(s.get("lastUpdated")))
+        if s.get("resolution"):
+            parts.append(str(s.get("resolution")))
+        if s.get("aiCsat") is not None:
+            parts.append(f"csat={s.get('aiCsat')}")
+        print(" " + "  ".join(parts))
+    return 0
+
+
+def _find_session_namespace(creds: dict, sid: str, namespaces: list[dict]) -> dict | None:
+    """Which bot owns session `sid`, found by probing each namespace's session
+    endpoint non-fatally (200 = found). First hit wins; None if no bot has it.
+    Used when `tasks show` is given a session id with no bot named."""
+    vsid = validate_id(sid, "session id")
+    for ns in namespaces:
+        nid = validate_id(ns.get("id"), "namespace id")
+        try:
+            status, _ = http_request_allow_error(
+                "GET", f"{creds['api_url']}/v2/namespaces/{nid}/sessions/{vsid}", token=creds.get("token"))
+        except SystemExit:
+            continue
+        except Exception:
+            continue
+        if status == 200:
+            return ns
+    return None
+
+
+def _legacy_session_show(args, creds: dict) -> int:
+    """`tasks show <session-id>` on legacy: one session's transcript. With a bot
+    named (`--agent` / EESEL_AGENT) it scopes there; without one it finds the
+    owning bot (a single-bot workspace uses its only bot; a multi-bot one probes
+    each bot for the id)."""
+    target = getattr(args, "agent", None) or os.environ.get("EESEL_AGENT")
+    if target:
+        ns = resolve_namespace_or_error(creds, target)
+        if not ns:
+            return 1
+    else:
+        namespaces = fetch_namespaces(creds)
+        if not namespaces:
+            err("No bots in this workspace.")
+            return 1
+        if len(namespaces) == 1:
+            ns = namespaces[0]
+            validate_id(ns.get("id"), "namespace id")
+        else:
+            ns = _find_session_namespace(creds, args.task_id, namespaces)
+            if not ns:
+                err(f"No session '{args.task_id}' found in this workspace.")
+                return 1
+    session = fetch_session(creds, ns["id"], args.task_id)
+    if _want_json(args):
+        emit(session)
+        return 0
+    sid = session.get("sessionId") or args.task_id
+    print(f"# session {sid}")
+    if session.get("title"):
+        print(f"# {session.get('title')}")
+    messages = session.get("messages") or []
+    if not messages:
+        info("(no messages)")
+        return 0
+    for m in messages:
+        _render_legacy_turn(m, full=getattr(args, "full", False))
+    return 0
+
+
+def _tasks_legacy(args, creds: dict) -> int:
+    """Dispatch the `tasks` verbs on a legacy workspace (read-only).
+
+    Legacy tasks are the bot's chat sessions: `list` shows recent sessions,
+    `show <session-id>` prints one session's transcript. count/analytics/export/
+    cost have no v2 analogue and are refused (the guard catches them first; this
+    fails closed if one reaches here)."""
+    sub = getattr(args, "tasks_cmd", None) or "list"
+    if sub == "list":
+        return _legacy_sessions_list(args, creds)
+    if sub == "show":
+        return _legacy_session_show(args, creds)
+    return _legacy_unsupported(f"tasks {sub}")
+
+
 def cmd_tasks(args) -> int:
     creds = require_creds()
+    if resolve_platform(creds, args) == PLATFORM_LEGACY:
+        return _tasks_legacy(args, creds)
     sub = getattr(args, "tasks_cmd", None) or "list"
 
     if sub == "analytics":
@@ -6619,6 +7423,28 @@ def hide_subcommands(sub_action, *names: str) -> None:
     sub_action.metavar = "{" + ",".join(ca.dest for ca in sub_action._choices_actions) + "}"
 
 
+def _hide_unsupported_legacy(top_sub) -> None:
+    """Trim `--help` to the legacy v2 read commands: hide the nouns with no
+    legacy meaning, and (under the partially-supported nouns) every subcommand
+    that isn't in `_LEGACY_SUPPORTED_SUBS`. Everything stays PARSEABLE — hiding
+    only drops it from help — so the pre-dispatch guard still answers with the
+    friendly 'not available on the legacy (v2) platform' message. Reuses the
+    same classification the guard and schema read, so the three can't drift."""
+    hide_subcommands(top_sub, *[n for n in _LEGACY_HIDDEN_NOUNS if n in top_sub.choices])
+    for noun, supported in _LEGACY_SUPPORTED_SUBS.items():
+        if supported is None:
+            continue  # whole noun supported (e.g. instructions) — nothing to trim
+        parser = top_sub.choices.get(noun)
+        if parser is None:
+            continue
+        child = next((a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None)
+        if child is None:
+            continue
+        hide = [name for name in child.choices if name not in supported]
+        if hide:
+            hide_subcommands(child, *hide)
+
+
 def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
     """Register the files command tree under `name`.
 
@@ -6768,8 +7594,8 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
 # `{id}` marks a path segment resolved at runtime. Commands with no single
 # stable endpoint (login/logout/whoami/link/chat/mcp call) are omitted.
 _COMMAND_ENDPOINTS = {
-    "agents.list": "GET /agents",
-    "agents.show": "GET /agents",
+    "agents.list": "GET /agents · legacy: GET /namespaces",
+    "agents.show": "GET /agents · legacy: GET /namespaces",
     "agents.create": "POST /agents",
     "agents.set": "PUT /agents/{id}",
     "agents.remove": "DELETE /agents/{id}",
@@ -6782,9 +7608,9 @@ _COMMAND_ENDPOINTS = {
     "automations.schedules.add": "POST /agents/{id}/triggers",
     "automations.schedules.remove": "DELETE /triggers/{id}",
     "automations.schedules.fire": "POST /triggers/{id}/fire",
-    "integrations.list": "GET /integrations",
+    "integrations.list": "GET /integrations · legacy: GET /namespaces/{id}/connections",
     "integrations.available": "GET /integration-definitions",
-    "integrations.show": "GET /integrations",
+    "integrations.show": "GET /integrations · legacy: GET /connections/{id}",
     "integrations.connect": "POST /integrations/{key}/{option}",
     "integrations.sync": "POST /integrations/{id}/trigger-sync",
     "integrations.sync-status": "GET /v2/sync-runs",
@@ -6824,13 +7650,13 @@ _COMMAND_ENDPOINTS = {
     "settings.notifications.enable": "PATCH /agents/{id}/notification-settings",
     "settings.notifications.disable": "PATCH /agents/{id}/notification-settings",
     "settings.notifications.set": "PATCH /agents/{id}/notification-settings",
-    "tasks.list": "POST /workspace/tasks",
+    "tasks.list": "POST /workspace/tasks · legacy: GET /v2/namespaces/{id}/sessions",
     "tasks.count": "POST /workspace/tasks",
-    "tasks.show": "POST /workspace/tasks",
+    "tasks.show": "POST /workspace/tasks · legacy: GET /v2/namespaces/{id}/sessions/{sessionId}",
     "tasks.analytics": "POST /workspace/tasks/analytics",
     "tasks.export": "POST /tasks/export",
     "mcp.token": "POST /workspaces/token",
-    "instructions": "GET /agents",
+    "instructions": "GET /agents · legacy: GET /connections/{id}/configuration",
     "billing.show": "GET /subscription/*",
     "billing.list": "GET /subscription/*",
 }
@@ -6900,6 +7726,10 @@ def _serialize_parser(parser, path: tuple = (), inherited_handler=None) -> dict:
     key = ".".join(path)
     if key in _COMMAND_ENDPOINTS:
         node["endpoint"] = _COMMAND_ENDPOINTS[key]
+    # Every command node says whether it works on the legacy v2 platform, so an
+    # agent can discover the read-only surface without trial and error.
+    if path:
+        node["legacy_supported"] = _legacy_supports_path(path)
     if flags:
         node["flags"] = flags
     if positionals:
@@ -6936,8 +7766,22 @@ scope by path:
     eesel agents <id> chat "..."             chat with this agent
 """
 
+# Legacy (v2) is read-only and only exposes bots + connections + prompt +
+# history, so the path-scope epilog is trimmed to just those — no write verbs,
+# no skills/files/chat that don't apply.
+_AGENTS_PATH_EPILOG_LEGACY = """\
+scope by path:
+  Put a bot's id in the command path to scope a noun to that bot — the same as
+  the flat command with --agent. The id can be a full id, id-prefix, or name.
 
-def build_parser(staff: bool = False) -> argparse.ArgumentParser:
+    eesel agents <id>                        show the bot (= `agents show <id>`)
+    eesel agents <id> show --instructions    print just its prompt
+    eesel agents <id> integrations list      that bot's connections (list/show)
+    eesel agents <id> tasks list             that bot's chat history (list/show)
+"""
+
+
+def build_parser(staff: bool = False, platform_hint: str | None = None) -> argparse.ArgumentParser:
     """Build the CLI parser.
 
     `staff` is whether the current login is on the global impersonator
@@ -6946,6 +7790,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     `impersonate` command — are hidden from `--help`. They remain parseable so
     nothing breaks for someone who knows them, but the server-side allowlist
     (and, for dev login, the local-only dev secret) is the real gate.
+
+    `platform_hint` is the resolved platform for this run ("legacy"/"platform"/
+    None). On "legacy" the commands with no read-only meaning there are hidden
+    from `--help` (see `_hide_unsupported_legacy`) — they stay parseable so the
+    pre-dispatch guard can still give its friendly message. Anything else (the
+    new platform, or unknown) hides nothing.
     """
     p = argparse.ArgumentParser(
         prog="eesel",
@@ -6962,6 +7812,12 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     p.add_argument("--fields", metavar="a,b,c", help="With --json: keep only these top-level keys on each object.")
     p.add_argument("--dry-run", action="store_true", help="Preview a side effect (config mutation, chat turn, or login): print the request that would be sent and make no call.")
     p.add_argument("--secrets", action="store_true", help="Reveal masked secret values (sysadmin/impersonator accounts only).")
+    # Platform override: normally the CLI auto-detects legacy v2 vs the new
+    # platform (see resolve_platform). These force it for one command — e.g.
+    # when a just-migrated workspace's cached/flagged state lags. Mutually
+    # exclusive (enforced in main after they're lifted from argv).
+    p.add_argument("--legacy", action="store_true", help="Force legacy v2-platform mode for this command (overrides auto-detection).")
+    p.add_argument("--platform", action="store_true", help="Force new-platform mode for this command (overrides auto-detection).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="Authenticate (browser-based, or --dev for local)" if staff else "Authenticate")
@@ -6998,7 +7854,7 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "agents",
         help="List, inspect, or manage agents",
-        epilog=_AGENTS_PATH_EPILOG,
+        epilog=_AGENTS_PATH_EPILOG_LEGACY if platform_hint == PLATFORM_LEGACY else _AGENTS_PATH_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     a_sub = sp.add_subparsers(dest="agents_cmd")
@@ -7111,6 +7967,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
     tk_sh.add_argument("--json", action="store_true", help="Emit the raw history payload instead of a rendered transcript")
     tk_sh.add_argument("--full", action="store_true", help="Don't truncate tool arguments/outputs")
     tk_sh.add_argument("--cost", action="store_true", help="Append a cost + token breakdown (dev mode only)")
+    # On legacy, sessions are namespace-scoped: `--agent` names the bot directly
+    # (else the CLI finds the owning bot by id). New-platform task ids are
+    # workspace-unique, so it's accepted and ignored there. Also lets the
+    # `agents <id> tasks show <sid>` path form reshape to `--agent <id>`.
+    tk_sh.add_argument("--agent", help="Agent id, id-prefix, or name to scope to; a single-agent workspace is used automatically, otherwise name the agent (--agent, EESEL_AGENT, or the `agents <id> …` path)")
     tk_co = tk_sub.add_parser("cost", help="Print cost + token usage for one task (includes sub-agents). Dev mode only.")
     tk_co.add_argument("task_id", help="Full task id or id-prefix")
     tk_co.add_argument("--json", action="store_true", help="Emit the raw cost breakdown as JSON instead of a summary")
@@ -7501,6 +8362,11 @@ def build_parser(staff: bool = False) -> argparse.ArgumentParser:
         _hidden_top.append("impersonate")
     hide_subcommands(sub, *_hidden_top)
 
+    # On a legacy v2 workspace, trim `--help` to the read commands that work
+    # there. New-platform / unknown hints leave the full surface visible.
+    if platform_hint == PLATFORM_LEGACY:
+        _hide_unsupported_legacy(sub)
+
     p._eesel_relocations = {
         "documents": "`documents` was renamed to `files` — use `eesel files …` "
                      "(e.g. `eesel files list`).",
@@ -7563,7 +8429,7 @@ _REMOVED_AGENTS_VERBS = {
 _AGENT_SCOPED_CHILDREN = {
     "integrations": ("flag", None),
     "files": ("flag", frozenset({"list", "show", "read", "add", "remove", "export"})),
-    "tasks": ("flag", frozenset({"list", "count", "analytics", "export"})),
+    "tasks": ("flag", frozenset({"list", "show", "count", "analytics", "export"})),
     "skills": ("pos", None),
 }
 
@@ -7778,7 +8644,7 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
     or takes a `--fields=…` inline value. Anything not one of these flags is
     passed through untouched for argparse to handle.
     """
-    values = {"json": False, "dry_run": False, "secrets": False, "fields": None}
+    values = {"json": False, "dry_run": False, "secrets": False, "fields": None, "legacy": False, "platform": False}
     rest: list[str] = []
     i = 0
     while i < len(argv):
@@ -7789,6 +8655,10 @@ def _extract_global_output_flags(argv: list[str]) -> tuple[list[str], dict]:
             values["dry_run"] = True
         elif tok == "--secrets":
             values["secrets"] = True
+        elif tok == "--legacy":
+            values["legacy"] = True
+        elif tok == "--platform":
+            values["platform"] = True
         elif tok == "--fields":
             # Only consume the next token as the value when it is a real value,
             # not another flag. `eesel schema --fields --json` must leave --json
@@ -7944,19 +8814,51 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
         _refuse_impersonated_write()
 
 
+def _guard_platform_command(args, creds: dict | None) -> None:
+    """Before dispatch on a legacy v2 workspace: refuse any command that has no
+    read-only meaning there, client-side, before any handler runs. Mirrors
+    `_guard_impersonated_command`.
+
+    A command that works on legacy is fine on either platform, so it returns at
+    once — before resolving the platform — which keeps the common path free of
+    any probe. Only an unsupported command needs to know the platform, and even
+    then it makes NO network call beyond `resolve_platform` (which is flag- and
+    cache-first). With no stored creds and no explicit `--legacy` there is
+    nothing to resolve offline, so it defers to the handler's require_creds()."""
+    if legacy_supports(args):
+        return
+    if not creds and not getattr(args, "legacy", False):
+        return
+    if resolve_platform(creds, args) != PLATFORM_LEGACY:
+        return
+    fail(EXIT_VALIDATION,
+         f"'{_command_label(args)}' is not available on the legacy (v2) platform (read-only).")
+
+
 def main(argv: list[str] | None = None) -> int:
     # Surface staff-only commands only for global impersonators. Read from the
     # cached creds flag (populated at login / refreshed by `whoami`) so this
     # stays a local read — no network call on every invocation.
     creds = load_creds()
     staff = bool(creds and creds.get("is_impersonator"))
-    parser = build_parser(staff)
     if argv is None:
         argv = sys.argv[1:]
     # Lift the global output/preview flags out of argv so they work in any
     # position (argparse only accepts top-level optionals before the
     # subcommand). The values are re-attached to the parsed namespace below.
+    # This runs BEFORE build_parser so the lifted --legacy/--platform can pick
+    # the help surface.
     argv, global_flags = _extract_global_output_flags(argv)
+    if global_flags["legacy"] and global_flags["platform"]:
+        fail(EXIT_USAGE, "--legacy and --platform are mutually exclusive.")
+    # An explicit flag wins; else the cached platform decides which `--help`
+    # surface to build. Unknown/None → show everything (hide nothing).
+    platform_hint = (
+        PLATFORM_LEGACY if global_flags["legacy"]
+        else PLATFORM_NEW if global_flags["platform"]
+        else (creds.get("platform") if creds else None)
+    )
+    parser = build_parser(staff, platform_hint)
     # Path-as-scope first (`agents <id> integrations …` → flat + `--agent <id>`),
     # then the integrations actions reshape runs on its output.
     argv = _normalize_path_scope_argv(argv)
@@ -7966,8 +8868,11 @@ def main(argv: list[str] | None = None) -> int:
     # exactly as before, whether the flag was global or per-command.
     args.json = bool(getattr(args, "json", False)) or global_flags["json"]
     args.secrets = bool(getattr(args, "secrets", False)) or global_flags["secrets"]
+    args.legacy = bool(getattr(args, "legacy", False)) or global_flags["legacy"]
+    args.platform = bool(getattr(args, "platform", False)) or global_flags["platform"]
     _configure_output(args, global_flags, creds)
     _guard_impersonated_command(args, creds)
+    _guard_platform_command(args, creds)
     return args.func(args)
 
 
