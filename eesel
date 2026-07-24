@@ -783,7 +783,11 @@ def resolve_platform(creds: dict, args=None) -> str:
 # analogue. This is the SINGLE source of truth, shared by the pre-dispatch guard
 # (`_guard_platform_command`), the `--help` trimming (`build_parser`), and the
 # `eesel schema` annotation (`_serialize_parser`).
-_LEGACY_UNIVERSAL = frozenset({"login", "logout", "whoami", "link", "schema"})
+# Cross-cutting commands that work on either platform. `impersonate` is a staff
+# command gated server-side (the /sysadmin endpoints 401 for non-impersonators)
+# and by the `staff` --help gate — it is NOT a platform surface, so the legacy
+# guard must never refuse it.
+_LEGACY_UNIVERSAL = frozenset({"login", "logout", "whoami", "link", "schema", "impersonate"})
 # noun → the subcommands supported on legacy (None ⇒ the whole noun is supported).
 _LEGACY_SUPPORTED_SUBS = {
     "agents": frozenset({"list", "show"}),

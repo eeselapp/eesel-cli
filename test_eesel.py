@@ -10527,6 +10527,18 @@ class TestGuardPlatformCommand:
         monkeypatch.setattr(eesel, "resolve_platform", boom)
         assert eesel._guard_platform_command(_parse("files", "list"), None) is None
 
+    def test_legacy_supports_impersonate(self):
+        # impersonate is a cross-cutting staff command, not a platform surface.
+        assert eesel.legacy_supports(_parse("impersonate", "u-1")) is True
+
+    def test_allows_impersonate_on_legacy_without_resolving(self, fake_creds, monkeypatch):
+        # It must work on legacy too, gated only server-side (the /sysadmin
+        # endpoint) — never refused by, nor even resolving, the platform.
+        def boom(*a, **k):
+            raise AssertionError("impersonate must not be platform-gated")
+        monkeypatch.setattr(eesel, "resolve_platform", boom)
+        assert eesel._guard_platform_command(_parse("impersonate", "u-1"), fake_creds) is None
+
     def test_message_names_the_command(self, fake_creds, monkeypatch, capsys):
         self._legacy(monkeypatch)
         with pytest.raises(SystemExit):
