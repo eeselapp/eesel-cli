@@ -4204,22 +4204,26 @@ def _legacy_connection_show(args, creds: dict) -> int:
     """`integrations show <conn>` on legacy: one connection's detail + its
     configuration entries (secret-looking values masked like everywhere else).
 
-    The connection is resolved within the scoped bot's connections so the
-    truncated id printed by `integrations list` (or a type name) works, then the
+    The connection is resolved within the scope (all bots by default, or the
+    one named with `--agent` / EESEL_AGENT) so the truncated id printed by
+    `integrations list` (or a type name) works without naming a bot, then the
     full id is used for the API calls."""
-    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
-    if not ns:
-        return 1
-    conns = fetch_namespace_connections(creds, ns["id"])
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    conns = []
+    for ns in namespaces:
+        for c in fetch_namespace_connections(creds, ns["id"]):
+            conns.append({**c, "namespaceId": ns["id"], "botName": ns.get("namespace")})
     match, candidates = _resolve_connection(conns, args.id)
     if not match:
         if candidates:
             err(f"'{args.id}' is ambiguous — it matches {len(candidates)} connections:")
             for c in candidates:
-                err(f"  {c.get('connectionId', '?')}  {c.get('connectionType', '?')}")
+                err(f"  {c.get('connectionId', '?')}  {c.get('connectionType', '?')}  [{c.get('botName', '?')}]")
             err("Re-run with a full connection id to disambiguate.")
         else:
-            err(f"No connection matches '{args.id}' on bot '{ns.get('namespace', '?')}'.")
+            err(f"No connection matches '{args.id}' in this workspace.")
         return 1
     conn_id = match["connectionId"]
     conn = fetch_connection(creds, conn_id)

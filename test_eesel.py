@@ -10854,3 +10854,48 @@ class TestLegacyTasksShowScoping:
         monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: seen.update(nid=nid) or {"sessionId": sid, "messages": []})
         assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--agent", "Bot Two")) == 0
         assert seen["nid"] == "ns-2"
+
+
+class TestLegacyIntegrationsShowScoping:
+    """`integrations show <conn>` on legacy resolves the connection across the
+    scope — all bots by default, or just the named one — so a bare id-prefix
+    works on a multi-bot workspace without naming a bot."""
+
+    FULL = "08549cf9-16ab-4ce8-83a8-7b965dcfa54d"
+
+    def _legacy_multi(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_resolves_prefix_across_all_bots_when_not_named(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy_multi(monkeypatch)
+        by_bot = {
+            "ns-1": [{"connectionId": "aaaa1111-0000-0000-0000-000000000000", "connectionType": "eesel"}],
+            "ns-2": [{"connectionId": self.FULL, "connectionType": "zendesk", "connectionName": "ZD"}],
+        }
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: by_bot[nid])
+        seen = {}
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: seen.update(detail=cid) or {"connectionId": cid, "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: seen.update(cfg=cid) or [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9")) == 0
+        assert seen["detail"] == self.FULL and seen["cfg"] == self.FULL
+
+    def test_ambiguous_prefix_across_bots_errors(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy_multi(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "dup12300-aaaa", "connectionType": "eesel"}] if nid == "ns-1"
+                            else [{"connectionId": "dup12300-bbbb", "connectionType": "zendesk"}])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "dup123")) == 1
+        assert "ambiguous" in capsys.readouterr().err.lower()
+
+    def test_scoped_to_named_bot(self, tmp_config, fake_creds, monkeypatch):
+        self._legacy_multi(monkeypatch)
+        calls = []
+        monkeypatch.setattr(eesel, "fetch_namespace_connections",
+                            lambda creds, nid: calls.append(nid) or ([{"connectionId": self.FULL, "connectionType": "zendesk"}] if nid == "ns-2" else []))
+        monkeypatch.setattr(eesel, "fetch_connection", lambda creds, cid: {"connectionId": cid, "connectionType": "zendesk"})
+        monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: [])
+        assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9", "--agent", "Bot Two")) == 0
+        assert calls == ["ns-2"]  # only the named bot's connections gathered
