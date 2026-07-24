@@ -5529,68 +5529,121 @@ def render_task_analytics(data: dict) -> None:
             print(f"  {count or 0:>6}  {name}")
 
 
-def _legacy_message_text(value) -> str:
-    """Best-effort plain text for a legacy message field.
-
-    Values are sometimes a plain string, sometimes JSON — a list of structured
-    parts (e.g. ``[{"type":"message","message":"…"}]``) or a single part dict.
-    Text parts are extracted and joined; a text-less part (e.g. a tool call)
-    renders as its ``[type]`` marker. A plain string, or anything that looks
-    like JSON but doesn't parse, is returned unchanged. Never raises."""
+def _legacy_stringify(value) -> str:
+    """A message field's value as a string: a str verbatim, else compact JSON."""
     if value is None:
         return ""
     if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _legacy_tool_thought(inputs) -> str:
+    """The readable thought from a think tool's `inputs` (a JSON string / dict
+    like {"thought": "…"}), else the raw inputs stringified."""
+    obj = inputs
+    if isinstance(inputs, str):
+        s = inputs.strip()
+        if s[:1] == "{":
+            try:
+                obj = json.loads(s)
+            except (ValueError, TypeError):
+                return inputs
+        else:
+            return inputs
+    if isinstance(obj, dict) and isinstance(obj.get("thought"), str):
+        return obj["thought"]
+    return _legacy_stringify(inputs)
+
+
+def _legacy_message_parts(value) -> list[tuple[str, str]]:
+    """Parse a legacy message field into ordered ``(kind, text)`` pairs so it can
+    be rendered like the platform `tasks show`. `kind` is one of:
+
+    - ``"text"``  — assistant/user prose (shown plain, in full);
+    - ``"think"`` — a `[thinking] <thought>` line (dimmed, in full);
+    - ``"tool"``  — a `[tool] <name> <inputs>` / `[tool] → <result>` line (dimmed,
+      truncated when not `--full`).
+
+    A plain string, or JSON that doesn't parse, becomes a single text part.
+    Never raises."""
+    if value is None:
+        return []
+    if isinstance(value, str):
         s = value.strip()
-        if s[:1] not in ("[", "{"):
-            return value  # plain text
+        if not s:
+            return []
+        if s[0] not in "[{":
+            return [("text", value)]
         try:
             parsed = json.loads(s)
         except (ValueError, TypeError):
-            return value  # looked like JSON but wasn't — show it raw
+            return [("text", value)]
     else:
         parsed = value
     if isinstance(parsed, dict):
         parsed = [parsed]
     if not isinstance(parsed, list):
-        return str(parsed)
-    out: list[str] = []
+        return [("text", str(parsed))]
+    out: list[tuple[str, str]] = []
     for part in parsed:
-        if isinstance(part, dict):
+        if isinstance(part, str):
+            if part.strip():
+                out.append(("text", part))
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "tool":
+            tool = part.get("tool") or {}
+            name = tool.get("name") or tool.get("key") or "tool"
+            key = str(tool.get("key") or "").lower()
+            if key == "think" or "think" in str(name).lower():
+                out.append(("think", f"[thinking] {_legacy_tool_thought(tool.get('inputs'))}".rstrip()))
+            else:
+                inp = _legacy_stringify(tool.get("inputs"))
+                out.append(("tool", f"[tool] {name}" + (f" {inp}" if inp else "")))
+            for of in ("output", "outputs", "result", "results", "response"):
+                val = tool.get(of)
+                if val not in (None, "", [], {}):
+                    out.append(("tool", f"[tool] → {_legacy_stringify(val)}"))
+                    break
+        else:
             text = part.get("message") or part.get("text") or part.get("content")
             if isinstance(text, str) and text.strip():
-                out.append(text)
-                continue
-            ptype = part.get("type")
-            if ptype == "tool":
-                # {"type":"tool","tool":{"key":..,"name":..}} → show the tool name
-                tool = part.get("tool") or {}
-                out.append(f"[{tool.get('name') or tool.get('key') or 'tool'}]")
+                out.append(("text", text))
             elif ptype and ptype != "message":
-                out.append(f"[{ptype}]")
-            # an empty message part (message == "") contributes nothing — skip it
-        elif isinstance(part, str):
-            out.append(part)
-    return "\n\n".join(out)
+                out.append(("tool", f"[{ptype}]"))
+    return out
 
 
 def _render_legacy_turn(turn: dict, *, full: bool = False) -> None:
-    """Render one legacy session turn: the user's message then the agent's.
-
-    Structured message bodies are flattened to plain text (see
-    `_legacy_message_text`). Long bodies are truncated unless `full`, mirroring
-    the new-platform `tasks show` (which caps tool args/output at 200 chars)."""
-    def body(text) -> str:
-        text = _legacy_message_text(text)
-        return text if full else text[:200]
-
-    user = turn.get("userMessage")
-    agent = turn.get("agentMessage")
-    if user:
-        print(f"\n{_color('you', '33')}:")
-        print(body(user))
-    if agent:
-        print(f"\n{_color('eesel', '36')}:")
-        print(body(agent))
+    """Render one legacy session turn like the platform `tasks show`: the user's
+    message, then the agent's — with the agent's thinking/tool steps **dimmed**
+    and detailed (`[thinking] <thought>`, `[tool] <name> <inputs>`, `[tool] →
+    <result>`) and its prose shown plain. Tool lines truncate at 200 chars
+    unless `full` (thinking and prose are shown in full, matching the platform);
+    consecutive identical dimmed lines are collapsed."""
+    for who, color, value in (("you", "33", turn.get("userMessage")),
+                              ("eesel", "36", turn.get("agentMessage"))):
+        parts = _legacy_message_parts(value)
+        if not parts:
+            continue
+        print(f"\n{_color(who, color)}:")
+        last_dim = None
+        for kind, text in parts:
+            if kind == "text":
+                last_dim = None
+                print(text)
+                continue
+            if text == last_dim:
+                continue  # collapse the call/result duplicates the API emits
+            last_dim = text
+            shown = text if (full or kind == "think") else text[:200]
+            print(_color(shown, "2;37"))
 
 
 def _legacy_sessions_list(args, creds: dict) -> int:

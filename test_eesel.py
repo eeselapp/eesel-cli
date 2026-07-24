@@ -10425,15 +10425,27 @@ class TestLegacyTasksCommand:
         out = capsys.readouterr().out
         assert "Where is my refund?" in out and "It is processing." in out
 
-    def test_show_truncates_without_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+    def test_show_truncates_tool_lines_without_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # Matching the platform: tool call/result lines cap at 200 unless --full.
+        self._legacy(monkeypatch)
+        long_input = "x" * 500
+        agent = json.dumps([{"type": "tool", "tool": {"name": "Big", "inputs": long_input}}])
+        monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
+            "sessionId": "s1", "messages": [{"userMessage": "hi", "agentMessage": agent}]})
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
+        assert "x" * 300 not in capsys.readouterr().out  # tool line truncated
+        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--full")) == 0
+        assert long_input in capsys.readouterr().out  # full tool inputs with --full
+
+    def test_show_prose_shown_in_full(self, tmp_config, fake_creds, monkeypatch, capsys):
+        # The assistant/user prose is never truncated (matches the platform,
+        # which only caps tool args/output) — so a long reply reads in full.
         self._legacy(monkeypatch)
         long_msg = "x" * 500
         monkeypatch.setattr(eesel, "fetch_session", lambda creds, nid, sid: {
             "sessionId": "s1", "messages": [{"userMessage": long_msg, "agentMessage": "ok"}]})
         assert eesel.cmd_tasks(_parse("tasks", "show", "s1")) == 0
-        assert long_msg not in capsys.readouterr().out  # truncated without --full
-        assert eesel.cmd_tasks(_parse("tasks", "show", "s1", "--full")) == 0
-        assert long_msg in capsys.readouterr().out  # whole message with --full
+        assert long_msg in capsys.readouterr().out
 
     def test_show_json_is_raw(self, tmp_config, fake_creds, monkeypatch, capsys):
         self._legacy(monkeypatch)
@@ -10573,57 +10585,76 @@ class TestWhoamiPlatform:
         assert "platform     : platform" in capsys.readouterr().out
 
 
-class TestLegacyMessageText:
-    """`_legacy_message_text` renders a stored message field (plain string or
-    structured JSON parts) as readable plain text, never raising."""
+class TestLegacyMessageParts:
+    """`_legacy_message_parts` classifies a stored message field into ordered
+    (kind, text) pairs — text/think/tool — so `tasks show` can render tool
+    details dimmed like the platform. Never raises."""
 
-    def test_plain_string_passthrough(self):
-        assert eesel._legacy_message_text("Hello there") == "Hello there"
+    def test_plain_string_is_one_text_part(self):
+        assert eesel._legacy_message_parts("Hello there") == [("text", "Hello there")]
 
     def test_none_is_empty(self):
-        assert eesel._legacy_message_text(None) == ""
+        assert eesel._legacy_message_parts(None) == []
 
-    def test_json_list_of_message_parts_joined(self):
-        raw = '[{"type": "message", "message": "Hi Kate,"}, {"type": "message", "message": "How can I help?"}]'
-        out = eesel._legacy_message_text(raw)
-        assert "Hi Kate," in out and "How can I help?" in out
-        assert '"type"' not in out and "[{" not in out  # not raw JSON
+    def test_message_parts_are_text(self):
+        out = eesel._legacy_message_parts('[{"type":"message","message":"Hi there"}]')
+        assert out == [("text", "Hi there")]
 
-    def test_json_single_dict_message(self):
-        assert eesel._legacy_message_text('{"type":"message","message":"Just this"}') == "Just this"
+    def test_think_tool_shows_the_thought(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "the user needs help"})}}])
+        assert eesel._legacy_message_parts(raw) == [("think", "[thinking] the user needs help")]
+
+    def test_other_tool_shows_name_and_inputs(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "create_ticket", "name": "Create Ticket",
+                                                    "inputs": json.dumps({"email": "a@b.com"})}}])
+        assert eesel._legacy_message_parts(raw) == [("tool", '[tool] Create Ticket {"email": "a@b.com"}')]
+
+    def test_tool_result_rendered_as_arrow(self):
+        raw = json.dumps([{"type": "tool", "tool": {"name": "Create Ticket", "inputs": "{}",
+                                                    "output": {"success": True}}}])
+        out = eesel._legacy_message_parts(raw)
+        assert ("tool", "[tool] Create Ticket {}") in out
+        assert any(k == "tool" and t.startswith("[tool] →") and "success" in t for k, t in out)
 
     def test_invalid_jsonish_string_passthrough(self):
-        # Looks like JSON (leading '[') but isn't — must not crash, returns raw.
-        s = "[not json] hello"
-        assert eesel._legacy_message_text(s) == s
+        assert eesel._legacy_message_parts("[not json] hello") == [("text", "[not json] hello")]
 
-    def test_already_a_list(self):
-        out = eesel._legacy_message_text([{"type": "message", "message": "A"}, {"type": "message", "message": "B"}])
-        assert "A" in out and "B" in out
+    def test_mixed_think_then_message(self):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "hmm"})}},
+                          {"type": "message", "message": "Here you go."}])
+        assert eesel._legacy_message_parts(raw) == [("think", "[thinking] hmm"), ("text", "Here you go.")]
 
-    def test_textless_part_renders_type_marker(self):
-        out = eesel._legacy_message_text('[{"type":"tool_use","name":"create_ticket"}]')
-        assert "tool_use" in out and '"name"' not in out
-
-    def test_empty_message_part_dropped_and_tool_named(self):
-        # The common Zendesk-chat shape: an empty assistant message + a tool part.
-        # The empty message contributes nothing; the tool renders by its name.
-        raw = '[{"type":"message","message":""},{"type":"tool","tool":{"key":"think","name":"Finished Thinking"}}]'
-        out = eesel._legacy_message_text(raw)
-        assert out == "[Finished Thinking]"
-
-    def test_message_then_tool(self):
-        raw = '[{"type":"message","message":"On it."},{"type":"tool","tool":{"name":"Create Ticket"}}]'
-        out = eesel._legacy_message_text(raw)
-        assert "On it." in out and "[Create Ticket]" in out
-        assert '"type"' not in out
-
-    def test_render_turn_shows_agent_text_not_raw_json(self, capsys):
-        turn = {"userMessage": "hi", "agentMessage": '[{"type":"message","message":"Hello!"}]'}
-        eesel._render_legacy_turn(turn, full=True)
+    def test_render_turn_shows_thought_and_reply(self, capsys):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking",
+                                                    "inputs": json.dumps({"thought": "analyzing"})}},
+                          {"type": "message", "message": "Here is the answer."}])
+        eesel._render_legacy_turn({"userMessage": "help", "agentMessage": raw}, full=True)
         out = capsys.readouterr().out
-        assert "Hello!" in out
+        assert "[thinking] analyzing" in out and "Here is the answer." in out
         assert "[{" not in out and '"type"' not in out
+
+    def test_render_collapses_consecutive_duplicate_tool_lines(self, capsys):
+        raw = json.dumps([{"type": "tool", "tool": {"key": "think", "name": "Finished Thinking", "inputs": "{}"}},
+                          {"type": "tool", "tool": {"key": "think", "name": "Finished Thinking", "inputs": "{}"}}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=True)
+        assert capsys.readouterr().out.count("[thinking]") == 1
+
+    def test_render_does_not_truncate_message_prose(self, capsys):
+        long = "x" * 500
+        raw = json.dumps([{"type": "message", "message": long}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=False)
+        assert long in capsys.readouterr().out  # prose is shown in full even without --full
+
+    def test_render_truncates_tool_line(self, capsys):
+        big = "y" * 500
+        raw = json.dumps([{"type": "tool", "tool": {"name": "Big Tool", "inputs": big}}])
+        eesel._render_legacy_turn({"agentMessage": raw}, full=False)
+        out = capsys.readouterr().out
+        # The whole line (prefix + inputs) is capped at 200, so most y's are cut.
+        assert "y" * 100 in out and "y" * 300 not in out
+        assert max(len(ln) for ln in out.splitlines()) <= 200
 
 
 class TestLegacyHelpHiding:
