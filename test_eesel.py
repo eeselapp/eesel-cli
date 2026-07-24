@@ -10759,3 +10759,40 @@ class TestLegacyTasksAggregate:
         assert calls == ["ns-2"]  # only the named bot is fetched
         parsed = json.loads(capsys.readouterr().out)
         assert [s["sessionId"] for s in parsed] == ["b1"]
+
+
+class TestLegacyIntegrationsAggregate:
+    """`integrations list` on legacy is workspace-wide: aggregate connections
+    across all bots (bot-tagged) unless a bot is named."""
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "Bot One"}, {"id": "ns-2", "namespace": "Bot Two"}])
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_aggregates_across_all_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "c1", "connectionType": "eesel", "connectionName": "E1"}] if nid == "ns-1"
+                            else [{"connectionId": "c2", "connectionType": "zendesk", "connectionName": "Z2"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list", "--json")) == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert [c["connectionId"] for c in parsed] == ["c1", "c2"]
+        tags = {c["connectionId"]: c["botName"] for c in parsed}
+        assert tags["c1"] == "Bot One" and tags["c2"] == "Bot Two"
+
+    def test_human_view_shows_bot_column(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid:
+                            [{"connectionId": "c1", "connectionType": "eesel", "connectionName": "E1"}] if nid == "ns-1"
+                            else [{"connectionId": "c2", "connectionType": "zendesk", "connectionName": "Z2"}])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        out = capsys.readouterr().out
+        assert "Bot One" in out and "Bot Two" in out and "zendesk" in out
+
+    def test_empty_across_all_bots(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        monkeypatch.setattr(eesel, "fetch_namespace_connections", lambda creds, nid: [])
+        assert eesel.cmd_integrations(_parse("integrations", "list")) == 0
+        assert "no connections" in capsys.readouterr().err.lower()

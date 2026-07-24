@@ -4152,23 +4152,29 @@ def _mask_legacy_config(entries: list, reveal: bool) -> list:
 
 
 def _legacy_connections_list(args, creds: dict) -> int:
-    """`integrations list` on legacy: the bot's (namespace's) connections."""
-    ns = resolve_namespace_or_error(creds, getattr(args, "agent", None))
-    if not ns:
-        return 1
-    conns = fetch_namespace_connections(creds, ns["id"])
+    """`integrations list` on legacy: connections. Workspace-wide by default —
+    aggregated across every bot — or scoped to one with `--agent` / EESEL_AGENT.
+    Each row is tagged with the bot it belongs to."""
+    namespaces, rc = _legacy_scope_namespaces(creds, args)
+    if rc is not None:
+        return rc
+    rows = []
+    for ns in namespaces:
+        for c in fetch_namespace_connections(creds, ns["id"]):
+            rows.append({**c, "namespaceId": ns["id"], "botName": ns.get("namespace")})
     if _want_json(args):
-        emit(conns)
+        emit(rows)
         return 0
-    if not conns:
+    if not rows:
         info("(no connections)")
         return 0
-    fmt = " {:<12}  {:<18}  {}"
-    info(fmt.format("id", "type", "name"))
-    for c in conns:
+    fmt = " {:<18}  {:<12}  {:<18}  {}"
+    info(fmt.format("bot", "id", "type", "name"))
+    for c in rows:
+        bot = str(c.get("botName") or c.get("namespaceId") or "?")[:18]
         cid = str(c.get("connectionId") or "—")[:12]
         ctype = (str(c.get("connectionType") or "?"))[:18]
-        print(fmt.format(cid, ctype, c.get("connectionName") or ""))
+        print(fmt.format(bot, cid, ctype, c.get("connectionName") or ""))
     return 0
 
 
