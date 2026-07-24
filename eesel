@@ -5568,8 +5568,11 @@ def _legacy_sessions_list(args, creds: dict) -> int:
         return 0
     for s in rows:
         # Defensive .get everywhere — a session may omit any of these fields.
+        # The sessionId is shown in FULL (not truncated): it's what you feed to
+        # `tasks show`, and legacy (Zendesk-chat) ids share a long prefix, so a
+        # truncated column would render them identical and unusable.
         parts = [str(s.get("botName") or s.get("namespaceId") or "?")[:18],
-                 str(s.get("sessionId") or "?")[:16]]
+                 str(s.get("sessionId") or "?")]
         if s.get("title"):
             parts.append(str(s.get("title")))
         if s.get("lastUpdated"):

@@ -10899,3 +10899,27 @@ class TestLegacyIntegrationsShowScoping:
         monkeypatch.setattr(eesel, "fetch_connection_config", lambda creds, cid, params=None: [])
         assert eesel.cmd_integrations(_parse("integrations", "show", "08549cf9", "--agent", "Bot Two")) == 0
         assert calls == ["ns-2"]  # only the named bot's connections gathered
+
+
+class TestLegacyTasksListFullId:
+    """The human `tasks list` must show the FULL sessionId: Zendesk chat ids
+    share a long common prefix, so a truncated column renders them identical and
+    unusable for the follow-up `tasks show`."""
+
+    NS = [{"id": "ns-1", "namespace": "Bot"}]
+
+    def _legacy(self, monkeypatch):
+        monkeypatch.setattr(eesel, "resolve_platform", lambda creds, args=None: "legacy")
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: self.NS)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_full_session_id_shown(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._legacy(monkeypatch)
+        a = "zendesk-chat-6a62acb46a9803691333d01a"
+        b = "zendesk-chat-6a628aa018dc17f505fc140c"  # same 16-char prefix as `a`
+        monkeypatch.setattr(eesel, "fetch_sessions", lambda creds, nid, **k: [
+            {"sessionId": a, "lastUpdated": "2026-07-02"},
+            {"sessionId": b, "lastUpdated": "2026-07-01"}])
+        assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
+        out = capsys.readouterr().out
+        assert a in out and b in out  # both full ids present and distinguishable
