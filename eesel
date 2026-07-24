@@ -5555,8 +5555,15 @@ def _legacy_message_text(value) -> str:
             text = part.get("message") or part.get("text") or part.get("content")
             if isinstance(text, str) and text.strip():
                 out.append(text)
-            elif part.get("type"):
-                out.append(f"[{part['type']}]")
+                continue
+            ptype = part.get("type")
+            if ptype == "tool":
+                # {"type":"tool","tool":{"key":..,"name":..}} → show the tool name
+                tool = part.get("tool") or {}
+                out.append(f"[{tool.get('name') or tool.get('key') or 'tool'}]")
+            elif ptype and ptype != "message":
+                out.append(f"[{ptype}]")
+            # an empty message part (message == "") contributes nothing — skip it
         elif isinstance(part, str):
             out.append(part)
     return "\n\n".join(out)

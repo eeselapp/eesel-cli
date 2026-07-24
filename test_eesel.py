@@ -10593,6 +10593,19 @@ class TestLegacyMessageText:
         out = eesel._legacy_message_text('[{"type":"tool_use","name":"create_ticket"}]')
         assert "tool_use" in out and '"name"' not in out
 
+    def test_empty_message_part_dropped_and_tool_named(self):
+        # The common Zendesk-chat shape: an empty assistant message + a tool part.
+        # The empty message contributes nothing; the tool renders by its name.
+        raw = '[{"type":"message","message":""},{"type":"tool","tool":{"key":"think","name":"Finished Thinking"}}]'
+        out = eesel._legacy_message_text(raw)
+        assert out == "[Finished Thinking]"
+
+    def test_message_then_tool(self):
+        raw = '[{"type":"message","message":"On it."},{"type":"tool","tool":{"name":"Create Ticket"}}]'
+        out = eesel._legacy_message_text(raw)
+        assert "On it." in out and "[Create Ticket]" in out
+        assert '"type"' not in out
+
     def test_render_turn_shows_agent_text_not_raw_json(self, capsys):
         turn = {"userMessage": "hi", "agentMessage": '[{"type":"message","message":"Hello!"}]'}
         eesel._render_legacy_turn(turn, full=True)
