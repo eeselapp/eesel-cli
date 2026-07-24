@@ -10561,6 +10561,46 @@ class TestWhoamiPlatform:
         assert "platform     : platform" in capsys.readouterr().out
 
 
+class TestLegacyMessageText:
+    """`_legacy_message_text` renders a stored message field (plain string or
+    structured JSON parts) as readable plain text, never raising."""
+
+    def test_plain_string_passthrough(self):
+        assert eesel._legacy_message_text("Hello there") == "Hello there"
+
+    def test_none_is_empty(self):
+        assert eesel._legacy_message_text(None) == ""
+
+    def test_json_list_of_message_parts_joined(self):
+        raw = '[{"type": "message", "message": "Hi Kate,"}, {"type": "message", "message": "How can I help?"}]'
+        out = eesel._legacy_message_text(raw)
+        assert "Hi Kate," in out and "How can I help?" in out
+        assert '"type"' not in out and "[{" not in out  # not raw JSON
+
+    def test_json_single_dict_message(self):
+        assert eesel._legacy_message_text('{"type":"message","message":"Just this"}') == "Just this"
+
+    def test_invalid_jsonish_string_passthrough(self):
+        # Looks like JSON (leading '[') but isn't — must not crash, returns raw.
+        s = "[not json] hello"
+        assert eesel._legacy_message_text(s) == s
+
+    def test_already_a_list(self):
+        out = eesel._legacy_message_text([{"type": "message", "message": "A"}, {"type": "message", "message": "B"}])
+        assert "A" in out and "B" in out
+
+    def test_textless_part_renders_type_marker(self):
+        out = eesel._legacy_message_text('[{"type":"tool_use","name":"create_ticket"}]')
+        assert "tool_use" in out and '"name"' not in out
+
+    def test_render_turn_shows_agent_text_not_raw_json(self, capsys):
+        turn = {"userMessage": "hi", "agentMessage": '[{"type":"message","message":"Hello!"}]'}
+        eesel._render_legacy_turn(turn, full=True)
+        out = capsys.readouterr().out
+        assert "Hello!" in out
+        assert "[{" not in out and '"type"' not in out
+
+
 class TestLegacyHelpHiding:
     """With platform_hint='legacy', build_parser trims `--help` to the read
     commands, but every hidden command stays parseable (guard gives the note)."""

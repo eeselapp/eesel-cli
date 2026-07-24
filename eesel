@@ -5525,12 +5525,51 @@ def render_task_analytics(data: dict) -> None:
             print(f"  {count or 0:>6}  {name}")
 
 
+def _legacy_message_text(value) -> str:
+    """Best-effort plain text for a legacy message field.
+
+    Values are sometimes a plain string, sometimes JSON — a list of structured
+    parts (e.g. ``[{"type":"message","message":"…"}]``) or a single part dict.
+    Text parts are extracted and joined; a text-less part (e.g. a tool call)
+    renders as its ``[type]`` marker. A plain string, or anything that looks
+    like JSON but doesn't parse, is returned unchanged. Never raises."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] not in ("[", "{"):
+            return value  # plain text
+        try:
+            parsed = json.loads(s)
+        except (ValueError, TypeError):
+            return value  # looked like JSON but wasn't — show it raw
+    else:
+        parsed = value
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return str(parsed)
+    out: list[str] = []
+    for part in parsed:
+        if isinstance(part, dict):
+            text = part.get("message") or part.get("text") or part.get("content")
+            if isinstance(text, str) and text.strip():
+                out.append(text)
+            elif part.get("type"):
+                out.append(f"[{part['type']}]")
+        elif isinstance(part, str):
+            out.append(part)
+    return "\n\n".join(out)
+
+
 def _render_legacy_turn(turn: dict, *, full: bool = False) -> None:
     """Render one legacy session turn: the user's message then the agent's.
 
-    Long bodies are truncated unless `full`, mirroring the new-platform
-    `tasks show` (which caps tool args/output at 200 chars)."""
-    def body(text: str) -> str:
+    Structured message bodies are flattened to plain text (see
+    `_legacy_message_text`). Long bodies are truncated unless `full`, mirroring
+    the new-platform `tasks show` (which caps tool args/output at 200 chars)."""
+    def body(text) -> str:
+        text = _legacy_message_text(text)
         return text if full else text[:200]
 
     user = turn.get("userMessage")
