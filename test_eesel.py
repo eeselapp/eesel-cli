@@ -10644,3 +10644,53 @@ class TestLegacyHelpHiding:
     def test_hidden_subcommand_still_parses(self):
         args = self._legacy().parse_args(["agents", "create", "--name", "X"])
         assert args.cmd == "agents" and args.agents_cmd == "create"
+
+
+class TestLegacyScopeNamespaces:
+    """`_legacy_scope_namespaces` picks which bots a workspace-wide legacy
+    command spans: a named bot → just that one; no name → the sole bot, or ALL
+    bots on a multi-bot workspace (the aggregate behaviour)."""
+
+    def _stub(self, monkeypatch, ns):
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: ns)
+        monkeypatch.delenv("EESEL_AGENT", raising=False)
+
+    def test_no_bots_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert nss == [] and rc == 1
+        assert "no bots" in capsys.readouterr().err.lower()
+
+    def test_single_bot_no_target(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "Only"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1"]
+
+    def test_multi_bot_no_target_returns_all(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1", "ns-2"]
+
+    def test_target_resolves_one(self, fake_creds, monkeypatch):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="B"))
+        assert rc is None and [n["id"] for n in nss] == ["ns-2"]
+
+    def test_target_from_env(self, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "fetch_namespaces", lambda creds: [
+            {"id": "ns-1", "namespace": "A"}, {"id": "ns-2", "namespace": "B"}])
+        monkeypatch.setenv("EESEL_AGENT", "A")
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent=None))
+        assert rc is None and [n["id"] for n in nss] == ["ns-1"]
+
+    def test_target_ambiguous_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [{"id": "a", "namespace": "Dup"}, {"id": "b", "namespace": "Dup"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="Dup"))
+        assert nss == [] and rc == 1
+        assert "ambiguous" in capsys.readouterr().err.lower()
+
+    def test_target_not_found_errors(self, fake_creds, monkeypatch, capsys):
+        self._stub(monkeypatch, [{"id": "ns-1", "namespace": "A"}])
+        nss, rc = eesel._legacy_scope_namespaces(fake_creds, _ns(agent="nope"))
+        assert nss == [] and rc == 1
+        assert "no bot matches" in capsys.readouterr().err.lower()

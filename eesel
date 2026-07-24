@@ -3140,6 +3140,40 @@ def resolve_namespace_or_error(creds: dict, target: str | None) -> dict | None:
     return None
 
 
+def _legacy_scope_namespaces(creds: dict, args) -> tuple[list[dict], int | None]:
+    """Which bots a workspace-wide legacy command spans.
+
+    Returns `(namespaces, err_rc)`: the bots to act on, and an exit code to
+    return on failure (None on success). A named bot (`--agent` / EESEL_AGENT)
+    resolves to exactly that one; with no name a single-bot workspace uses its
+    only bot and a multi-bot workspace uses ALL of them — the aggregate model
+    that mirrors the new platform, where these workspace-wide nouns span every
+    agent and `--agent` is just a filter. Ambiguity is refused (same messages as
+    `resolve_namespace_or_error`); every returned id is validated."""
+    target = getattr(args, "agent", None) or os.environ.get("EESEL_AGENT")
+    namespaces = fetch_namespaces(creds)
+    if not namespaces:
+        err("No bots in this workspace.")
+        return [], 1
+    if target:
+        ns, candidates = resolve_namespace_strict(namespaces, target)
+        if not ns:
+            if candidates:
+                err(f"'{target}' is ambiguous — it matches {len(candidates)} bots:")
+                for n in candidates:
+                    err(f"  {n.get('id', '?')}  {n.get('namespace', '?')}")
+                err("Re-run with a full bot id to disambiguate.")
+            else:
+                err(f"No bot matches '{target}'.")
+            return [], 1
+        selected = [ns]
+    else:
+        selected = namespaces  # the sole bot, or ALL bots on a multi-bot workspace
+    for n in selected:
+        validate_id(n.get("id"), "namespace id")
+    return selected, None
+
+
 def _namespaces_list(args, creds: dict) -> int:
     """`agents list` on legacy: the workspace's bots (namespaces)."""
     namespaces = fetch_namespaces(creds)
