@@ -1095,6 +1095,13 @@ def _use_creds(creds: dict) -> dict:
 
 
 def require_creds() -> dict:
+    # `eesel support read` has minted a read-only token for a customer's own
+    # workspace and armed it for this process — every read in the inner command
+    # runs against that workspace. It wins over every other credential source,
+    # including a linked branch env, and is never written to the creds file.
+    if _support_creds_override is not None:
+        return _support_creds_override
+
     # A worktree linked to a branch env (or an `EESEL_BASE_URL` override) mints a
     # throwaway token from that env's `/dev/session` per run. This reads nothing
     # from ~/.config, so a linked worktree needs no `eesel login` at all — and
@@ -1590,6 +1597,8 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
     # Defined near main() alongside the pre-dispatch guard; a no-op unless a real
     # impersonation target is active.
     _impersonation_write_backstop(method, url)
+    # The same shape for a read-only support session; a no-op unless one is armed.
+    _support_readonly_write_backstop(method, url)
     try:
         return _http_send(method, url, token=token, body=body, timeout=timeout, headers=headers)
     except urllib.error.HTTPError as e:
@@ -1598,6 +1607,9 @@ def http_request(method: str, url: str, *, token: str | None = None, body: dict 
             if healed is not None:
                 return healed
         body_text = e.read().decode(errors="replace")
+        # A no-op outside a support session; adds one line of context so a
+        # read-only refusal or a lapsed 15-minute token doesn't read as generic.
+        _support_readonly_note(e.code, body_text)
         fail(code_for_status(e.code), f"{method} {url} → {e.code}: {body_text}")
     except (TimeoutError, socket.timeout):
         fail(EXIT_SERVER, f"{method} {url} timed out after {timeout}s (server slow or hung?).")
@@ -1699,6 +1711,7 @@ def http_request_allow_error(method: str, url: str, *, token: str | None = None,
     """
     assert_url_path_safe(url)
     _impersonation_write_backstop(method, url)
+    _support_readonly_write_backstop(method, url)
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -7594,6 +7607,7 @@ def _install_suggestions(parser: argparse.ArgumentParser) -> None:
 # `{id}` marks a path segment resolved at runtime. Commands with no single
 # stable endpoint (login/logout/whoami/link/chat/mcp call) are omitted.
 _COMMAND_ENDPOINTS = {
+    "support.read": "POST /support/mint-readonly-token",
     "agents.list": "GET /agents · legacy: GET /namespaces",
     "agents.show": "GET /agents · legacy: GET /namespaces",
     "agents.create": "POST /agents",
@@ -8323,6 +8337,48 @@ def build_parser(staff: bool = False, platform_hint: str | None = None) -> argpa
     n_set.add_argument("--json", action="store_true", help="Emit the raw settings readback")
     sp.set_defaults(func=cmd_settings)
 
+    # Staff-only, same treatment as `impersonate`: shown in `eesel --help` only
+    # for global impersonators, hidden (but still runnable) for everyone else.
+    # The server-side support allowlist is the real gate — the mint endpoint
+    # refuses any workspace that isn't on it. `eesel schema` always lists it, so
+    # an agent driving the CLI can still discover the command.
+    sp = sub.add_parser(
+        "support",
+        help="Read a customer's workspace read-only, from their support conversation (staff only)"
+        if staff
+        else argparse.SUPPRESS,
+        description="Read a CUSTOMER's workspace through the ordinary eesel read "
+        "commands. The server exchanges a support conversation for a 15-minute, "
+        "READ-ONLY token scoped to the workspace owned by that conversation's "
+        "verified sender — you never name the target, and no write is possible "
+        "with it. Requires an allowlisted support workspace.",
+    )
+    sup_sub = sp.add_subparsers(dest="support_cmd")
+
+    sup_read = sup_sub.add_parser(
+        "read",
+        help="Run one eesel read command against the customer's workspace",
+        description="Mint (or reuse) a read-only token for the conversation's verified "
+                    "sender, then run one ordinary read command against their workspace. "
+                    "Everything after `--task <id>` is the read command, verbatim: "
+                    "`eesel support read --task <id> agents list`.",
+    )
+    sup_read.add_argument("--task", required=True, metavar="TASK_ID",
+                          help="The support conversation to derive the customer from (`eesel tasks list` as yourself)")
+    sup_read.add_argument("--fresh", action="store_true",
+                          help="Mint a new token even if a live one is cached for this task")
+    sup_read.add_argument("command", nargs=argparse.REMAINDER,
+                          help="The read command to run, e.g. `agents list` or `files show <key>`")
+
+    sup_status = sup_sub.add_parser("status", help="Show live support sessions and how long they last")
+    sup_status.add_argument("--task", metavar="TASK_ID", help="Only this conversation's session")
+    sup_status.add_argument("--json", action="store_true", help="Emit the sessions as JSON (never the token)")
+
+    sup_end = sup_sub.add_parser("end", help="Drop cached support tokens (all, or one task's)")
+    sup_end.add_argument("--task", metavar="TASK_ID", help="Only drop this conversation's session")
+
+    sp.set_defaults(func=cmd_support)
+
     # Staff-only. Shown in `eesel --help` only for global impersonators; hidden
     # from everyone else (but still runnable if you know the subcommand). The
     # server-side allowlist is the actual gate — this just keeps the command
@@ -8359,7 +8415,7 @@ def build_parser(staff: bool = False, platform_hint: str | None = None) -> argpa
     # unless filtered by dest here. `impersonate` stays visible for staff.
     _hidden_top = ["document", "tools", "instructions"]
     if not staff:
-        _hidden_top.append("impersonate")
+        _hidden_top.extend(("impersonate", "support"))
     hide_subcommands(sub, *_hidden_top)
 
     # On a legacy v2 workspace, trim `--help` to the read commands that work
@@ -8833,6 +8889,479 @@ def _guard_platform_command(args, creds: dict | None) -> None:
         return
     fail(EXIT_VALIDATION,
          f"'{_command_label(args)}' is not available on the legacy (v2) platform (read-only).")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Support read-only sessions (`eesel support …`)
+#
+# eesel's own support side reads a CUSTOMER's workspace — instructions,
+# knowledge, activity, config — through the ordinary read commands, without
+# ever holding a cross-workspace or a write credential. The server mints the
+# credential it uses: `POST /support/mint-readonly-token` exchanges the id of a
+# support conversation for a short-lived (15 min) READ-ONLY token scoped to the
+# workspace owned by that conversation's verified sender. The support side
+# never names the target — the server derives it from the conversation, so
+# neither the model nor the customer's message text can steer it.
+#
+# So `eesel support read --task <id> <read command…>` is: mint (or reuse a live
+# cached token), then run that one command with the minted token as its bearer.
+#
+# The SERVER is the boundary — it refuses every mutating method on a read-only
+# token. The three client-side layers here are convenience (a clear refusal
+# instead of a raw 401) and are deliberately not the guarantee:
+#   1. an allowlist of read nouns, so `chat`/`new`/`login` never run here,
+#   2. the parser's own `write=True` tags, refused before any call is made,
+#   3. a backstop on any mutating HTTP request the first two missed.
+# Design of record: `agents/support/READONLY-IMPERSONATION.md` (eeselapp/slack).
+# ──────────────────────────────────────────────────────────────────────────
+
+SUPPORT_MINT_PATH = "/support/mint-readonly-token"
+
+
+# The mint endpoint's URL. The path is spelled out here rather than
+# interpolated from SUPPORT_MINT_PATH, and the body is one bare `return`, so
+# `eesel schema`'s endpoint annotation can be cross-checked against a real call
+# in the source (the schema test resolves one-line f-string helpers, not module
+# constants). The two spellings are pinned together by
+# `test_support_mint_url_matches_the_constant`.
+def _support_mint_url(base_url: str) -> str:
+    return f"{base_url}/support/mint-readonly-token"
+# Minted tokens are cached here, 0600, one file per (env, task). A support
+# engineer or agent runs many reads against one conversation and every mint
+# costs the server two Auth0 round-trips, so re-minting per command would be
+# both slow and rate-limit-prone. This is NOT the login credentials file: a
+# support session must never become the ambient identity, so nothing outside
+# `eesel support …` reads these, and `eesel support end` drops them.
+SUPPORT_SESSION_DIR = CONFIG_DIR / "support"
+# Treat a token as spent this long before the server's stated expiry, so a read
+# can't start with two seconds left and 401 halfway through a paged fetch.
+SUPPORT_TOKEN_SKEW_SECONDS = 60
+
+# Top-level nouns that mean "read the customer's account". Everything else —
+# `chat` and `new` (which would run and bill a turn in their workspace),
+# `login`/`logout`/`link` (which would touch the operator's own credentials),
+# `impersonate`, and `support` itself — is refused before anything is minted.
+# Read-only by construction on the client; the server still enforces it.
+_SUPPORT_READ_NOUNS = frozenset({
+    "agents", "instructions", "integrations", "tasks", "files", "document",
+    "tools", "automations", "skills", "workspace", "billing", "settings", "mcp",
+})
+# What to suggest in the refusal — the aliases above are hidden commands.
+_SUPPORT_READ_NOUNS_SHOWN = (
+    "agents", "instructions", "files", "integrations", "automations",
+    "skills", "tasks", "settings", "workspace", "billing", "mcp",
+)
+
+# Set by `eesel support read` once a token is minted and the inner command is
+# about to run; read by the HTTP backstop and the 401 explainer. None means "no
+# support session", which is every other invocation of the CLI.
+_support_session: dict | None = None
+# The creds the inner command runs with. `require_creds()` returns this while a
+# support session is armed, so every existing read command targets the
+# customer's workspace with no change to the command itself.
+_support_creds_override: dict | None = None
+
+# The mint's own POST is the one mutating request a support session may make —
+# and only to re-mint an expired token mid-session.
+_SUPPORT_ALLOWED_WRITE_PATHS = frozenset({SUPPORT_MINT_PATH})
+
+
+def _support_session_path(api_url: str, task_id: str) -> Path:
+    """One cache file per (env, task). Hashed so a task id never becomes a
+    filename, and so the same task against two envs can't collide."""
+    key = hashlib.sha256(f"{api_url}\n{task_id}".encode()).hexdigest()[:32]
+    return SUPPORT_SESSION_DIR / f"{key}.json"
+
+
+def _support_session_seconds_left(sess: dict | None) -> float:
+    """Seconds of usable life left on a cached session (already minus the skew).
+    Zero or negative means re-mint."""
+    if not sess or not sess.get("token"):
+        return 0.0
+    try:
+        expires_at = float(sess.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return expires_at - SUPPORT_TOKEN_SKEW_SECONDS - time.time()
+
+
+def load_support_session(api_url: str, task_id: str) -> dict | None:
+    """The live cached session for this (env, task), or None. A spent or
+    unreadable file is deleted on the way out, so a stale customer token never
+    lingers on disk after it stops being usable."""
+    path = _support_session_path(api_url, task_id)
+    try:
+        sess = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception:
+        path.unlink(missing_ok=True)
+        return None
+    if _support_session_seconds_left(sess) <= 0:
+        path.unlink(missing_ok=True)
+        return None
+    return sess
+
+
+def save_support_session(sess: dict) -> None:
+    SUPPORT_SESSION_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _atomic_write(
+        _support_session_path(sess["api_url"], sess["task_id"]),
+        json.dumps(sess, indent=2),
+        mode=0o600,
+    )
+
+
+def list_support_sessions(*, purge_expired: bool = True) -> list[dict]:
+    """Every cached session, newest first. Expired files are deleted as we go,
+    so `eesel support status` doubles as the cleanup."""
+    out: list[dict] = []
+    if not SUPPORT_SESSION_DIR.exists():
+        return out
+    for path in sorted(SUPPORT_SESSION_DIR.glob("*.json")):
+        try:
+            sess = json.loads(path.read_text())
+        except Exception:
+            if purge_expired:
+                path.unlink(missing_ok=True)
+            continue
+        if _support_session_seconds_left(sess) <= 0:
+            if purge_expired:
+                path.unlink(missing_ok=True)
+            continue
+        out.append(sess)
+    out.sort(key=lambda s: s.get("minted_at") or 0, reverse=True)
+    return out
+
+
+def clear_support_sessions(*, task_id: str | None = None) -> int:
+    """Delete cached sessions — one task's, or all of them. Returns how many
+    files were removed."""
+    if not SUPPORT_SESSION_DIR.exists():
+        return 0
+    removed = 0
+    for path in SUPPORT_SESSION_DIR.glob("*.json"):
+        if task_id:
+            try:
+                if json.loads(path.read_text()).get("task_id") != task_id:
+                    continue
+            except Exception:
+                continue  # unreadable: only the unqualified clear removes it
+        path.unlink(missing_ok=True)
+        removed += 1
+    return removed
+
+
+# Server error → (reason slug, what it means, what to do). The last three are
+# EXPECTED outcomes, not bugs: plenty of support conversations have no verified
+# sender, or a sender who isn't the owner of an eesel workspace.
+_SUPPORT_MINT_REASONS = (
+    (
+        "not authorized to mint support tokens",
+        "caller_not_allowlisted",
+        "This login's workspace isn't allowed to mint support tokens.",
+        "In prod the support allowlist is hardcoded server-side. On a branch env, enable it: "
+        'POST {base}/dev/enable-support-lookup {"workspace_id": "<this workspace>", "enabled": true}.',
+    ),
+    (
+        "task is not in this support workspace",
+        "task_not_in_support_workspace",
+        "That task isn't a conversation in this support workspace.",
+        "The server only mints for conversations in your own support inbox. Check the id with "
+        "`eesel tasks list` as yourself (no `support read`).",
+    ),
+    (
+        "could not establish a verified sender",
+        "no_verified_sender",
+        "The server couldn't derive a verified sender for that conversation — expected, not a bug.",
+        "Sender resolution is Intercom-only today, and an anonymous contact has no email to resolve. "
+        "There is no way to name the customer by hand: the target is server-derived on purpose.",
+    ),
+    (
+        "sender is not a verified owner",
+        "sender_not_verified_owner",
+        "The sender isn't the email-verified owner of an eesel workspace — expected, not a bug.",
+        "A teammate writing in (rather than the owner), an unverified email, or a personal address "
+        "that doesn't match the account all land here.",
+    ),
+    (
+        "task_id is required",
+        "task_id_required",
+        "The server received no task_id.",
+        "",
+    ),
+)
+
+
+def _fail_support_mint(status: int, payload: dict, task_id: str) -> None:
+    """Turn a mint failure into an actionable message and a typed exit."""
+    server_msg = ""
+    if isinstance(payload, dict):
+        server_msg = str(payload.get("error") or payload.get("message") or "")
+    reason = "mint_failed"
+    detail = server_msg or f"the server returned {status}"
+    hint = ""
+    for needle, slug, meaning, advice in _SUPPORT_MINT_REASONS:
+        if needle in server_msg:
+            reason, detail, hint = slug, meaning, advice
+            break
+    if status == 404 and reason == "mint_failed":
+        reason = "endpoint_missing"
+        detail = "This server has no support mint endpoint."
+        hint = "It ships on the support read-only branch — check the env is running that build."
+    err(f"Could not mint a read-only token for task {task_id}: {detail}")
+    if hint:
+        info(f"  {hint}")
+    info(f"  reason: {reason} (HTTP {status})")
+    sys.exit(code_for_status(status))
+
+
+def mint_support_readonly_token(creds: dict, task_id: str) -> dict:
+    """Exchange a support conversation for a read-only token scoped to the
+    workspace of that conversation's verified sender, and cache it.
+
+    Authenticates as the CALLER (eesel's own support workspace). The target is
+    never sent — the server derives it from the conversation — so this cannot be
+    pointed at an arbitrary workspace, by us or by anything the customer wrote.
+    """
+    status, payload = http_request_allow_error(
+        "POST", _support_mint_url(creds["api_url"]), token=creds["token"], body={"task_id": task_id}
+    )
+    if status != 200 or not isinstance(payload, dict) or not payload.get("token"):
+        _fail_support_mint(status, payload if isinstance(payload, dict) else {}, task_id)
+    workspace_id = payload.get("workspace_id")
+    if not workspace_id:
+        fail(EXIT_SERVER, f"{SUPPORT_MINT_PATH} returned a token but no workspace_id (got keys: {sorted(payload)}).")
+    # Trust the server's TTL, but never longer than the 15 minutes the design
+    # commits to — a bad `expires_in` must not extend a customer-scoped token.
+    try:
+        ttl = min(int(payload.get("expires_in") or 900), 900)
+    except (TypeError, ValueError):
+        ttl = 900
+    sess = {
+        "task_id": task_id,
+        "api_url": creds["api_url"],
+        "workspace_id": validate_id(str(workspace_id), "workspace id"),
+        "token": payload["token"],
+        "read_only": bool(payload.get("read_only", True)),
+        "minted_at": int(time.time()),
+        "expires_at": int(time.time()) + max(ttl, 0),
+    }
+    save_support_session(sess)
+    return sess
+
+
+def _support_creds(caller: dict, sess: dict) -> dict:
+    """The creds every read in this session runs with: the caller's env, the
+    customer's workspace, the minted token.
+
+    `ephemeral` is load-bearing — `save_creds` refuses to persist creds carrying
+    it, so a support read can never overwrite the operator's own login or leave
+    the customer's workspace/platform behind on disk. There is no refresh token,
+    so nothing tries to renew a customer-scoped credential either.
+    """
+    return {
+        "env": caller.get("env"),
+        "api_url": sess["api_url"],
+        "dashboard_url": caller.get("dashboard_url"),
+        "workspace_id": sess["workspace_id"],
+        "agent_id": None,
+        "token": sess["token"],
+        "expires_at": sess["expires_at"],
+        "ephemeral": True,
+        "support_task_id": sess["task_id"],
+    }
+
+
+def _arm_support_session(sess: dict, creds: dict) -> None:
+    """Point the rest of this process at the customer's workspace, read-only."""
+    global _support_session, _support_creds_override, _current_creds, _REVEAL_SECRETS
+    _support_session = sess
+    _support_creds_override = creds
+    _current_creds = creds
+    # A support session reads what the customer can see; it is not the place to
+    # unmask their stored credentials, whatever `--secrets` and a sysadmin login
+    # would allow as yourself.
+    _REVEAL_SECRETS = False
+
+
+def _refuse_support_write(reason: str, *advice: str) -> None:
+    err(f"Refused — read-only support session. {reason}")
+    for line in advice:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(EXIT_IMPERSONATION_BLOCKED)
+
+
+def _guard_support_readonly_command(args) -> None:
+    """Before dispatch: refuse anything that isn't a read of the customer's
+    account. Cheap and offline — nothing has been sent at this point."""
+    cmd = getattr(args, "cmd", None)
+    if cmd not in _SUPPORT_READ_NOUNS:
+        _refuse_support_write(
+            f"`{cmd}` isn't a read of the customer's account.",
+            "Reads available here: " + ", ".join(_SUPPORT_READ_NOUNS_SHOWN) + ".",
+            "Run it as yourself (without `support read`) if that's what you meant.",
+        )
+    if cmd == "mcp" and getattr(args, "mcp_cmd", None) == "token":
+        _refuse_support_write(
+            "`mcp token` mints a workspace token, which a read-only session can't do.",
+            "The minted support token is deliberately never printed — it is a customer credential.",
+        )
+    if _is_write_command(args):
+        _refuse_support_write(
+            f"`{_command_label(args)}` would change the customer's live setup.",
+            "The server rejects it on this token too; this just says so before the call.",
+        )
+
+
+def _support_readonly_write_backstop(method: str, url: str) -> None:
+    """Last line of defence: a mutating request the two checks above missed.
+
+    A command the parser doesn't tag as a write reaching here almost always
+    means a READ that is served over POST (the CLI's activity list is one). The
+    server's read-only gate is method-based, so it refuses those too — name the
+    endpoint so it can be allowlisted server-side rather than guessed at.
+    """
+    if _support_session is None:
+        return
+    if method.upper() in ("GET", "HEAD", "OPTIONS"):
+        return
+    path = urllib.parse.urlsplit(url).path
+    if path in _SUPPORT_ALLOWED_WRITE_PATHS:
+        return
+    _refuse_support_write(
+        f"{method.upper()} {path} is not a read.",
+        "If this is a read the API happens to serve over POST, the server's read-only gate blocks it",
+        f"as well — it needs an explicit server-side exemption for {path}.",
+    )
+
+
+def _support_readonly_note(status: int, body_text: str) -> None:
+    """Add one line of context to a 401/403 during a support session, so a
+    server-side refusal doesn't read as a generic auth failure. Advisory only —
+    the caller still fails with the server's own message and status."""
+    if _support_session is None or status not in (401, 403):
+        return
+    if "read-only" in (body_text or "").lower():
+        info("This is a read-only support session — the server blocked that as a write.")
+    else:
+        info("Read-only support tokens last 15 minutes; re-run to mint a fresh one "
+             "(`eesel support status` shows what's left).")
+
+
+def _support_banner(sess: dict) -> None:
+    left = max(int(_support_session_seconds_left(sess) + SUPPORT_TOKEN_SKEW_SECONDS), 0)
+    print(
+        _color(
+            f"▲ support read-only — workspace {sess['workspace_id']} "
+            f"(task {sess['task_id'][:8]}, {left // 60}m{left % 60:02d}s left)",
+            "33",
+        ),
+        file=sys.stderr,
+    )
+
+
+def cmd_support(args) -> int:
+    """`eesel support read|status|end` — read a customer's workspace read-only.
+
+    `read` mints (or reuses) a 15-minute read-only token for the workspace owned
+    by a support conversation's verified sender, then runs one ordinary eesel
+    read command against it. `status` shows the live sessions and their time
+    left; `end` drops the cached tokens.
+    """
+    sub = getattr(args, "support_cmd", None)
+    if sub == "read":
+        return _cmd_support_read(args)
+    if sub == "status":
+        return _cmd_support_status(args)
+    if sub == "end":
+        return _cmd_support_end(args)
+    err("Usage: eesel support read --task <task_id> <read command…>")
+    info("  e.g. eesel support read --task 1a2b3c4d-… agents list")
+    info("  also: eesel support status · eesel support end [--task <task_id>]")
+    return EXIT_USAGE
+
+
+def _cmd_support_read(args) -> int:
+    inner_argv = list(getattr(args, "command", None) or [])
+    # An explicit `--` separator is allowed (and needed only when the read
+    # command's first token could look like a flag).
+    if inner_argv and inner_argv[0] == "--":
+        inner_argv = inner_argv[1:]
+    if not inner_argv:
+        err("No read command given.")
+        info("Usage: eesel support read --task <task_id> <read command…>")
+        info("  e.g. eesel support read --task <id> agents list")
+        info("       eesel support read --task <id> files list")
+        return EXIT_USAGE
+    if "--task" in inner_argv or any(t.startswith("--task=") for t in inner_argv):
+        err("`--task` must come before the read command.")
+        info("  eesel support read --task <task_id> agents list")
+        return EXIT_USAGE
+
+    task_id = validate_id(args.task, "task id")
+
+    # Parse and vet the inner command BEFORE minting: refusing `chat` shouldn't
+    # cost a mint, and every mint is an audited exchange of a customer's identity.
+    parser = build_parser(staff=False, platform_hint=None)
+    inner = parser.parse_args(_normalize_integrations_argv(_normalize_path_scope_argv(inner_argv)))
+    # `main()` already lifted the global output flags out of the whole argv and
+    # configured them, so carry the resolved values onto the inner namespace —
+    # `eesel support read --task X agents list --json` behaves as you'd expect.
+    for flag in ("json", "secrets", "legacy", "platform"):
+        setattr(inner, flag, bool(getattr(inner, flag, False)) or bool(getattr(args, flag, False)))
+    _guard_support_readonly_command(inner)
+
+    caller = require_creds()
+    sess = None if getattr(args, "fresh", False) else load_support_session(caller["api_url"], task_id)
+    if sess is None:
+        sess = mint_support_readonly_token(caller, task_id)
+    _support_banner(sess)
+    if os.environ.get("EESEL_AGENT"):
+        warn("EESEL_AGENT is ignored in a support session — pass `--agent` to scope to one of "
+             "the customer's agents.")
+
+    _arm_support_session(sess, _support_creds(caller, sess))
+    # Resolved against the CUSTOMER's workspace: a customer on the legacy v2
+    # platform supports only a subset of reads, and this gives the same friendly
+    # refusal there as it would running as them.
+    _guard_platform_command(inner, _support_creds_override)
+    return inner.func(inner)
+
+
+def _cmd_support_status(args) -> int:
+    sessions = list_support_sessions()
+    task_id = getattr(args, "task", None)
+    if task_id:
+        sessions = [s for s in sessions if s.get("task_id") == task_id]
+    rows = [
+        {
+            "task_id": s.get("task_id"),
+            "workspace_id": s.get("workspace_id"),
+            "api_url": s.get("api_url"),
+            "read_only": bool(s.get("read_only", True)),
+            "seconds_left": max(int(_support_session_seconds_left(s) + SUPPORT_TOKEN_SKEW_SECONDS), 0),
+        }
+        for s in sessions
+    ]
+    if _OUTPUT_FORMAT == "json" or getattr(args, "json", False):
+        emit(rows)  # the token itself is never emitted
+        return 0
+    if not rows:
+        info("No live support sessions.")
+        return 0
+    for r in rows:
+        left = r["seconds_left"]
+        print(f"{r['task_id']}  {r['workspace_id']}  {left // 60}m{left % 60:02d}s left  {r['api_url']}")
+    return 0
+
+
+def _cmd_support_end(args) -> int:
+    task_id = getattr(args, "task", None)
+    removed = clear_support_sessions(task_id=task_id)
+    scope = f"task {task_id}" if task_id else "all tasks"
+    ok(f"Dropped {removed} cached support session{'' if removed == 1 else 's'} ({scope}).")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
