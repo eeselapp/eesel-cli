@@ -11019,3 +11019,332 @@ class TestLegacyTasksListFullId:
         assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
         out = capsys.readouterr().out
         assert a in out and b in out  # both full ids present and distinguishable
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Support read-only sessions (`eesel support …`)
+#
+# The support side reads a CUSTOMER's workspace with a server-minted, 15-minute
+# read-only token derived from a support conversation. These tests pin the two
+# things that make that safe on the client: the minted token is never the
+# ambient identity (it lives in its own short-TTL store, and `save_creds`
+# refuses it), and nothing that could change the customer's account is allowed
+# to run under it.
+# ──────────────────────────────────────────────────────────────────────────
+
+SUPPORT_TASK = "task-1a2b3c4d"
+SUPPORT_MINT_OK = {
+    "token": "readonly-jwt-for-customer",
+    "workspace_id": "ws-customer-999",
+    "expires_in": 900,
+    "read_only": True,
+}
+
+
+@pytest.fixture
+def support_config(tmp_config, monkeypatch):
+    """Redirect the support-session store into the tmp config dir and make sure
+    no session is armed from an earlier test (the arming is process-global)."""
+    monkeypatch.setattr(eesel, "SUPPORT_SESSION_DIR", tmp_config / "support")
+    monkeypatch.setattr(eesel, "_support_session", None)
+    monkeypatch.setattr(eesel, "_support_creds_override", None)
+    monkeypatch.delenv("EESEL_AGENT", raising=False)
+    return tmp_config / "support"
+
+
+def _stub_mint(monkeypatch, status=200, payload=None):
+    """Route the mint POST and record what was sent."""
+    calls = []
+
+    def fake_allow(method, url, *, token=None, body=None, timeout=60):
+        calls.append({"method": method, "url": url, "token": token, "body": body})
+        return status, (SUPPORT_MINT_OK if payload is None else payload)
+
+    monkeypatch.setattr(eesel, "http_request_allow_error", fake_allow)
+    return calls
+
+
+class TestSupportMintUrl:
+    def test_support_mint_url_matches_the_constant(self):
+        # Two spellings of one path (see the helper's comment): the schema test
+        # needs the literal, the write-backstop allowlist needs the constant.
+        assert eesel._support_mint_url("https://x") == "https://x" + eesel.SUPPORT_MINT_PATH
+
+
+class TestSupportMint:
+    def test_mint_posts_only_the_task_id_as_the_caller(self, support_config, fake_creds, monkeypatch):
+        calls = _stub_mint(monkeypatch)
+        sess = eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"].endswith("/support/mint-readonly-token")
+        # Authenticated as the SUPPORT workspace; the body names the
+        # conversation and nothing else — the target is server-derived, so
+        # there is no field here that could point it at another workspace.
+        assert calls[0]["token"] == fake_creds["token"]
+        assert calls[0]["body"] == {"task_id": SUPPORT_TASK}
+        assert sess["token"] == SUPPORT_MINT_OK["token"]
+        assert sess["workspace_id"] == "ws-customer-999"
+
+    def test_minted_token_is_cached_private_to_the_user(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch)
+        eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        files = list(support_config.glob("*.json"))
+        assert len(files) == 1
+        # A customer-scoped credential on disk is 0600, like the creds file.
+        assert files[0].stat().st_mode & 0o777 == 0o600
+        # ...and the task id is not readable from the filename.
+        assert SUPPORT_TASK not in files[0].name
+
+    def test_a_second_read_reuses_the_cached_token(self, support_config, fake_creds, monkeypatch):
+        calls = _stub_mint(monkeypatch)
+        eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        again = eesel.load_support_session(fake_creds["api_url"], SUPPORT_TASK)
+        assert again["token"] == SUPPORT_MINT_OK["token"]
+        assert len(calls) == 1  # every mint costs the server two Auth0 lookups
+
+    def test_the_cache_is_scoped_to_the_env(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch)
+        eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        # Same task against a different backend must not hand back this token.
+        assert eesel.load_support_session("https://other.preprod.eesel.xyz", SUPPORT_TASK) is None
+
+    def test_an_expired_token_is_dropped_not_returned(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch)
+        eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        path = eesel._support_session_path(fake_creds["api_url"], SUPPORT_TASK)
+        sess = json.loads(path.read_text())
+        sess["expires_at"] = int(time.time()) - 1
+        path.write_text(json.dumps(sess))
+        assert eesel.load_support_session(fake_creds["api_url"], SUPPORT_TASK) is None
+        # A spent customer token must not linger on disk.
+        assert not path.exists()
+
+    def test_a_token_inside_the_skew_window_counts_as_spent(self, support_config, fake_creds, monkeypatch):
+        # Half a minute of life left is not enough to start a paged read with.
+        sess = {"token": "t", "expires_at": time.time() + 30}
+        assert eesel._support_session_seconds_left(sess) < 0
+
+    def test_server_ttl_is_capped_at_the_committed_fifteen_minutes(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch, payload={**SUPPORT_MINT_OK, "expires_in": 86400})
+        sess = eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        assert sess["expires_at"] - sess["minted_at"] == 900
+
+    @pytest.mark.parametrize("server_error,slug", [
+        ("not authorized to mint support tokens", "caller_not_allowlisted"),
+        ("task is not in this support workspace", "task_not_in_support_workspace"),
+        ("could not establish a verified sender for this conversation", "no_verified_sender"),
+        ("sender is not a verified owner of an eesel workspace", "sender_not_verified_owner"),
+    ])
+    def test_each_mint_refusal_is_explained_by_name(self, support_config, fake_creds, monkeypatch, capsys, server_error, slug):
+        # "no verified sender" and "not a verified owner" are EXPECTED outcomes
+        # for plenty of conversations — they have to read as an answer, not as a
+        # broken CLI, and carry a slug an agent can branch on.
+        _stub_mint(monkeypatch, status=403, payload={"error": server_error})
+        with pytest.raises(SystemExit) as e:
+            eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        assert e.value.code == eesel.EXIT_AUTH
+        assert slug in capsys.readouterr().err
+
+    def test_a_missing_endpoint_says_so(self, support_config, fake_creds, monkeypatch, capsys):
+        _stub_mint(monkeypatch, status=404, payload={})
+        with pytest.raises(SystemExit):
+            eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        assert "endpoint_missing" in capsys.readouterr().err
+
+
+class TestSupportCredsAreNeverAmbient:
+    def test_support_creds_are_refused_by_save_creds(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch)
+        sess = eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        creds = eesel._support_creds(fake_creds, sess)
+        assert creds["ephemeral"] is True
+        assert creds["workspace_id"] == "ws-customer-999"
+        # The operator's own login must survive a support read untouched — this
+        # is what stops the customer's workspace becoming the ambient identity.
+        eesel.save_creds(creds)
+        assert json.loads(eesel.CREDS_FILE.read_text())["workspace_id"] == fake_creds["workspace_id"]
+
+    def test_support_creds_cannot_be_renewed(self, support_config, fake_creds, monkeypatch):
+        _stub_mint(monkeypatch)
+        sess = eesel.mint_support_readonly_token(fake_creds, SUPPORT_TASK)
+        # No refresh token: nothing tries to silently extend a customer-scoped
+        # credential past its 15 minutes.
+        assert "refresh_token" not in eesel._support_creds(fake_creds, sess)
+
+    def test_require_creds_returns_the_armed_session(self, support_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "_support_creds_override", {"token": "readonly", "api_url": "x"})
+        assert eesel.require_creds()["token"] == "readonly"
+
+    def test_arming_a_session_never_reveals_customer_secrets(self, support_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel, "_REVEAL_SECRETS", True)  # e.g. a sysadmin ran --secrets
+        eesel._arm_support_session({"task_id": SUPPORT_TASK, "workspace_id": "ws-customer-999",
+                                    "token": "t", "expires_at": time.time() + 900},
+                                   {"token": "t"})
+        assert eesel._REVEAL_SECRETS is False
+
+
+class TestSupportWriteRefusals:
+    """Three client-side layers, none of them the guarantee — the server refuses
+    every mutating method on a read-only token. These exist so a refusal reads
+    as a refusal instead of a raw 401."""
+
+    def _armed(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_support_session", {
+            "task_id": SUPPORT_TASK, "workspace_id": "ws-customer-999",
+            "token": "t", "expires_at": time.time() + 900})
+
+    def test_a_write_command_is_refused_before_any_call(self, support_config, monkeypatch, capsys):
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_support_readonly_command(_parse("agents", "create", "--name", "X"))
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert "read-only support session" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ("chat", "hello"),        # would run and BILL a turn in their workspace
+        ("new",),
+        ("login",),               # would touch the operator's own credentials
+        ("logout",),
+        ("link", "https://x.preprod.eesel.xyz"),
+        ("impersonate", "auth0|x"),
+        ("support", "status"),    # no recursion
+    ])
+    def test_only_reads_of_the_customer_are_offered(self, support_config, capsys, argv):
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_support_readonly_command(_parse(*argv))
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert "isn't a read" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [
+        ("agents", "list"), ("files", "list"), ("tasks", "list"),
+        ("automations", "triggers", "list"), ("skills", "list"),
+        ("workspace", "show"), ("billing", "show", "usage"), ("integrations", "list"),
+    ])
+    def test_the_reads_support_actually_needs_are_allowed(self, support_config, argv):
+        eesel._guard_support_readonly_command(_parse(*argv))  # no exit
+
+    def test_mcp_token_is_refused_because_it_mints(self, support_config, capsys):
+        with pytest.raises(SystemExit):
+            eesel._guard_support_readonly_command(_parse("mcp", "token"))
+        assert "mints a workspace token" in capsys.readouterr().err
+
+    def test_the_backstop_refuses_a_mutating_request(self, support_config, monkeypatch, capsys):
+        self._armed(monkeypatch)
+        with pytest.raises(SystemExit) as e:
+            eesel._support_readonly_write_backstop("DELETE", "https://api/agents/a1")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        err = capsys.readouterr().err
+        # Names the endpoint, because a READ served over POST needs a
+        # server-side exemption and guessing which one is the slow way.
+        assert "/agents/a1" in err
+
+    def test_the_backstop_allows_reads_and_the_re_mint(self, support_config, monkeypatch):
+        self._armed(monkeypatch)
+        eesel._support_readonly_write_backstop("GET", "https://api/agents")
+        eesel._support_readonly_write_backstop("POST", "https://api" + eesel.SUPPORT_MINT_PATH)
+
+    def test_the_backstop_is_inert_with_no_session(self, support_config):
+        eesel._support_readonly_write_backstop("DELETE", "https://api/agents/a1")
+
+    def test_a_server_read_only_refusal_is_explained(self, support_config, monkeypatch, capsys):
+        self._armed(monkeypatch)
+        eesel._support_readonly_note(401, '{"message": "This token is read-only and cannot perform this action."}')
+        assert "blocked that as a write" in capsys.readouterr().err
+
+    def test_a_plain_401_points_at_the_fifteen_minute_expiry(self, support_config, monkeypatch, capsys):
+        self._armed(monkeypatch)
+        eesel._support_readonly_note(401, '{"message": "Unauthorized"}')
+        assert "15 minutes" in capsys.readouterr().err
+
+    def test_the_note_is_silent_outside_a_support_session(self, support_config, capsys):
+        eesel._support_readonly_note(401, "read-only")
+        assert capsys.readouterr().err == ""
+
+
+class TestSupportReadEndToEnd:
+    def test_the_read_runs_against_the_customer_with_the_minted_token(self, support_config, fake_creds, monkeypatch, capsys):
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append({"method": req.get_method(), "url": req.full_url,
+                         "token": req.headers.get("Authorization")})
+            resp = _FakeResp(SUPPORT_MINT_OK if req.full_url.endswith(eesel.SUPPORT_MINT_PATH)
+                             else {"agents": [{"agent_id": "agent-cust-1", "name": "Their Bot",
+                                               "is_active": True}]})
+            resp.status = 200  # http_request_allow_error reads it; _FakeResp is minimal
+            return resp
+
+        # Patch the transport, not http_request, so the real write-backstop and
+        # 401 handling stay in the path under test.
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", fake_urlopen)
+        assert eesel.main(["support", "read", "--task", SUPPORT_TASK, "agents", "list"]) == 0
+        mint, read = sent[0], sent[1]
+        assert mint["url"].endswith(eesel.SUPPORT_MINT_PATH)
+        assert mint["token"] == f"Bearer {fake_creds['token']}"          # minted AS support
+        assert read["method"] == "GET"
+        assert read["token"] == f"Bearer {SUPPORT_MINT_OK['token']}"     # read AS the customer
+        out, err = capsys.readouterr()
+        assert "Their Bot" in out
+        assert "support read-only" in err                    # the session is visible
+
+    def test_a_refused_command_never_mints(self, support_config, fake_creds, monkeypatch):
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: pytest.fail("nothing should be sent"))
+        with pytest.raises(SystemExit) as e:
+            eesel.main(["support", "read", "--task", SUPPORT_TASK, "chat", "hi"])
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_task_flag_after_the_command_is_a_clear_usage_error(self, support_config, fake_creds, capsys):
+        assert eesel.main(["support", "read", "--task", SUPPORT_TASK, "agents", "list",
+                           "--task", "other"]) == eesel.EXIT_USAGE
+        assert "must come before" in capsys.readouterr().err
+
+    def test_no_read_command_is_a_usage_error(self, support_config, fake_creds, capsys):
+        assert eesel.main(["support", "read", "--task", SUPPORT_TASK]) == eesel.EXIT_USAGE
+        assert "No read command" in capsys.readouterr().err
+
+
+class TestSupportStatusAndEnd:
+    def _seed(self, monkeypatch, fake_creds, task, workspace, seconds=900):
+        eesel.save_support_session({
+            "task_id": task, "api_url": fake_creds["api_url"], "workspace_id": workspace,
+            "token": "secret-readonly-jwt", "read_only": True,
+            "minted_at": int(time.time()), "expires_at": int(time.time()) + seconds,
+        })
+
+    def test_status_lists_live_sessions_without_the_token(self, support_config, fake_creds, monkeypatch, capsys):
+        self._seed(monkeypatch, fake_creds, SUPPORT_TASK, "ws-customer-999")
+        assert eesel.cmd_support(_parse("support", "status", "--json")) == 0
+        out = capsys.readouterr().out
+        assert "ws-customer-999" in out
+        # The token is a customer credential; `status` must never print it.
+        assert "secret-readonly-jwt" not in out
+
+    def test_status_purges_what_has_expired(self, support_config, fake_creds, monkeypatch, capsys):
+        self._seed(monkeypatch, fake_creds, SUPPORT_TASK, "ws-customer-999", seconds=-10)
+        assert eesel.cmd_support(_parse("support", "status")) == 0
+        assert list(support_config.glob("*.json")) == []
+
+    def test_end_drops_one_task(self, support_config, fake_creds, monkeypatch):
+        self._seed(monkeypatch, fake_creds, SUPPORT_TASK, "ws-customer-999")
+        self._seed(monkeypatch, fake_creds, "task-other", "ws-customer-888")
+        assert eesel.cmd_support(_parse("support", "end", "--task", SUPPORT_TASK)) == 0
+        left = eesel.list_support_sessions()
+        assert [s["task_id"] for s in left] == ["task-other"]
+
+    def test_end_drops_everything_by_default(self, support_config, fake_creds, monkeypatch):
+        self._seed(monkeypatch, fake_creds, SUPPORT_TASK, "ws-customer-999")
+        self._seed(monkeypatch, fake_creds, "task-other", "ws-customer-888")
+        assert eesel.cmd_support(_parse("support", "end")) == 0
+        assert eesel.list_support_sessions() == []
+
+
+class TestSupportDiscoverability:
+    def test_schema_always_lists_support_so_an_agent_can_find_it(self):
+        schema = eesel._serialize_parser(eesel.build_parser(staff=True))
+        assert "read" in schema["subcommands"]["support"]["subcommands"]
+
+    def test_support_is_hidden_from_help_for_a_normal_login(self, capsys):
+        # Staff-gated in `--help` exactly like `impersonate`; the server-side
+        # support allowlist is the real gate.
+        assert "support" not in eesel.build_parser(staff=False).format_help()
+        assert "support" in eesel.build_parser(staff=True).format_help()

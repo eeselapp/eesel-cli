@@ -80,6 +80,26 @@ trimmed to those. Force the platform for one command with `--legacy` or
 `--platform` (mutually exclusive). `eesel schema` marks each command with a
 `legacy_supported` flag, so check there before calling on a legacy workspace.
 
+## Reading a customer's workspace (support only)
+
+`eesel support read --task <task_id> <read command…>` runs one ordinary read
+command against the workspace of a support conversation's sender, using a
+15-minute read-only token the server mints. You never name the customer: the
+server reads the sender off the helpdesk's record of that conversation. Writes
+are refused, by the server as well as by the CLI, and `eesel support status` /
+`end` show and drop the cached tokens. The command is hidden from `--help` for
+non-staff logins but always present in `eesel schema`.
+
+Four answers are expected outcomes rather than bugs, each named on a `reason:`
+line with exit code 3: `no_verified_sender`, `sender_not_verified_owner`,
+`caller_not_allowlisted`, `task_not_in_support_workspace`. See the README for
+what to do about each.
+
+⚠️ `tasks list` / `count` / `analytics` do not work inside a support session:
+the API serves those reads over POST and the server's read-only rule is decided
+by HTTP method. `tasks show <id>` (a GET) does work, and `eesel tasks list` as
+yourself is unaffected.
+
 ## Exit codes
 
 `0` = success · `2` = usage error (bad flags/arguments, from the parser) ·

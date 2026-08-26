@@ -310,6 +310,75 @@ once with nothing global to race over.
   as a normal `eesel login` / `--dev`.
 - Unlink by deleting `eesel.dev.json`.
 
+## Support read-only sessions - `eesel support`
+
+Read a **customer's** workspace through the ordinary read commands. You hand the
+server the id of a support conversation; it works out who wrote in, checks that
+person owns an eesel workspace, and hands back a 15-minute **read-only** token
+for that one workspace. So the most a support session can reach is the account
+of the customer already talking to you, and only to read it.
+
+```bash
+eesel tasks list                                      # as YOURSELF: find the conversation id
+eesel support read --task <task_id> agents list       # everything after --task is the read command
+eesel support read --task <task_id> instructions
+eesel support read --task <task_id> files show <key>
+eesel support status                                  # live sessions and time left
+eesel support end                                     # drop every cached token (--task drops one)
+```
+
+You never name the customer. The server reads the sender off the helpdesk's own
+record of that conversation, so nothing the customer wrote, and nothing the
+agent decides, can aim the token at a different account. Every mint is logged
+server-side with who asked, which workspace was resolved, and the token's
+lifetime.
+
+### When it says no
+
+The first two are ordinary answers about the conversation, not faults to
+report: plenty of people who write into support are not the owner of an eesel
+workspace, or are not resolvable at all.
+
+| what you see | what it means | what to do |
+| --- | --- | --- |
+| `no_verified_sender` | the helpdesk record has no sender we can trust for that conversation. Resolution works for Intercom conversations, inbound email, and Gorgias tickets; a Zendesk or Freshdesk conversation always lands here today | nothing to retry, and no way to name the customer by hand. Ask them in the conversation for the account email and use the dashboard |
+| `sender_not_verified_owner` | the sender is real but isn't the email-verified **owner** of an eesel workspace. A teammate writing in instead of the owner lands here | if you need the account read, ask the owner to write in themselves |
+| `caller_not_allowlisted` | your workspace isn't on the server's list of support workspaces | ask whoever runs the support workspace to add it. In prod the list is in code and needs a deploy |
+| `task_not_in_support_workspace` | that conversation isn't in your own support inbox | wrong id, or an id from somewhere else. Re-check `eesel tasks list` |
+
+All four print to stderr and exit `3` (the auth class, see Exit codes below),
+with the name above on its own `reason:` line so a script can branch on it.
+
+### Writes
+
+Refused, and the refusal is the server's: it rejects every request that changes
+anything, whatever the CLI does. The CLI just says so before the call instead of
+turning it into a bare 401, and it refuses `chat` and `new` outright here (both
+would run and bill a turn in the customer's workspace).
+
+⚠️ `tasks list`, `tasks count` and `tasks analytics` don't work **inside** a
+support session. The API serves those reads over `POST`, and the server's
+read-only rule is "no request that could change anything", which is decided by
+HTTP method, so it turns them away with the writes. `tasks show <id>` is a `GET`
+and works. Note this is only in-session: `eesel tasks list` as yourself, to find
+the conversation id, is unaffected. Making a customer's activity list readable
+needs the server to exempt `/workspace/tasks` and `/workspace/tasks/analytics`
+by name; until someone does, that one read is out of reach.
+
+### The token
+
+Cached at `~/.config/eesel/support/<hash>.json` (chmod 600, the hash is of the
+env plus the task id) until it expires, so a run of many reads needs only one
+round trip to mint. When it lapses the next `support read` mints a fresh one by
+itself; `--fresh` forces that early. It is never written to
+`credentials.json`, no command outside `eesel support` reads it, and it is
+never printed - the customer's credential should not end up in your shell
+history or a log.
+
+`eesel support` is hidden from `--help` unless your login is flagged staff, and
+always present in `eesel schema`. That is cosmetic; the real gate is the
+server's support-workspace allowlist above.
+
 ## Legacy (v2) platform
 
 eesel serves two products from one backend: the new **platform** (agents) and
