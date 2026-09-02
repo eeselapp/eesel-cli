@@ -1,5 +1,15 @@
 # eesel-cli
 
+> **Looking for the eesel CLI?** The public CLI is the `@eesel/cli` package on
+> npm: `npx @eesel/cli login`, then `npx @eesel/cli init chat-bubble --site
+> https://your-site.com`. Docs: https://docs.eesel.ai/apis-and-developer-resources/cli.
+> `curl -fsSL https://dashboard.eesel.ai/eesel-cli/install | sh` now installs
+> that package too.
+>
+> This repo is the **internal** Python `eesel` script used by the eesel team for
+> prod debugging (impersonation, sysadmin verbs). Customers should not be
+> pointed here.
+
 A simple CLI for the [eesel.ai](https://eesel.ai) platform. Auth, then
 chat — almost like the dashboard, from your terminal.
 
