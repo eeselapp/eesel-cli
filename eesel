@@ -8702,13 +8702,15 @@ def _configure_output(args, global_flags: dict, creds: dict | None) -> None:
 #
 # While a staff login is impersonating a customer, every command runs in the
 # customer's live workspace. Reads and chat are fine (chat's write tools are
-# stubbed server-side), but any command that changes the customer's setup would
-# hit their real account. Two layers refuse those, both no-ops unless a *real*
-# target is active:
-#   1. A pre-dispatch check in main() — refuses a known write command before any
-#      API call, and shows a banner on every command.
-#   2. A backstop in http_request — refuses any mutating HTTP method that a verb
-#      tag missed, so a forgotten command can't become a silent hole.
+# stubbed server-side), but any command that changes the customer's setup hits
+# their real account, so it happens only when a person reads what it would do
+# and types 'yes'. Two layers ask, both no-ops unless a *real* target is active:
+#   1. A pre-dispatch check in main() — asks about a known write command before
+#      any API call, and shows a banner on every command.
+#   2. A backstop in http_request — asks about any mutating HTTP method that a
+#      verb tag missed, so a forgotten command can't become a silent hole.
+# There is no flag, env var or non-interactive path that answers yes, so a
+# script, a cron or an agent pipeline gets a refusal, not a write.
 # This is a CLI-side guard for the operator's own tool; a direct curl under a
 # live target still writes. The complete fix (server-side block-by-default) is a
 # separate, human-gated change.
@@ -8721,6 +8723,11 @@ EXIT_IMPERSONATION_BLOCKED = 3
 # Set once by _guard_impersonated_command() when a real target is active; read
 # by the http_request backstop. None means "not impersonating".
 _impersonation_target: dict | None = None
+
+# Set by _guard_impersonated_command() once a person has approved this command's
+# writes, so the requests it then makes are not re-asked one by one. Per process,
+# so it covers exactly the one command that was approved.
+_impersonation_write_approved = False
 
 # Mutating-method requests to these paths are reads or plumbing, not customer
 # changes, so they run under a live target. Everything else with a mutating
@@ -8739,37 +8746,75 @@ def _is_write_command(args) -> bool:
     definition (`set_defaults(write=True)`), so the mark lives next to the
     command and rides argparse's own resolution — a command with no such tag
     reads as a non-write. The http_request backstop is the real guarantee; this
-    only drives the earlier, cleaner pre-dispatch refusal, so a command that
-    forgets the tag still gets refused (just later), never leaked.
+    only drives the earlier, cleaner pre-dispatch prompt, so a command that
+    forgets the tag is still approved request by request (just later), never
+    leaked.
     """
     return bool(getattr(args, "write", False))
 
 
-def _refuse_impersonated_write() -> None:
+def _target_description() -> tuple[str, str]:
+    """The live target as (user, workspace), with readable stand-ins when either
+    is unknown. Shared by the approval prompt and the refusal."""
+    t = _impersonation_target or {}
+    return t.get("user", "a customer"), t.get("workspace", "their workspace")
+
+
+def _approve_impersonated_write(what: str) -> bool:
+    """Ask the operator to approve one customer-changing action; True only on an
+    exact typed "yes".
+
+    Deliberately stricter than `confirm()`, which also takes "y" and returns True
+    under --dry-run: the answer here has to be the whole word, typed at a
+    terminal, every time. There is no flag and no env var that says yes in
+    advance, so a script, a cron or an agent pipeline reaches the refusal below
+    instead of writing to a customer's account.
+    """
+    user, workspace = _target_description()
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return False
+    warn(f"{what} changes {user}'s live workspace ({workspace}).")
+    print(_color("  Type 'yes' to run it as them: ", "33"), end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip() == "yes"
+    except EOFError:
+        return False
+
+
+def _refuse_impersonated_write(what: str) -> None:
     """Print the refusal to stderr and exit with the distinct block code. Used by
     both the pre-dispatch check and the http_request backstop, so the message is
     identical wherever a write is stopped."""
-    t = _impersonation_target or {}
-    user, workspace = t.get("user", "a customer"), t.get("workspace", "their workspace")
+    user, workspace = _target_description()
     # err() already gives the "✗ " prefix + red; the two continuation lines are
     # plain indented stderr (no helper emits an unprefixed line).
-    err(f"Refused — you are impersonating {user} ({workspace}).")
-    print("  The eesel CLI won't change a customer's live setup while impersonating.", file=sys.stderr)
+    err(f"Refused — {what} was not approved, and you are impersonating {user} ({workspace}).")
+    print("  Changing a customer's live setup takes a typed 'yes' at a terminal.", file=sys.stderr)
     print("  Run `eesel impersonate clear` to make this change as yourself.", file=sys.stderr)
     sys.exit(EXIT_IMPERSONATION_BLOCKED)
 
 
 def _impersonation_write_backstop(method: str, url: str) -> None:
-    """Refuse a mutating request under a live target unless its path is a known
-    read/plumbing exception. A mutating GET (there are none today that change a
-    customer's setup) would slip past this and must be caught by _WRITE_VERBS."""
+    """Ask about a mutating request under a live target unless its path is a known
+    read/plumbing exception, or the command it belongs to was already approved.
+    A mutating GET (there are none today that change a customer's setup) would
+    slip past this and must be caught by _WRITE_VERBS."""
     if _impersonation_target is None:
         return
     if method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
         return
-    if urllib.parse.urlsplit(url).path in _IMPERSONATION_ALLOWED_WRITE_PATHS:
+    path = urllib.parse.urlsplit(url).path
+    if path in _IMPERSONATION_ALLOWED_WRITE_PATHS:
         return
-    _refuse_impersonated_write()
+    if _impersonation_write_approved:
+        return
+    # An untagged command asks per request rather than once up front: nobody has
+    # seen a description of what it does, so the request itself is the thing to
+    # approve. It deliberately does not remember the answer — a later, different
+    # write in the same command is a separate decision.
+    what = f"{method.upper()} {path}"
+    if not _approve_impersonated_write(what):
+        _refuse_impersonated_write(what)
 
 
 def _guard_impersonated_command(args, creds: dict | None) -> None:
@@ -8780,7 +8825,7 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
     call, shows no banner, and is never blocked — zero cost off the staff path.
     Idle staff (no target armed) act as themselves and are likewise untouched.
     """
-    global _impersonation_target
+    global _impersonation_target, _impersonation_write_approved
     if not (creds and creds.get("is_impersonator")):
         return
     # A cached staff token may be near/expired. `require_creds()` will refresh it
@@ -8810,8 +8855,16 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
     workspace = resolve_effective_workspace_id(creds) or creds.get("workspace_id") or "their workspace"
     _impersonation_target = {"user": target_uid, "workspace": workspace}
     print(_color(f"▲ impersonating {target_uid} — {workspace}", "33"), file=sys.stderr)
-    if _is_write_command(args):
-        _refuse_impersonated_write()
+    if not _is_write_command(args):
+        return
+    if _DRY_RUN:
+        # Nothing is sent: write_request prints the request it would make and
+        # exits. Asking about a write that cannot happen is noise.
+        return
+    what = f"`{_command_label(args)}`"
+    if not _approve_impersonated_write(what):
+        _refuse_impersonated_write(what)
+    _impersonation_write_approved = True
 
 
 def _guard_platform_command(args, creds: dict | None) -> None:

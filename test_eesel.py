@@ -91,9 +91,11 @@ def _reset_impersonation_target():
     # test to stop the backstop / 401 self-heal leaking state between tests.
     eesel._impersonation_target = None
     eesel._current_creds = None
+    eesel._impersonation_write_approved = False
     yield
     eesel._impersonation_target = None
     eesel._current_creds = None
+    eesel._impersonation_write_approved = False
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3344,6 +3346,83 @@ class TestImpersonationBackstop:
         assert seen == [1]
 
 
+class TestImpersonatedWriteApproval:
+    """A write under a live target runs only when a person types "yes" at a
+    terminal. Everything else — no terminal, "y", a decline — refuses."""
+
+    def _arm(self, monkeypatch):
+        monkeypatch.setattr(eesel, "_impersonation_target",
+                            {"user": "auth0|cust", "workspace": "cust-ws"}, raising=False)
+
+    def _tty(self, monkeypatch, answer):
+        monkeypatch.setattr(eesel.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(eesel.sys.stderr, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: answer)
+
+    def test_typed_yes_lets_the_request_through(self, monkeypatch, capsys):
+        self._arm(monkeypatch)
+        self._tty(monkeypatch, "yes")
+        seen = []
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda req, timeout=None: seen.append(req.full_url) or _FakeResp({}))
+        eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert seen == ["https://api.example/agents"]
+        err = capsys.readouterr().err
+        assert "changes auth0|cust's live workspace (cust-ws)" in err  # what it affects, before the answer
+
+    def test_bare_y_is_not_a_yes(self, monkeypatch):
+        # `confirm()` accepts "y"; this prompt deliberately does not.
+        self._arm(monkeypatch)
+        self._tty(monkeypatch, "y")
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send")))
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+
+    def test_no_terminal_is_never_asked_and_never_writes(self, monkeypatch, capsys):
+        # A script, a cron or an agent pipeline: stdin is not a tty, so there is
+        # no prompt to answer and the write is refused outright.
+        self._arm(monkeypatch)
+        monkeypatch.setattr(eesel.sys.stdin, "isatty", lambda: False, raising=False)
+        monkeypatch.setattr("builtins.input",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("must not prompt")))
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send")))
+        with pytest.raises(SystemExit) as e:
+            eesel.http_request("POST", "https://api.example/agents", token="t")
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert "typed 'yes' at a terminal" in capsys.readouterr().err
+
+    def test_an_approved_command_is_not_asked_again_per_request(self, monkeypatch):
+        # The pre-dispatch approval covers the requests that command then makes.
+        self._arm(monkeypatch)
+        monkeypatch.setattr(eesel, "_impersonation_write_approved", True, raising=False)
+        monkeypatch.setattr("builtins.input",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("must not re-prompt")))
+        seen = []
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda req, timeout=None: seen.append(1) or _FakeResp({}))
+        eesel.http_request("POST", "https://api.example/agents", token="t")
+        eesel.http_request("POST", "https://api.example/agents/a/sync", token="t")
+        assert seen == [1, 1]
+
+    def test_an_untagged_command_is_asked_per_request(self, monkeypatch):
+        # Approving one request must not approve the next one a forgotten-tag
+        # command makes — they are separate decisions.
+        self._arm(monkeypatch)
+        asked = []
+        monkeypatch.setattr(eesel.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(eesel.sys.stderr, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: asked.append(1) or "yes")
+        monkeypatch.setattr(eesel.urllib.request, "urlopen",
+                            lambda req, timeout=None: _FakeResp({}))
+        eesel.http_request("POST", "https://api.example/agents", token="t")
+        eesel.http_request("DELETE", "https://api.example/agents/a", token="t")
+        assert len(asked) == 2
+        assert eesel._impersonation_write_approved is False
+
+
 class TestGuardImpersonatedCommand:
     """`_guard_impersonated_command` runs before dispatch: banner on every
     command under a live target, refusal for writes, nothing off the staff path."""
@@ -3378,14 +3457,35 @@ class TestGuardImpersonatedCommand:
         assert eesel._impersonation_target is None
         assert capsys.readouterr().err == ""
 
-    def test_write_refused_with_distinct_code(self, monkeypatch, capsys):
+    def test_write_refused_with_distinct_code_when_unapproved(self, monkeypatch, capsys):
+        # No terminal (the test process), so there is nothing to approve with.
         self._real_target(monkeypatch)
         with pytest.raises(SystemExit) as e:
-            eesel._guard_impersonated_command(_ns(write=True), self._creds())
+            eesel._guard_impersonated_command(_ns(write=True, cmd="agents"), self._creds())
         assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
         err = capsys.readouterr().err
         assert "▲ impersonating auth0|cust — cust-ws" in err  # banner
         assert "Refused" in err                               # refusal
+        assert eesel._impersonation_write_approved is False
+
+    def test_approved_write_runs_and_covers_its_requests(self, monkeypatch, capsys):
+        self._real_target(monkeypatch)
+        monkeypatch.setattr(eesel.sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr(eesel.sys.stderr, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input", lambda *a: "yes")
+        eesel._guard_impersonated_command(_ns(write=True, cmd="agents"), self._creds())
+        assert eesel._impersonation_write_approved is True
+        assert "`agents list`" in capsys.readouterr().err  # the prompt names the command
+
+    def test_dry_run_write_is_not_asked_about(self, monkeypatch):
+        # --dry-run prints the request and sends nothing, so there is no change
+        # to approve.
+        self._real_target(monkeypatch)
+        monkeypatch.setattr(eesel, "_DRY_RUN", True, raising=False)
+        monkeypatch.setattr("builtins.input",
+                            lambda *a: (_ for _ in ()).throw(AssertionError("must not prompt")))
+        eesel._guard_impersonated_command(_ns(write=True, cmd="agents"), self._creds())
+        assert eesel._impersonation_write_approved is False
 
     def test_read_shows_banner_but_is_not_blocked(self, monkeypatch, capsys):
         self._real_target(monkeypatch)
