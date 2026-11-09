@@ -122,6 +122,27 @@ Files are scoped to one agent — its `files/…` and `outputs/skills/…`
 keys — so scope the command with `EESEL_AGENT` or `--agent` first.
 `--prefix` filters within that scope (e.g. `files/`, `outputs/`).
 
+### On / Team only / Off (files and memory)
+
+The Files page's per-row setting, from the terminal. States: `on`, `team`
+(Team only), `off`, `answers` (non-v4 "Answers from it", files only) and
+`inherit` (clear the row's own setting so it follows its folder).
+
+```bash
+eesel files access                                  # every file: state, stored value, own|folder|default, key
+eesel files access <key|id|filename> team           # set one file
+eesel files access files/<agent>/research off       # set a folder (everything under it)
+eesel files access <key> inherit                    # clear the file's own setting
+
+eesel memory list                                   # each memory file and its state
+eesel memory access <key|name> team                 # set one memory On / Team only / Off
+```
+
+Both go through `/documents/audience-rules`, the same rules the dashboard
+writes. While impersonating, a set asks for a typed `yes`, except on eesel's
+own test workspaces, which the server lists in `/sysadmin/impersonator-status`:
+there it runs with no prompt.
+
 ## Tasks (workspace activity)
 
 `tasks` shows everything the workspace's agents have actually done —

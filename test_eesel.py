@@ -11119,3 +11119,119 @@ class TestLegacyTasksListFullId:
         assert eesel.cmd_tasks(_parse("tasks", "list")) == 0
         out = capsys.readouterr().out
         assert a in out and b in out  # both full ids present and distinguishable
+
+
+class TestTestWorkspaceWrites:
+    """On eesel's own test workspaces (the server's `write_test_workspace_ids`)
+    an impersonated write runs with no typed yes; everywhere else it still asks."""
+
+    TEST_WS = "41f1ecef-45e5-43cd-9bcb-ffe3eae5689e"
+
+    def _creds(self):
+        return {"is_impersonator": True, "api_url": "https://api.example", "token": "t", "workspace_id": "own-ws"}
+
+    def _target(self, monkeypatch, ws, listed):
+        monkeypatch.setattr(eesel, "_get_impersonate_status",
+                            lambda c: {"allowed": True, "target_user_id": "auth0|pat", "write_test_workspace_ids": listed})
+        monkeypatch.setattr(eesel, "resolve_effective_workspace_id", lambda c: ws)
+        monkeypatch.setattr(eesel, "_impersonation_write_approved", False, raising=False)
+
+    def test_listed_workspace_writes_without_prompt(self, monkeypatch, capsys):
+        self._target(monkeypatch, self.TEST_WS, [self.TEST_WS])
+        monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("must not prompt")))
+        eesel._guard_impersonated_command(_ns(write=True, cmd="memory"), self._creds())
+        assert eesel._impersonation_write_approved is True
+        assert "writes run for real" in capsys.readouterr().err
+        # The http_request backstop lets the PUT through too.
+        eesel._impersonation_write_backstop("PUT", "https://api.example/documents/audience-rules")
+
+    def test_unlisted_workspace_still_refused(self, monkeypatch):
+        self._target(monkeypatch, "cust-ws", [self.TEST_WS])
+        with pytest.raises(SystemExit) as e:
+            eesel._guard_impersonated_command(_ns(write=True, cmd="memory"), self._creds())
+        assert e.value.code == eesel.EXIT_IMPERSONATION_BLOCKED
+        assert eesel._impersonation_write_approved is False
+
+    def test_older_server_without_list_still_refused(self, monkeypatch):
+        self._target(monkeypatch, self.TEST_WS, None)
+        with pytest.raises(SystemExit):
+            eesel._guard_impersonated_command(_ns(write=True, cmd="memory"), self._creds())
+
+    def test_status_passes_the_list_through(self, tmp_config, monkeypatch):
+        payload = {"is_impersonator": True, "impersonator_uid": "staff", "target_uid": "pat",
+                   "write_test_workspace_ids": [self.TEST_WS]}
+        monkeypatch.setattr(eesel.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp(payload))
+        out = eesel._get_impersonate_status({"api_url": "https://oracle.eesel.app", "token": "t-list"})
+        assert out["write_test_workspace_ids"] == [self.TEST_WS]
+
+
+class TestFileAndMemoryAccess:
+    """`files access` / `memory list|access`: the Files page's On / Team only / Off."""
+
+    AGENTS = [{"agent_id": "agent-test-456", "name": "Support Bot"}]
+    KEY = "files/agent-test-456/notes.md"
+
+    def _parse(self, *argv):
+        return eesel.build_parser(staff=True).parse_args(list(argv))
+
+    def test_only_a_set_is_a_write(self):
+        assert eesel._is_write_command(self._parse("files", "access")) is False
+        assert eesel._is_write_command(self._parse("files", "access", "k", "team")) is True
+        assert eesel._is_write_command(self._parse("memory", "list")) is False
+        assert eesel._is_write_command(self._parse("memory", "access", "k", "off")) is True
+
+    def test_resolve_longest_rule_then_default(self):
+        rules = [{"key_prefix": "files/a", "audience": "internal"}, {"key_prefix": "files/a/x.md", "audience": "off"}]
+        assert eesel._resolve_access("files/a/x.md", rules) == ("off", "own")
+        assert eesel._resolve_access("files/a/y.md", rules) == ("internal", "folder")
+        # A sibling that only shares a string prefix is not under the folder.
+        assert eesel._resolve_access("files/ab/y.md", rules) == ("public", "default")
+        default = {"audience": "internal_labelled", "since": "2026-11-03T00:00:00Z"}
+        assert eesel._resolve_access("files/b/new.md", [], "2026-11-08T23:52:40+00:00", default) == ("internal_labelled", "default")
+        assert eesel._resolve_access("files/b/old.md", [], "2026-10-01T00:00:00", default) == ("public", "default")
+
+    def _wire(self, monkeypatch, rules):
+        calls = []
+        monkeypatch.setattr(eesel, "fetch_agents", lambda creds: self.AGENTS)
+        monkeypatch.setattr(eesel, "fetch_documents",
+                            lambda creds, **k: [{"id": "d1", "key": self.KEY, "created_at": None}] if k.get("prefix") == "files/agent-test-456" else [])
+
+        def fake_http(method, url, *, token=None, body=None, timeout=60, headers=None):
+            calls.append((method, url, body))
+            if url.endswith("/memory"):
+                return {"entries": [{"key": "files/agent-test-456/.memory/door.md", "name": "door", "description": "door code"}]}
+            return {"rules": rules, "new_file_default": None}
+
+        def fake_write(method, url, *, token=None, body=None, timeout=60, allow_error=False):
+            calls.append((method, url, body))
+            return {"status": "ok", "removed": 1}
+
+        monkeypatch.setattr(eesel, "http_request", fake_http)
+        monkeypatch.setattr(eesel, "write_request", fake_write)
+        return calls
+
+    def test_files_access_lists_states(self, tmp_config, fake_creds, monkeypatch, capsys):
+        self._wire(monkeypatch, [{"key_prefix": self.KEY, "audience": "internal"}])
+        assert eesel.cmd_files(self._parse("files", "access", "--agent", "Support Bot")) == 0
+        assert capsys.readouterr().out.split() == ["Team", "only", "internal", "own", self.KEY]
+
+    def test_files_access_set_and_inherit(self, tmp_config, fake_creds, monkeypatch):
+        calls = self._wire(monkeypatch, [])
+        assert eesel.cmd_files(self._parse("files", "access", "notes.md", "off", "--agent", "Support Bot")) == 0
+        assert ("PUT", "http://localhost:8080/documents/audience-rules", {"key_prefix": self.KEY, "audience": "off"}) in calls
+        assert eesel.cmd_files(self._parse("files", "access", self.KEY, "inherit", "--agent", "Support Bot")) == 0
+        assert ("DELETE", "http://localhost:8080/documents/audience-rules", {"key_prefix": self.KEY}) in calls
+
+    def test_files_access_folder_and_unknown(self, tmp_config, fake_creds, monkeypatch):
+        calls = self._wire(monkeypatch, [])
+        assert eesel.cmd_files(self._parse("files", "access", "files/agent-test-456/", "team", "--agent", "Support Bot")) == 0
+        assert ("PUT", "http://localhost:8080/documents/audience-rules", {"key_prefix": "files/agent-test-456", "audience": "internal"}) in calls
+        assert eesel.cmd_files(self._parse("files", "access", "nope.md", "team", "--agent", "Support Bot")) == 1
+
+    def test_memory_list_and_access(self, tmp_config, fake_creds, monkeypatch, capsys):
+        calls = self._wire(monkeypatch, [])
+        assert eesel.cmd_memory(self._parse("memory", "list", "--agent", "Support Bot")) == 0
+        assert capsys.readouterr().out.startswith("On ")
+        assert eesel.cmd_memory(self._parse("memory", "access", "door", "team", "--agent", "Support Bot")) == 0
+        assert ("PUT", "http://localhost:8080/documents/audience-rules",
+                {"key_prefix": "files/agent-test-456/.memory/door.md", "audience": "internal"}) in calls
