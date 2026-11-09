@@ -810,7 +810,7 @@ _LEGACY_SUB_DEST = {
 # `--help` on legacy (they stay parseable; the guard refuses them).
 _LEGACY_HIDDEN_NOUNS = (
     "files", "skills", "mcp", "settings", "chat", "new", "cost",
-    "automations", "billing", "sessions",
+    "automations", "billing", "sessions", "memory",
 )
 
 
@@ -2917,6 +2917,11 @@ def _get_impersonate_status(creds: dict) -> dict | None:
         target_uid = data.get("target_uid")
         target = target_uid if (impersonator and target_uid and target_uid != impersonator) else None
         result = {"allowed": allowed, "target_user_id": target}
+        # eesel's own test workspaces, where an impersonated write runs for real
+        # (server-side list, staff only). Absent on older servers.
+        test_ids = data.get("write_test_workspace_ids")
+        if isinstance(test_ids, list):
+            result["write_test_workspace_ids"] = [str(i) for i in test_ids]
     if token is not None:
         _IMPERSONATE_STATUS_CACHE[token] = result
     return result
@@ -5968,9 +5973,27 @@ def _document_key(doc: dict) -> str:
 def agent_documents(creds: dict, *, prefix: str | None = None, limit: int = 500) -> list[dict]:
     """Documents the scoped agent owns (files/{agent}, outputs/skills/{agent}),
     optionally narrowed to a key prefix. Shared by `document read`'s direct
-    lookup and its interactive menu."""
-    docs = fetch_documents(creds, prefix=prefix, limit=limit)
+    lookup and its interactive menu.
+
+    With no prefix, each of the agent's own prefixes is fetched: one unscoped
+    page of the whole workspace can hold none of this agent's files at all."""
+    prefixes = [prefix] if prefix else agent_document_prefixes(creds)
+    docs = _unique_documents(doc for p in prefixes for doc in fetch_documents(creds, prefix=p, limit=limit))
     return [doc for doc in docs if document_matches_agent(creds, doc)]
+
+
+def _unique_documents(docs) -> list[dict]:
+    """Drop repeats (by id, else key), keeping the first; fetches over several
+    prefixes can return the same document twice."""
+    seen: set = set()
+    out = []
+    for doc in docs:
+        ident = doc.get("id") or _document_key(doc)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(doc)
+    return out
 
 
 def match_document(docs: list[dict], target: str) -> dict | list[dict] | None:
@@ -6386,12 +6409,13 @@ def cmd_files(args) -> int:
         creds = require_creds_scoped(args)
         if not _scope_files_agent(creds, args):
             return 1
-        documents = fetch_documents(
-            creds,
-            prefix=args.prefix,
-            search=args.search,
-            limit=args.limit,
-            offset=args.offset,
+        # Without a prefix or search, page through the agent's own prefixes: one
+        # unscoped page of a big workspace can hold none of this agent's files.
+        prefixes = [args.prefix] if (args.prefix or args.search) else agent_document_prefixes(creds)
+        documents = _unique_documents(
+            doc
+            for prefix in prefixes
+            for doc in fetch_documents(creds, prefix=prefix, search=args.search, limit=args.limit, offset=args.offset)
         )
         documents = [doc for doc in documents if document_matches_agent(creds, doc)]
         if _want_json(args):
@@ -6422,6 +6446,8 @@ def cmd_files(args) -> int:
         return _files_remove(args)
     if sub == "acl":
         return _files_acl(args)
+    if sub == "access":
+        return _files_access(args)
     return 1
 
 
@@ -6570,6 +6596,168 @@ def _files_acl(args) -> int:
         return 0
 
     err(f"Unknown acl command: {sub}")
+    return 1
+
+
+# ── File and memory access (the Files page's On / Team only / Off) ───────────
+# One rule table per workspace (GET/PUT/DELETE /documents/audience-rules), keyed
+# by workspace-relative key prefix: a full key is a file's own rule, a shorter
+# prefix a folder's. Longest match wins. Memory files are documents too, under
+# files/<agent>/.memory/, so `memory access` writes the same rules.
+
+# The state a person picks -> the stored audience. `on` writes public; on v4 the
+# server reads a stored public as internal_labelled for these files, so it is
+# the dashboard's On either way. `answers` is the non-v4 "Answers from it".
+_ACCESS_AUDIENCE = {"on": "public", "answers": "internal_labelled", "team": "internal", "off": "off"}
+_ACCESS_STATES = (*_ACCESS_AUDIENCE, "inherit")
+
+
+def _access_label(audience: str) -> str:
+    """A stored audience in the dashboard's words (v4: On / Team only / Off)."""
+    if audience == "internal":
+        return "Team only"
+    if audience == "off":
+        return "Off"
+    return "On"
+
+
+def _access_rules(creds: dict) -> tuple[list[dict], dict | None]:
+    data = http_request("GET", f"{creds['api_url']}/documents/audience-rules", token=creds["token"])
+    return data.get("rules") or [], data.get("new_file_default")
+
+
+def _workspace_relative(creds: dict, key: str) -> str:
+    """Rules are keyed without the leading workspace id; strip it if present."""
+    ws = resolve_effective_workspace_id(creds) or creds.get("workspace_id") or ""
+    return key[len(ws) + 1:] if ws and key.startswith(f"{ws}/") else key
+
+
+def _resolve_access(key: str, rules: list[dict], created_at: str | None = None, new_file_default: dict | None = None) -> tuple[str, str]:
+    """(stored audience, where it comes from: own | folder | default) for a key:
+    the longest rule at or above it, else the new-file default for a file
+    created since it applies, else public. Mirrors the dashboard's
+    resolveAudience."""
+    best, best_len = None, -1
+    for rule in rules:
+        prefix = rule.get("key_prefix") or ""
+        if (key == prefix or key.startswith(prefix + "/")) and len(prefix) > best_len:
+            best, best_len = rule.get("audience"), len(prefix)
+    if best is not None:
+        return best, "own" if best_len == len(key) else "folder"
+    if new_file_default and created_at:
+        since = (new_file_default.get("since") or "").replace("Z", "+00:00")
+        created = created_at.replace("Z", "+00:00")
+        try:
+            def _utc(v):
+                d = datetime.fromisoformat(v)
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            if _utc(created) >= _utc(since):
+                return new_file_default.get("audience") or "public", "default"
+        except ValueError:
+            pass
+    return "public", "default"
+
+
+def _set_access(creds: dict, key: str, state: str) -> int:
+    """PUT the state's audience at `key`, or DELETE its own rule for `inherit`."""
+    url = f"{creds['api_url']}/documents/audience-rules"
+    if state == "inherit":
+        data = write_request("DELETE", url, token=creds["token"], body={"key_prefix": key})
+        ok(f"{key}: own setting cleared ({data.get('removed', 0)} removed); it now follows its folder.")
+    else:
+        write_request("PUT", url, token=creds["token"], body={"key_prefix": key, "audience": _ACCESS_AUDIENCE[state]})
+    rules, default = _access_rules(creds)
+    audience, _ = _resolve_access(key, rules, None, default)
+    if state != "inherit":
+        ok(f"{key}: {_access_label(audience)} ({audience})")
+    else:
+        info(f"{key}: {_access_label(audience)} ({audience}, inherited)")
+    return 0
+
+
+def _print_access_rows(args, rows: list[dict]) -> int:
+    if _want_json(args):
+        emit(rows)
+        return 0
+    if not rows:
+        info("(none)")
+        return 0
+    for row in rows:
+        print(f"{row['state']:<9}  {row['audience']:<17}  {row['source']:<7}  {row['key']}")
+    return 0
+
+
+def _files_access(args) -> int:
+    """`eesel files access [KEY STATE]` — list each file's state, or set one
+    file's or folder's state (on | team | off | answers | inherit)."""
+    creds = require_creds_scoped(args)
+    if not _scope_files_agent(creds, args):
+        return 1
+    documents = agent_documents(creds, prefix=getattr(args, "prefix", None), limit=500)
+    if args.target is None:
+        rules, default = _access_rules(creds)
+        rows = []
+        for doc in documents:
+            key = _workspace_relative(creds, _document_key(doc))
+            audience, source = _resolve_access(key, rules, doc.get("created_at") or doc.get("createdAt"), default)
+            rows.append({"key": key, "state": _access_label(audience), "audience": audience, "source": source})
+        return _print_access_rows(args, rows)
+    if args.state is None:
+        err("Name the state too: eesel files access <key> on|team|off|answers|inherit")
+        return 2
+    match = match_document(documents, args.target)
+    if isinstance(match, list):
+        err(f"'{args.target}' matches {len(match)} files; use the full key.")
+        return 1
+    if match:
+        key = _workspace_relative(creds, _document_key(match))
+    else:
+        # A folder: a prefix with at least one of this agent's files under it.
+        key = _workspace_relative(creds, args.target.rstrip("/"))
+        if not any(_workspace_relative(creds, _document_key(d)).startswith(key + "/") for d in documents):
+            err(f"No file or folder matches '{args.target}'.")
+            info("Run `eesel files access` to see this agent's file keys.")
+            return 1
+    return _set_access(creds, key, args.state)
+
+
+def cmd_memory(args) -> int:
+    """`eesel memory list` and `eesel memory access <key|name> STATE` — the
+    agent's memory files (files/<agent>/.memory/) and their On / Team only / Off."""
+    creds = require_creds_scoped(args)
+    if not _scope_files_agent(creds, args):
+        return 1
+    data = http_request("GET", f"{creds['api_url']}/agents/{creds['agent_id']}/memory", token=creds["token"])
+    entries = data.get("entries") or []
+    sub = args.memory_cmd or "list"
+    if sub == "list":
+        rules, _ = _access_rules(creds)
+        rows = []
+        for entry in entries:
+            audience, source = _resolve_access(entry.get("key") or "", rules)
+            rows.append({"key": entry.get("key"), "name": entry.get("name"), "description": entry.get("description"),
+                         "state": _access_label(audience), "audience": audience, "source": source})
+        if _want_json(args):
+            emit(rows)
+            return 0
+        if not rows:
+            info("(no memory)")
+            return 0
+        for row in rows:
+            print(f"{row['state']:<9}  {row['key']}  {row['description'] or ''}")
+        return 0
+    if sub == "access":
+        target = args.target
+        entry = next((e for e in entries if target in (e.get("key"), e.get("name"))), None)
+        if entry is None:
+            names = [e.get("key") for e in entries if (e.get("key") or "").endswith("/" + target) or (e.get("key") or "").endswith("/" + target + ".md")]
+            if len(names) == 1:
+                entry = next(e for e in entries if e.get("key") == names[0])
+        if entry is None:
+            err(f"No memory matches '{target}'. Run `eesel memory list` for the keys.")
+            return 1
+        return _set_access(creds, entry["key"], args.state)
+    err(f"Unknown memory command: {sub}")
     return 1
 
 
@@ -7527,6 +7715,19 @@ def _add_files_parser(sub, name: str, hidden: bool = False) -> None:
         help="A key prefix to grant (repeatable). REPLACES the agent's current prefixes",
     )
 
+    agent_help = "Agent id, id-prefix, or name; a single-agent workspace is used automatically"
+    ac = d_sub.add_parser(
+        "access",
+        help="List each file's On / Team only / Off, or set one file's or folder's (on|team|off|answers|inherit)",
+    )
+    ac.add_argument("target", nargs="?", help="File key, id or filename, or a folder prefix (omit to list)")
+    ac.add_argument("state", nargs="?", choices=_ACCESS_STATES, help="on | team (Team only) | off | answers (non-v4) | inherit (clear its own setting)")
+    ac.add_argument("--prefix", help="List only files under this key prefix")
+    ac.add_argument("--agent", help=agent_help)
+    ac.add_argument("--json", action="store_true", help="Emit the rows as JSON")
+    # Only a set is a write; a bare `files access` is a read.
+    ac.set_defaults(write=lambda a: getattr(a, "state", None) is not None)
+
     hide_subcommands(d_sub, "read")  # `read` is the hidden alias for `show`
 
     sp.set_defaults(func=cmd_files, file_cmd="list", prefix=None, search=None, limit=100, offset=0)
@@ -7991,6 +8192,18 @@ def build_parser(staff: bool = False, platform_hint: str | None = None) -> argpa
     # are `files/<agent-id>/<name>`). The legacy singular `document` is kept as a
     # hidden alias so pre-rename scripts keep working.
     _add_files_parser(sub, "files")
+
+    sp = sub.add_parser("memory", help="List the agent's memory files, or set one On / Team only / Off")
+    me_sub = sp.add_subparsers(dest="memory_cmd")
+    me_ls = me_sub.add_parser("list", help="List memory files with their On / Team only / Off")
+    me_ls.add_argument("--agent", help="Agent id, id-prefix, or name; a single-agent workspace is used automatically")
+    me_ls.add_argument("--json", action="store_true", help="Emit the rows as JSON")
+    me_ac = me_sub.add_parser("access", help="Set one memory file On / Team only / Off (or inherit)")
+    me_ac.set_defaults(write=True)
+    me_ac.add_argument("target", help="Memory key, name, or filename (see `eesel memory list`)")
+    me_ac.add_argument("state", choices=("on", "team", "off", "inherit"), help="on | team (Team only) | off | inherit")
+    me_ac.add_argument("--agent", help="Agent id, id-prefix, or name; a single-agent workspace is used automatically")
+    sp.set_defaults(func=cmd_memory, memory_cmd="list")
     _add_files_parser(sub, "document", hidden=True)
 
     # Hidden back-compat alias: the read-only `eesel tools [agent]` command was
@@ -8428,7 +8641,7 @@ _REMOVED_AGENTS_VERBS = {
 # hidden `tools` alias are likewise out of scope here.
 _AGENT_SCOPED_CHILDREN = {
     "integrations": ("flag", None),
-    "files": ("flag", frozenset({"list", "show", "read", "add", "remove", "export"})),
+    "files": ("flag", frozenset({"list", "show", "read", "add", "remove", "export", "access"})),
     "tasks": ("flag", frozenset({"list", "show", "count", "analytics", "export"})),
     "skills": ("pos", None),
 }
@@ -8750,7 +8963,10 @@ def _is_write_command(args) -> bool:
     forgets the tag is still approved request by request (just later), never
     leaked.
     """
-    return bool(getattr(args, "write", False))
+    write = getattr(args, "write", False)
+    # A verb that is a read or a write depending on its arguments (`files access`
+    # lists bare, sets with a state) tags itself with a predicate instead.
+    return bool(write(args) if callable(write) else write)
 
 
 def _target_description() -> tuple[str, str]:
@@ -8855,6 +9071,12 @@ def _guard_impersonated_command(args, creds: dict | None) -> None:
     workspace = resolve_effective_workspace_id(creds) or creds.get("workspace_id") or "their workspace"
     _impersonation_target = {"user": target_uid, "workspace": workspace}
     print(_color(f"▲ impersonating {target_uid} — {workspace}", "33"), file=sys.stderr)
+    if workspace in (status.get("write_test_workspace_ids") or []):
+        # One of eesel's own test workspaces (the server's list): no customer to
+        # protect, so writes run for real with no prompt, here and in chat.
+        print(_color("  eesel test workspace — writes run for real", "33"), file=sys.stderr)
+        _impersonation_write_approved = True
+        return
     if not _is_write_command(args):
         return
     if _DRY_RUN:
