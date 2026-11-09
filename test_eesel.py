@@ -11222,6 +11222,15 @@ class TestFileAndMemoryAccess:
         assert eesel.cmd_files(self._parse("files", "access", self.KEY, "inherit", "--agent", "Support Bot")) == 0
         assert ("DELETE", "http://localhost:8080/documents/audience-rules", {"key_prefix": self.KEY}) in calls
 
+    def test_files_access_takes_a_path_under_the_agent_folder(self, tmp_config, fake_creds, monkeypatch):
+        calls = self._wire(monkeypatch, [])
+        monkeypatch.setattr(eesel, "fetch_documents",
+                            lambda creds, **k: [{"id": "d2", "key": "files/agent-test-456/browser/notes.md"}, {"id": "d1", "key": self.KEY}] if k.get("prefix") == "files/agent-test-456" else [])
+        assert eesel.cmd_files(self._parse("files", "access", "browser/notes.md", "team", "--agent", "Support Bot")) == 0
+        assert ("PUT", "http://localhost:8080/documents/audience-rules", {"key_prefix": "files/agent-test-456/browser/notes.md", "audience": "internal"}) in calls
+        assert eesel.cmd_files(self._parse("files", "access", "browser", "off", "--agent", "Support Bot")) == 0
+        assert ("PUT", "http://localhost:8080/documents/audience-rules", {"key_prefix": "files/agent-test-456/browser", "audience": "off"}) in calls
+
     def test_files_access_folder_and_unknown(self, tmp_config, fake_creds, monkeypatch):
         calls = self._wire(monkeypatch, [])
         assert eesel.cmd_files(self._parse("files", "access", "files/agent-test-456/", "team", "--agent", "Support Bot")) == 0
