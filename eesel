@@ -6663,7 +6663,10 @@ def _set_access(creds: dict, key: str, state: str) -> int:
     url = f"{creds['api_url']}/documents/audience-rules"
     if state == "inherit":
         data = write_request("DELETE", url, token=creds["token"], body={"key_prefix": key})
-        ok(f"{key}: own setting cleared ({data.get('removed', 0)} removed); it now follows its folder.")
+        if data.get("removed"):
+            ok(f"{key}: own setting cleared; it now follows its folder.")
+        else:
+            info(f"{key}: had no setting of its own.")
     else:
         write_request("PUT", url, token=creds["token"], body={"key_prefix": key, "audience": _ACCESS_AUDIENCE[state]})
     rules, default = _access_rules(creds)
@@ -6705,7 +6708,12 @@ def _files_access(args) -> int:
     if args.state is None:
         err("Name the state too: eesel files access <key> on|team|off|answers|inherit")
         return 2
-    match = match_document(documents, args.target)
+    # A path under the agent's own folder (`browser/overview.md`, as the Files
+    # page and the agent show it) means the same as its full key.
+    target = args.target.strip().lstrip("/")
+    root = f"files/{creds['agent_id']}/"
+    full = target if target.startswith(("files/", "outputs/")) else root + target
+    match = next((d for d in documents if _workspace_relative(creds, _document_key(d)) == full), None) or match_document(documents, target)
     if isinstance(match, list):
         err(f"'{args.target}' matches {len(match)} files; use the full key.")
         return 1
@@ -6713,7 +6721,7 @@ def _files_access(args) -> int:
         key = _workspace_relative(creds, _document_key(match))
     else:
         # A folder: a prefix with at least one of this agent's files under it.
-        key = _workspace_relative(creds, args.target.rstrip("/"))
+        key = _workspace_relative(creds, full.rstrip("/"))
         if not any(_workspace_relative(creds, _document_key(d)).startswith(key + "/") for d in documents):
             err(f"No file or folder matches '{args.target}'.")
             info("Run `eesel files access` to see this agent's file keys.")
